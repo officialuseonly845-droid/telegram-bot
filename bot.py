@@ -80,22 +80,24 @@ async def handle_message(update: Update, context):
         ad_senders.add(username)
         await update.message.reply_text(f"Your X ID - {username}")
 
-async def main():
-    application = Application.builder().token(TOKEN).build()
+from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
-    # Add command handlers
-    application.add_handler(CommandHandler("slot", start_slot))
-    application.add_handler(CommandHandler("detect", stop_detect))
-    application.add_handler(CommandHandler("list", list_users))
-    application.add_handler(CommandHandler("adlist", ad_list))
-    application.add_handler(CommandHandler("notad", not_ad_list))
-    application.add_handler(CommandHandler("refresh", refresh))
-    application.add_handler(CommandHandler("double", double_check))
+# Initialize application and add handlers
+application = Application.builder().token(TOKEN).build()
 
-    # Add message handler
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+application.add_handler(CommandHandler("slot", start_slot))
+application.add_handler(CommandHandler("detect", stop_detect))
+application.add_handler(CommandHandler("list", list_users))
+application.add_handler(CommandHandler("adlist", ad_list))
+application.add_handler(CommandHandler("notad", not_ad_list))
+application.add_handler(CommandHandler("refresh", refresh))
+application.add_handler(CommandHandler("double", double_check))
 
-    await application.run_polling()
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+# Run polling in an existing event loop (without asyncio.run)
+application.run_polling()
+
 
 if __name__ == "__main__":
     import asyncio
