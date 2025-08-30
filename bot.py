@@ -80,8 +80,6 @@ async def handle_message(update: Update, context):
         ad_senders.add(username)
         await update.message.reply_text(f"Your X ID - {username}")
 
-from telegram.ext import Application, CommandHandler, MessageHandler, filters
-
 # Initialize application and add handlers
 application = Application.builder().token(TOKEN).build()
 
@@ -97,11 +95,6 @@ application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_m
 
 # Run polling in an existing event loop (without asyncio.run)
 application.run_polling()
-
-
-if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
 
 
 
