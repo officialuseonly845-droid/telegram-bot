@@ -13,7 +13,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Telegram token from environment variable
-TOKEN = os.getenv("TELEGRAM_TOKEN")  # Set this in Render/Replit secrets
+TOKEN = os.getenv("TELEGRAM_TOKEN")  # Set this in Render secrets
 
 # Global storage
 link_senders = set()   # Telegram usernames who sent X links
@@ -119,3 +119,4 @@ Thread(target=run_flask).start()
 # --- Run bot ---
 if __name__ == "__main__":
     application.run_polling()
+    
