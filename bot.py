@@ -6,21 +6,25 @@ from flask import Flask
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# Logging
+# ---------------- Logging ----------------
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Telegram token from environment variable
-TOKEN = os.getenv("TELEGRAM_TOKEN")  # Set this in Render secrets
+# ---------------- Token ----------------
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+if not TOKEN:
+    logger.error("Telegram token not found! Set TELEGRAM_TOKEN environment variable.")
+    exit(1)
 
-# Global storage
-link_senders = set()   # Telegram usernames who sent X links
-x_links = {}           # Telegram username -> X username from link (@ prefixed)
-ad_senders = set()     # Telegram usernames who sent ads
+# ---------------- Storage ----------------
+link_senders = set()  # Users who sent X links
+x_links = {}          # Telegram username -> X username (@ prefixed)
+ad_senders = set()    # Users who sent Ads
 
-# --- Commands ---
+# ---------------- Commands ----------------
 async def start_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("START SENDING LINKS 🔗")
     context.chat_data['collecting_links'] = True
@@ -68,7 +72,7 @@ async def double_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("No users sent 2+ links.")
 
-# --- Handle messages ---
+# ---------------- Handle Messages ----------------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_username = "@" + (update.message.from_user.username or update.message.from_user.first_name)
     text = update.message.text or ""
@@ -91,7 +95,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Your X ID - {x_username}\nYour X profile - {profile_url}"
         )
 
-# --- Initialize bot ---
+# ---------------- Initialize Bot ----------------
 application = Application.builder().token(TOKEN).build()
 
 # Add handlers
@@ -104,7 +108,7 @@ application.add_handler(CommandHandler("refresh", refresh))
 application.add_handler(CommandHandler("double", double_check))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-# --- Tiny Flask server for UptimeRobot ---
+# ---------------- Flask server for UptimeRobot ----------------
 app = Flask('')
 
 @app.route('/')
@@ -113,6 +117,12 @@ def home():
 
 def run_flask():
     app.run(host='0.0.0.0', port=8080)
+
+Thread(target=run_flask).start()
+
+# ---------------- Run Bot ----------------
+if __name__ == "__main__":
+    application.run_polling()    app.run(host='0.0.0.0', port=8080)
 
 Thread(target=run_flask).start()
 
