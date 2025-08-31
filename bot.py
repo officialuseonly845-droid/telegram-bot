@@ -1,6 +1,8 @@
 import os
 import re
 import logging
+from threading import Thread
+from flask import Flask
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -10,8 +12,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Telegram bot token from environment variable
-TOKEN = os.getenv("TELEGRAM_TOKEN")  # Set this in Replit Secrets or Render Secrets
+# Telegram token from environment variable
+TOKEN = os.getenv("TELEGRAM_TOKEN")  # Set this in Render/Replit secrets
 
 # Global storage
 link_senders = set()   # Telegram usernames who sent X links
@@ -79,7 +81,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             x_username = "@" + match.group(1)
             x_links[telegram_username] = x_username
 
-    # Detect Ads or "all done" triggers
+    # Detect Ads or Done triggers
     triggers = r'\b(ad|Ad|AD|all done|All done|ALL DONE|done|Done)\b'
     if context.chat_data.get('detect_ads') and re.search(triggers, text):
         ad_senders.add(telegram_username)
@@ -102,24 +104,18 @@ application.add_handler(CommandHandler("refresh", refresh))
 application.add_handler(CommandHandler("double", double_check))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-# --- Start bot ---
-if __name__ == "__main__":
-    application.run_polling()
-from flask import Flask
-from threading import Thread
-
+# --- Tiny Flask server for UptimeRobot ---
 app = Flask('')
 
 @app.route('/')
 def home():
     return "Bot is running!"
 
-def run():
+def run_flask():
     app.run(host='0.0.0.0', port=8080)
 
-Thread(target=run).start()
+Thread(target=run_flask).start()
 
-    
- 
-
-   
+# --- Run bot ---
+if __name__ == "__main__":
+    application.run_polling()
