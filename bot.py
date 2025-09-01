@@ -1,132 +1,37 @@
 import os
-import re
-import logging
-from threading import Thread
-from flask import Flask
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import re
 
-# ---------------- Logging ----------------
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-# ---------------- Token ----------------
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-if not TOKEN:
-    logger.error("Telegram token not found! Set TELEGRAM_TOKEN environment variable.")
-    exit(1)
 
-# ---------------- Storage ----------------
-link_senders = set()  # Users who sent X links
-x_links = {}          # Telegram username -> X username (@ prefixed)
-ad_senders = set()    # Users who sent Ads
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Hey! Send me your ad link or type 'done' when finished.")
 
-# ---------------- Commands ----------------
-async def start_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("START SENDING LINKS 🔗")
-    context.chat_data['collecting_links'] = True
+def extract_x_username(text):
+    match = re.search(r"https?://(?:www\.)?x\.com/([A-Za-z0-9_]+)", text)
+    return f"@{match.group(1)}" if match else None
 
-async def stop_detect(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("STOP ⛔ SENDING LINK 🔗")
-    context.chat_data['collecting_links'] = False
-    context.chat_data['detect_ads'] = True
-
-async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if link_senders:
-        msg = "Users who sent X links:\n" + "\n".join(link_senders)
-    else:
-        msg = "No X links detected yet."
-    await update.message.reply_text(msg)
-
-async def ad_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if ad_senders:
-        msg = "Users who sent Ads:\n" + "\n".join(ad_senders)
-    else:
-        msg = "No Ads detected yet."
-    await update.message.reply_text(msg)
-
-async def not_ad_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    not_ads = link_senders - ad_senders
-    if not_ads:
-        msg = "Users who DIDN'T send ads:\n" + "\n".join(not_ads)
-    else:
-        msg = "No users without ads."
-    await update.message.reply_text(msg)
-
-async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    link_senders.clear()
-    ad_senders.clear()
-    x_links.clear()
-    await update.message.reply_text("All lists cleared! ✅")
-
-async def double_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg_counts = {}
-    for user in link_senders:
-        msg_counts[user] = msg_counts.get(user, 0) + 1
-    doubles = [u for u, count in msg_counts.items() if count > 1]
-    if doubles:
-        await update.message.reply_text("Users who sent 2+ links:\n" + "\n".join(doubles))
-    else:
-        await update.message.reply_text("No users sent 2+ links.")
-
-# ---------------- Handle Messages ----------------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    telegram_username = "@" + (update.message.from_user.username or update.message.from_user.first_name)
-    text = update.message.text or ""
+    text = update.message.text.strip()
+    trigger_words = ["ad", "Ad", "ALL DONE", "All done", "all done", "Done", "done"]
 
-    # Detect X links
-    if context.chat_data.get('collecting_links') and "x.com/" in text:
-        link_senders.add(telegram_username)
-        match = re.search(r"x\.com/([\w\d_]+)", text)
-        if match:
-            x_username = "@" + match.group(1)
-            x_links[telegram_username] = x_username
+    if any(word in text for word in trigger_words):
+        username = extract_x_username(text)
+        if username:
+            await update.message.reply_text(f"Your X ID - {username}")
+            await update.message.reply_text(f"Your X profile - {username}")
+        else:
+            await update.message.reply_text("Couldn't find an X username in your message.")
+    else:
+        await update.message.reply_text("Please send a valid ad link or type 'done'.")
 
-    # Detect Ads or Done triggers
-    triggers = r'\b(ad|Ad|AD|all done|All done|ALL DONE|done|Done)\b'
-    if context.chat_data.get('detect_ads') and re.search(triggers, text):
-        ad_senders.add(telegram_username)
-        x_username = x_links.get(telegram_username, "Unknown")
-        profile_url = f"https://x.com/{x_username.lstrip('@')}" if x_username != "Unknown" else "Unknown"
-        await update.message.reply_text(
-            f"Your X ID - {x_username}\nYour X profile - {profile_url}"
-        )
+def main():
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    print("Bot started!")
+    app.run_polling()
 
-# ---------------- Initialize Bot ----------------
-application = Application.builder().token(TOKEN).build()
-
-# Add handlers
-application.add_handler(CommandHandler("slot", start_slot))
-application.add_handler(CommandHandler("detect", stop_detect))
-application.add_handler(CommandHandler("list", list_users))
-application.add_handler(CommandHandler("adlist", ad_list))
-application.add_handler(CommandHandler("notad", not_ad_list))
-application.add_handler(CommandHandler("refresh", refresh))
-application.add_handler(CommandHandler("double", double_check))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-# ---------------- Flask server for UptimeRobot ----------------
-app = Flask('')
-
-@app.route('/')
-def home():
-    return "Bot is running!"
-
-def run_flask():
-    app.run(host='0.0.0.0', port=8080)
-
-Thread(target=run_flask).start()
-
-# ---------------- Run Bot ----------------
 if __name__ == "__main__":
-    application.run_polling()    app.run(host='0.0.0.0', port=8080)
-
-Thread(target=run_flask).start()
-
-# --- Run bot ---
-if __name__ == "__main__":
-    application.run_polling()
-    
+    main()
