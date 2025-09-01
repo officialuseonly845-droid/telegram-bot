@@ -1,36 +1,102 @@
 import os
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import re
+import logging
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
+# Logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Get Telegram token
 TOKEN = os.getenv("TELEGRAM_TOKEN")
+if not TOKEN:
+    raise ValueError("TELEGRAM_TOKEN environment variable not set!")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hey! Send me your ad link or type 'done' when finished.")
+# Global sets
+link_senders = set()
+ad_senders = set()
 
-def extract_x_username(text):
-    match = re.search(r"https?://(?:www\.)?x\.com/([A-Za-z0-9_]+)", text)
-    return f"@{match.group(1)}" if match else None
+# --- Commands ---
+async def start_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("START SENDING LINKS 🔗")
+    context.chat_data['collecting_links'] = True
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    trigger_words = ["ad", "Ad", "ALL DONE", "All done", "all done", "Done", "done"]
+async def stop_detect(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("STOP ⛔ SENDING LINK 🔗")
+    context.chat_data['collecting_links'] = False
+    context.chat_data['detect_ads'] = True
 
-    if any(word in text for word in trigger_words):
-        username = extract_x_username(text)
-        if username:
-            await update.message.reply_text(f"Your X ID - {username}")
-            await update.message.reply_text(f"Your X profile - {username}")
-        else:
-            await update.message.reply_text("Couldn't find an X username in your message.")
+async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if link_senders:
+        msg = "Users who sent X links:\n" + "\n".join(link_senders)
     else:
-        await update.message.reply_text("Please send a valid ad link or type 'done'.")
+        msg = "No X links detected yet."
+    await update.message.reply_text(msg)
 
+async def ad_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if ad_senders:
+        msg = "Users who sent Ads:\n" + "\n".join(ad_senders)
+    else:
+        msg = "No Ads detected yet."
+    await update.message.reply_text(msg)
+
+async def not_ad_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    not_ads = link_senders - ad_senders
+    if not_ads:
+        msg = "Users who DIDN'T send ads:\n" + "\n".join(not_ads)
+    else:
+        msg = "No users without ads."
+    await update.message.reply_text(msg)
+
+async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    link_senders.clear()
+    ad_senders.clear()
+    await update.message.reply_text("All lists cleared! ✅")
+
+async def double_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg_counts = {}
+    for user in link_senders:
+        msg_counts[user] = msg_counts.get(user, 0) + 1
+    doubles = [u for u, count in msg_counts.items() if count > 1]
+    if doubles:
+        await update.message.reply_text("Users who sent 2+ links:\n" + "\n".join(doubles))
+    else:
+        await update.message.reply_text("No users sent 2+ links.")
+
+# --- Detect Messages ---
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    username = "@" + (update.message.from_user.username or update.message.from_user.first_name)
+    text = update.message.text or ""
+
+    if context.chat_data.get('collecting_links') and "x.com/" in text:
+        link_senders.add(username)
+
+    if context.chat_data.get('detect_ads') and re.search(r'\b(ad|Ad|AD|done|Done|all done|All done|ALL DONE)\b', text):
+        ad_senders.add(username)
+
+        match = re.search(r"https?://x\.com/([^/]+)/status/\d+", text)
+        if match:
+            x_user = match.group(1)
+            await update.message.reply_text(f"Your X ID - @{x_user}\n\nYour X profile - https://x.com/{x_user}")
+        else:
+            await update.message.reply_text(f"Your X ID - {username}")
+
+# --- Main ---
 def main():
     app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
+
+    app.add_handler(CommandHandler("slot", start_slot))
+    app.add_handler(CommandHandler("detect", stop_detect))
+    app.add_handler(CommandHandler("list", list_users))
+    app.add_handler(CommandHandler("adlist", ad_list))
+    app.add_handler(CommandHandler("notad", not_ad_list))
+    app.add_handler(CommandHandler("refresh", refresh))
+    app.add_handler(CommandHandler("double", double_check))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("Bot started!")
+
     app.run_polling()
 
 if __name__ == "__main__":
