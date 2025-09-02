@@ -2,57 +2,57 @@ import os
 import re
 import logging
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from keep_alive import keep_alive
-
-# Start Flask server to keep bot alive
-keep_alive()
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
 # Logging for debugging
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Telegram Bot Token
+# Token from environment variables
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-
-# Keywords that trigger response
-TRIGGER_WORDS = ["ad", "Ad", "AD", "done", "Done", "DONE", "all done", "All done", "ALL DONE"]
-
-# Extract X username from link
-def extract_x_username(text):
-    match = re.search(r"x\.com/([A-Za-z0-9_]+)", text)
-    if match:
-        return match.group(1)
-    return None
 
 # Start command
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hey! Send me an X link, and I’ll extract the username for you.")
+    await update.message.reply_text("👋 Hey! Send your ad or 'done' and I'll grab your X username!")
 
-# Message handler
+# Extract username
+def extract_x_username(text: str) -> str:
+    match = re.search(r"x\.com/([A-Za-z0-9_]+)", text)
+    if match:
+        return f"@{match.group(1)}"
+    return None
+
+# Handle messages
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    username = extract_x_username(text)
+    text = update.message.text.strip()
+    trigger_words = ["ad", "done", "all done"]
 
-    if any(word in text for word in TRIGGER_WORDS) and username:
-        await update.message.reply_text(f"Your X ID - @{username}\n\nYour X profile - {username}")
-    elif username:
-        await update.message.reply_text(f"Your X ID - @{username}\n\nYour X profile - {username}")
+    if any(t.lower() == text.lower() for t in trigger_words):
+        username = extract_x_username(text)
+        if username:
+            reply = f"Your X ID - {username}\n\nYour X Profile - {username}"
+        else:
+            reply = "⚠️ No valid X link found. Please send a correct one."
+        await update.message.reply_text(reply)
 
 # Error handler
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(msg="Exception while handling an update:", exc_info=context.error)
+    logger.error(f"Error: {context.error}")
 
-# Main function
+# Main
 def main():
-    app = Application.builder().token(TOKEN).build()
+    if not TOKEN:
+        raise ValueError("❌ TELEGRAM_TOKEN is missing! Set it in Render env vars.")
+
+    app = ApplicationBuilder().token(TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
-    print("Bot started...")
+    print("✅ Bot started...")
     app.run_polling()
 
 if __name__ == "__main__":
