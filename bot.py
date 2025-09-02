@@ -1,68 +1,59 @@
 import os
+import re
 import logging
-from flask import Flask, request
-from telegram import Update, Bot
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from keep_alive import keep_alive
 
-# Logging
+# Start Flask server to keep bot alive
+keep_alive()
+
+# Logging for debugging
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Telegram Token
+# Telegram Bot Token
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-bot = Bot(TOKEN)
 
-# Flask app
-app = Flask(__name__)
-application = Application.builder().token(TOKEN).build()
+# Keywords that trigger response
+TRIGGER_WORDS = ["ad", "Ad", "AD", "done", "Done", "DONE", "all done", "All done", "ALL DONE"]
 
-# Error handler
-async def error_handler(update: object, context: CallbackContext) -> None:
-    logger.error("Exception while handling update:", exc_info=context.error)
-
-application.add_error_handler(error_handler)
+# Extract X username from link
+def extract_x_username(text):
+    match = re.search(r"x\.com/([A-Za-z0-9_]+)", text)
+    if match:
+        return match.group(1)
+    return None
 
 # Start command
-async def start(update: Update, context: CallbackContext):
-    await update.message.reply_text("Hey! Send your ad or say 'done' and I’ll extract your X username!")
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Hey! Send me an X link, and I’ll extract the username for you.")
 
-# Reply logic
-async def handle_message(update: Update, context: CallbackContext):
+# Message handler
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
-    user_text = text.strip().lower()
+    username = extract_x_username(text)
 
-    # Keywords
-    trigger_words = ["ad", "done", "all done"]
-    if any(word in user_text for word in trigger_words):
-        # Extract X username from message
-        username = None
-        if "x.com/" in text:
-            username = text.split("x.com/")[1].split("/")[0]
-        
-        if username:
-            reply = f"Your X ID - @{username}\n\nYour X profile - https://x.com/{username}"
-        else:
-            reply = "Couldn't find your X username in the message. Please include your X link."
+    if any(word in text for word in TRIGGER_WORDS) and username:
+        await update.message.reply_text(f"Your X ID - @{username}\n\nYour X profile - {username}")
+    elif username:
+        await update.message.reply_text(f"Your X ID - @{username}\n\nYour X profile - {username}")
 
-        await update.message.reply_text(reply)
+# Error handler
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(msg="Exception while handling an update:", exc_info=context.error)
 
-# Add handlers
-application.add_handler(CommandHandler("start", start))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+# Main function
+def main():
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_error_handler(error_handler)
 
-# Flask routes
-@app.route(f"/{TOKEN}", methods=["POST"])
-def webhook():
-    update = Update.de_json(request.get_json(force=True), bot)
-    application.update_queue.put_nowait(update)
-    return "ok"
-
-@app.route("/", methods=["GET"])
-def index():
-    return "Bot is running!"
+    print("Bot started...")
+    app.run_polling()
 
 if __name__ == "__main__":
-    PORT = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=PORT)
+    main()
