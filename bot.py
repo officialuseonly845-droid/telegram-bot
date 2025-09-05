@@ -1,105 +1,118 @@
-import logging
+import os
 import re
+import logging
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext
-from keep_alive import keep_alive
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, filters, ContextTypes
+)
 
-# Enable logging
+# Logging (for debugging)
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Bot data
-participants = set()
-ad_senders = {}
-x_profiles = {}
+# Get token from Replit/Render secrets
+TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-# Extract X username and profile link
-def extract_x_data(message: str):
-    match = re.search(r"https?://x\.com/([^/]+)/status/\d+", message)
+# Global data
+link_senders = {}  # {telegram_username: x_link}
+ad_senders = set()
+
+# Extract X username & profile
+def extract_x_username_and_profile(link: str):
+    """
+    From https://x.com/username/status/123456 => returns ("@username", "https://x.com/username")
+    """
+    match = re.search(r"x\.com/([^/]+)/status", link)
     if match:
         username = match.group(1)
-        profile = f"https://x.com/{username}"
-        return username, profile
+        return f"@{username}", f"https://x.com/{username}"
     return None, None
 
-# Commands
-async def slot(update: Update, context: CallbackContext):
-    username = update.effective_user.username or update.effective_user.first_name
-    participants.add(username)
+# /slot command
+async def start_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("START SENDING LINKS 🔗")
+    context.chat_data["collecting_links"] = True
+    context.chat_data["detect_ads"] = False
 
-async def detect(update: Update, context: CallbackContext):
+# /detect command
+async def stop_detect(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⛔ STOP SENDING LINKS 🔗")
+    context.chat_data["collecting_links"] = False
+    context.chat_data["detect_ads"] = True
 
-async def list_users(update: Update, context: CallbackContext):
-    if participants:
-        text = "USERS PARTICIPATED ✅\n" + "\n".join(participants)
+# /list command
+async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if link_senders:
+        msg = "USERS PARTICIPATED ✅\n" + "\n".join(link_senders.keys())
     else:
-        text = "No users participated yet."
-    await update.message.reply_text(text)
+        msg = "No users have sent links yet."
+    await update.message.reply_text(msg)
 
-async def ad_list(update: Update, context: CallbackContext):
+# /adlist command
+async def ad_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if ad_senders:
-        text = "📌 THESE PEOPLE HAVE COMPLETED ENGAGEMENT\n" + "\n".join(ad_senders.keys())
+        msg = "📌 THESE PEOPLE HAVE COMPLETED ENGAGEMENT\n" + "\n".join(ad_senders)
     else:
-        text = "No ads recorded yet."
-    await update.message.reply_text(text)
+        msg = "No one has completed engagement yet."
+    await update.message.reply_text(msg)
 
-async def not_ad(update: Update, context: CallbackContext):
-    not_completed = [u for u in participants if u not in ad_senders]
-    if not_completed:
-        text = "These users have NOT sent ads:\n" + "\n".join(not_completed)
+# /notad command
+async def not_ad_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    not_ads = set(link_senders.keys()) - ad_senders
+    if not_ads:
+        msg = "Users who haven't sent ads:\n" + "\n".join(not_ads)
     else:
-        text = "Everyone has sent ads."
-    await update.message.reply_text(text)
+        msg = "Everyone has sent ads."
+    await update.message.reply_text(msg)
 
-async def refresh(update: Update, context: CallbackContext):
-    participants.clear()
+# /refresh command
+async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    link_senders.clear()
     ad_senders.clear()
-    x_profiles.clear()
     await update.message.reply_text("LIST ♻ REFRESHED")
 
-# Detect ad/done messages
-async def detect_ads(update: Update, context: CallbackContext):
-    username = update.effective_user.username or update.effective_user.first_name
-    text = update.message.text
+# Handle all messages
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    username = f"@{update.message.from_user.username}" if update.message.from_user.username else update.message.from_user.first_name
+    text = update.message.text or ""
 
-    if any(word in text.lower() for word in ["ad", "done", "all done"]):
-        if username not in ad_senders:
-            x_user, x_profile = extract_x_data(text)
-            if x_user:
-                ad_senders[username] = x_user
-                x_profiles[username] = x_profile
-                reply = (
+    # Collect X links
+    if context.chat_data.get("collecting_links") and "x.com/" in text:
+        link_senders[username] = text
+
+    # Detect "ad"/"done" messages
+    if context.chat_data.get("detect_ads") and re.search(r"\b(ad|done|all done)\b", text, re.IGNORECASE):
+        x_link = link_senders.get(username)
+        if x_link:
+            x_username, x_profile = extract_x_username_and_profile(x_link)
+            if x_username:
+                ad_senders.add(x_username)
+                await update.message.reply_text(
                     f"ENGAGEMENT RECORDED FROM ✅\n"
-                    f"X ID - @{x_user}\n\n"
+                    f"X ID - {x_username}\n\n"
                     f"X profile - {x_profile}"
                 )
-            else:
-                reply = "ENGAGEMENT RECORDED FROM ✅\n(No valid X link found)"
-            await update.message.reply_text(reply)
 
 # Error handler
-async def error_handler(update: object, context: CallbackContext):
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(msg="Exception while handling an update:", exc_info=context.error)
 
-# Start bot
+# Run bot
 def main():
-    keep_alive()
-    app = Application.builder().token("8411876178:AAHfnSz8lYOve1cUBlCtdnn9kokibRFA4Pg").build()
+    app = Application.builder().token(TOKEN).build()
 
-    # Handlers
-    app.add_handler(CommandHandler("slot", slot))
-    app.add_handler(CommandHandler("detect", detect))
+    app.add_handler(CommandHandler("slot", start_slot))
+    app.add_handler(CommandHandler("detect", stop_detect))
     app.add_handler(CommandHandler("list", list_users))
     app.add_handler(CommandHandler("adlist", ad_list))
-    app.add_handler(CommandHandler("notad", not_ad))
+    app.add_handler(CommandHandler("notad", not_ad_list))
     app.add_handler(CommandHandler("refresh", refresh))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, detect_ads))
-
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
+
+    logger.info("Bot is running...")
     app.run_polling()
 
 if __name__ == "__main__":
