@@ -10,14 +10,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Bot data storage
+# Bot data
 participants = set()
 ad_senders = {}
 x_profiles = {}
 
-# Extract X username and profile
+# Extract X username and profile link
 def extract_x_data(message: str):
-    match = re.search(r"https?://x\.com/([^/]+)/status/(\d+)", message)
+    match = re.search(r"https?://x\.com/([^/]+)/status/\d+", message)
     if match:
         username = match.group(1)
         profile = f"https://x.com/{username}"
@@ -87,8 +87,8 @@ async def error_handler(update: object, context: CallbackContext):
 
 # Start bot
 def main():
-    keep_alive()  # Start the Flask server
-    app = Application.builder().token("YOUR_TELEGRAM_BOT_TOKEN").build()
+    keep_alive()
+    app = Application.builder().token("8411876178:AAHfnSz8lYOve1cUBlCtdnn9kokibRFA4Pg").build()
 
     # Handlers
     app.add_handler(CommandHandler("slot", slot))
