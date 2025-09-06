@@ -1,10 +1,13 @@
 import os
 import re
 import logging
+from keep_alive import keep_alive
+keep_alive()
 from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters, ContextTypes
 )
+
 
 # Logging (for debugging)
 logging.basicConfig(
@@ -111,6 +114,7 @@ def main():
     app.add_handler(CommandHandler("refresh", refresh))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
+    
 
     logger.info("Bot is running...")
     app.run_polling()
