@@ -1,94 +1,113 @@
+from flask import Flask
+from threading import Thread
 import os
 import re
 import logging
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-# Logging
+# --- Keep Alive Web Server ---
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is running!"
+
+def run():
+    app.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
+
+# --- Logging ---
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Bot token from environment
+# --- Telegram Bot Token ---
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-# Global sets to store users
-link_senders = set()
-ad_senders = set()
-user_links = {}  # Store mapping telegram username -> X link
+# --- Data Stores ---
+link_senders = {}
+ad_senders = {}
 
-# Commands
-async def slot(update: Update, context):
-    await update.message.reply_text("START SENDING LINKS ✅")
+# --- Commands ---
+async def start_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("START SENDING LINKS 🔗")
     context.chat_data['collecting_links'] = True
 
-async def detect(update: Update, context):
-    await update.message.reply_text("⛔ STOP SENDING LINKS")
+async def stop_detect(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⛔ STOP SENDING LINKS 🔗")
     context.chat_data['collecting_links'] = False
     context.chat_data['detect_ads'] = True
 
-async def list_users(update: Update, context):
-    msg = "USERS PARTICIPATED ✅\n"
-    msg += "\n".join(link_senders) if link_senders else "No users yet."
-    await update.message.reply_text(msg)
+async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if link_senders:
+        msg = "USERS PARTICIPATED ✅\n" + "\n".join(link_senders.keys())
+        await update.message.reply_text(msg)
+    else:
+        await update.message.reply_text("No links yet.")
 
-async def adlist(update: Update, context):
-    msg = "📌 THESE PEOPLE HAVE COMPLETED ENGAGEMENT\n"
-    msg += "\n".join(ad_senders) if ad_senders else "No engagements yet."
-    await update.message.reply_text(msg)
+async def ad_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if ad_senders:
+        msg = "📌 THESE PEOPLE HAVE COMPLETED ENGAGEMENT\n" + "\n".join(ad_senders.values())
+        await update.message.reply_text(msg)
+    else:
+        await update.message.reply_text("No ads yet.")
 
-async def notad(update: Update, context):
-    not_ads = link_senders - ad_senders
-    msg = "\n".join(not_ads) if not_ads else "Everyone completed engagement."
-    await update.message.reply_text(msg)
+async def not_ad_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    not_ads = [u for u in link_senders.keys() if u not in ad_senders]
+    if not_ads:
+        msg = "Users without ads:\n" + "\n".join(not_ads)
+        await update.message.reply_text(msg)
+    else:
+        await update.message.reply_text("Everyone sent ads.")
 
-async def refresh(update: Update, context):
+async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     link_senders.clear()
     ad_senders.clear()
-    user_links.clear()
     await update.message.reply_text("LIST ♻ REFRESHED")
 
-# Detect messages
-async def handle_message(update: Update, context):
+# --- Helper to extract X username ---
+def extract_x_username(text):
+    match = re.search(r"x\.com/([A-Za-z0-9_]+)", text)
+    return match.group(1) if match else "unknown"
+
+# --- Message Handler ---
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = "@" + (update.message.from_user.username or update.message.from_user.first_name)
     text = update.message.text or ""
 
-    # Collect X links
+    # Store X links
     if context.chat_data.get('collecting_links') and "x.com/" in text:
-        link_senders.add(username)
-        user_links[username] = text.strip()
+        x_username = extract_x_username(text)
+        link_senders[username] = x_username
 
-    # Detect ads or done messages
-    if context.chat_data.get('detect_ads') and re.search(r'\b(ad|Ad|AD|done|Done|all done|All done|ALL DONE)\b', text):
-        if username in user_links:
-            x_link = user_links[username]
-            # Extract X username from link
-            x_username = x_link.split("x.com/")[-1].split("/")[0]
-            x_profile = x_link.split("/status")[0]  # get profile link part
-            ad_senders.add(username)
-            reply = f"ENGAGEMENT RECORDED FROM ✅\nX ID - @{x_username}\nX profile - {x_profile}"
-            await update.message.reply_text(reply)
+    # Detect Ads/Done/All Done
+    if context.chat_data.get('detect_ads') and re.search(r'\b(ad|done|all done)\b', text, re.IGNORECASE):
+        x_username = link_senders.get(username, "Unknown")
+        ad_senders[username] = x_username
+        await update.message.reply_text(
+            f"ENGAGEMENT RECORDED FROM ✅\nX ID - @{x_username}\nX Profile - https://x.com/{x_username}"
+        )
 
-# Initialize bot
-application = Application.builder().token(TOKEN).build()
+# --- Main Function ---
+def main():
+    keep_alive()  # Start web server
 
-# Add handlers
-application.add_handler(CommandHandler("slot", slot))
-application.add_handler(CommandHandler("detect", detect))
-application.add_handler(CommandHandler("list", list_users))
-application.add_handler(CommandHandler("adlist", adlist))
-application.add_handler(CommandHandler("notad", notad))
-application.add_handler(CommandHandler("refresh", refresh))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app_telegram = Application.builder().token(TOKEN).build()
 
-# Error handler to keep bot alive
-async def error_handler(update: object, context):
-    logger.error(msg="Exception while handling an update:", exc_info=context.error)
+    app_telegram.add_handler(CommandHandler("slot", start_slot))
+    app_telegram.add_handler(CommandHandler("detect", stop_detect))
+    app_telegram.add_handler(CommandHandler("list", list_users))
+    app_telegram.add_handler(CommandHandler("adlist", ad_list))
+    app_telegram.add_handler(CommandHandler("notad", not_ad_list))
+    app_telegram.add_handler(CommandHandler("refresh", refresh))
+    app_telegram.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-application.add_error_handler(error_handler)
+    app_telegram.run_polling()
 
-# Run bot
 if __name__ == "__main__":
-    application.run_polling()
+    main()
