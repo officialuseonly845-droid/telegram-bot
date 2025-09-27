@@ -1,13 +1,10 @@
 import os
 import re
 import logging
-import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler,
-    ContextTypes, filters
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+import threading
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO)
@@ -23,14 +20,13 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.wfile.write(STATUS_MESSAGES["server_alive"].encode())
 
     def log_message(self, format, *args):
-        pass
+        pass  # Suppress default logging
 
 def start_health_server():
     port = int(os.environ.get("PORT", 5000))
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
     logger.info(f"✅ Health server running on 0.0.0.0:{port}")
     server.serve_forever()
-
 
 # ---------- Telegram Bot ----------
 active_groups = set()
@@ -43,17 +39,16 @@ async def active(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    if chat_id in active_groups:
-        active_groups.remove(chat_id)
-        await update.message.reply_text("🛑 Bot is now inactive in this group.")
+    active_groups.discard(chat_id)
+    await update.message.reply_text("🛑 Bot is now inactive in this group.")
 
 async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user
     if chat_id not in active_groups:
         return
-    message_text = update.message.text or ""
-    if not LINK_PATTERN.search(message_text):
+    text = update.message.text or ""
+    if not LINK_PATTERN.search(text):
         try:
             await update.message.delete()
             await context.bot.send_message(
@@ -64,6 +59,7 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Error deleting message: {e}")
 
+# ---------- Main ----------
 def main():
     TOKEN = os.getenv("BOT_TOKEN")
     if not TOKEN:
@@ -74,7 +70,7 @@ def main():
     app.add_handler(CommandHandler("stop", stop))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_messages))
 
-    # Start both bot and health server
+    # Start health server in background
     threading.Thread(target=start_health_server, daemon=True).start()
     logger.info("🚀 Telegram bot started...")
     app.run_polling()
