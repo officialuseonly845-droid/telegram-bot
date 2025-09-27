@@ -1,56 +1,83 @@
 import os
-import openai
-import requests
-from flask import Flask, request
+import re
+import logging
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    ContextTypes, filters
+)
 
-# Load secrets from environment variables
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-openai.api_key = OPENAI_API_KEY
+# ---------- Logging ----------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+# ---------- Health Check ----------
+STATUS_MESSAGES = {"server_alive": "Server alive ✅"}
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    data = request.get_json()
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(STATUS_MESSAGES["server_alive"].encode())
 
-    if "message" in data:
-        chat_id = data["message"]["chat"]["id"]
-        user_text = data["message"].get("text", "")
+    def log_message(self, format, *args):
+        pass
 
-        # Always respond to /start
-        if user_text == "/start":
-            requests.post(f"{TELEGRAM_API}/sendMessage", json={
-                "chat_id": chat_id,
-                "text": "👋 Hi! I’m your BELLUGA bot. Mention 'BELLUGA' in your message and I’ll respond!"
-            })
-            return {"ok": True}
+def start_health_server():
+    port = int(os.environ.get("PORT", 5000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    logger.info(f"✅ Health server running on 0.0.0.0:{port}")
+    server.serve_forever()
 
-        # If message contains "BELLUGA" exactly, send fixed greeting
-        if user_text.strip().upper() == "BELLUGA":
-            requests.post(f"{TELEGRAM_API}/sendMessage", json={
-                "chat_id": chat_id,
-                "text": "Hi! I am BELLUGA, ask me anything 😎"
-            })
-            return {"ok": True}
 
-        # If message contains "BELLUGA" and extra text → treat as question
-        if "BELLUGA" in user_text.upper():
-            # Ask ChatGPT
-            response = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[{"role": "user", "content": user_text}]
+# ---------- Telegram Bot ----------
+active_groups = set()
+LINK_PATTERN = re.compile(r'(https?://\S+|www\.\S+)')
+
+async def active(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    active_groups.add(chat_id)
+    await update.message.reply_text("✅ Bot is now active in this group!")
+
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if chat_id in active_groups:
+        active_groups.remove(chat_id)
+        await update.message.reply_text("🛑 Bot is now inactive in this group.")
+
+async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    if chat_id not in active_groups:
+        return
+    message_text = update.message.text or ""
+    if not LINK_PATTERN.search(message_text):
+        try:
+            await update.message.delete()
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"{user.mention_html()} PLEASE DON'T TALK OFFTOPIC HERE 🚨",
+                parse_mode="HTML"
             )
-            answer = response["choices"][0]["message"]["content"]
+        except Exception as e:
+            logger.error(f"Error deleting message: {e}")
 
-            requests.post(f"{TELEGRAM_API}/sendMessage", json={
-                "chat_id": chat_id,
-                "text": answer
-            })
+def main():
+    TOKEN = os.getenv("BOT_TOKEN")
+    if not TOKEN:
+        raise ValueError("❌ BOT_TOKEN not found in environment variables")
 
-    return {"ok": True}
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("active", active))
+    app.add_handler(CommandHandler("stop", stop))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_messages))
 
-@app.route("/")
-def home():
-    return "Bot is running!"
+    # Start both bot and health server
+    threading.Thread(target=start_health_server, daemon=True).start()
+    logger.info("🚀 Telegram bot started...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
