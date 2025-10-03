@@ -54,21 +54,18 @@ def get_user_mention(user):
     else:
         return user.first_name
 
+# --------- COMMAND HANDLERS ---------
+
 # Command: /gay
 async def gay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Pick a random member and assign gay percentage with funny message."""
     try:
         chat_id = update.effective_chat.id
-        
-        # Check if in group
         if update.effective_chat.type not in ['group', 'supergroup']:
             await update.message.reply_text("This command only works in groups!")
             return
         
         members = await get_human_members(context, chat_id)
-        
         if not members:
-            # Fallback: use the user who sent the command
             members = [update.effective_user]
         
         random_user = random.choice(members)
@@ -94,22 +91,17 @@ async def gay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error in gay_command: {e}")
         try:
             await update.message.reply_text("Oops! Something went wrong 😅")
-        except:
-            pass
+        except: pass
 
 # Command: /couple
 async def couple_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Pick two random members as couple of the day with playful message."""
     try:
         chat_id = update.effective_chat.id
-        
-        # Check if in group
         if update.effective_chat.type not in ['group', 'supergroup']:
             await update.message.reply_text("This command only works in groups!")
             return
         
         members = await get_human_members(context, chat_id)
-        
         if len(members) < 2:
             await update.message.reply_text("Not enough members to make a couple! 😅")
             return
@@ -137,24 +129,18 @@ async def couple_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error in couple_command: {e}")
         try:
             await update.message.reply_text("Oops! Something went wrong 😅")
-        except:
-            pass
+        except: pass
 
 # Command: /cringe
 async def cringe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Pick a random member and roast them with cringe message."""
     try:
         chat_id = update.effective_chat.id
-        
-        # Check if in group
         if update.effective_chat.type not in ['group', 'supergroup']:
             await update.message.reply_text("This command only works in groups!")
             return
         
         members = await get_human_members(context, chat_id)
-        
         if not members:
-            # Fallback: use the user who sent the command
             members = [update.effective_user]
         
         random_user = random.choice(members)
@@ -183,91 +169,45 @@ async def cringe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error in cringe_command: {e}")
         try:
             await update.message.reply_text("Oops! Something went wrong 😅")
-        except:
-            pass
+        except: pass
 
 # Command: /chammar
 async def chammar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Always reply with SHAKTI."""
     try:
         await update.message.reply_text("SHAKTI 💪🔥")
     except Exception as e:
         logger.error(f"Error in chammar_command: {e}")
 
-# Command: /help
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show available commands."""
+# ------- NEW FUN COMMANDS ---------
+
+async def roast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        help_text = """
-🤖 *Available Commands:*
+        members = await get_human_members(context, update.effective_chat.id) or [update.effective_user]
+        user = random.choice(members)
+        mention = get_user_mention(user)
+        messages = [
+            f"💀 {mention} was the practice test before evolution got it right 😂",
+            f"🤣 {mention} looks like WiFi at 1 bar — always weak",
+            f"📉 {mention} = human version of 'Try again later'",
+            f"🤡 Even ChatGPT refuses to reply to {mention}",
+            f"💥 {mention} broke the roast-meter"
+        ]
+        await update.message.reply_text(random.choice(messages))
+    except: pass
 
-/gay - Pick a random member with gay percentage 🌈
-/couple - Find today's couple 💞
-/cringe - Roast a random member 🤡
-/chammar - Get motivated 💪
-/help - Show this message
+async def simp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        members = await get_human_members(context, update.effective_chat.id) or [update.effective_user]
+        user = random.choice(members)
+        mention = get_user_mention(user)
+        messages = [
+            f"💘 {mention} donated their kidney to their crush… still friendzoned 😂",
+            f"🤣 {mention} liked 200 posts of their crush at 3AM",
+            f"🌚 {mention} achieved Level 100 Simp Master",
+            f"📉 Simp stocks crashing thanks to {mention}",
+            f"😂 {mention} is so down bad even gravity said 'damn'"
+        ]
+        await update.message.reply_text(random.choice(messages))
+    except: pass
 
-_Note: Most commands work only in groups!_
-        """
-        await update.message.reply_text(help_text, parse_mode='Markdown')
-    except Exception as e:
-        logger.error(f"Error in help_command: {e}")
-
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Log errors caused by updates but don't crash."""
-    logger.error(f'Update {update} caused error {context.error}', exc_info=context.error)
-
-def start_bot():
-    """Start the bot with error recovery."""
-    while True:
-        try:
-            # Get token from environment variable
-            TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-            
-            if not TOKEN:
-                logger.error("TELEGRAM_BOT_TOKEN not found in environment variables!")
-                time.sleep(10)
-                continue
-            
-            logger.info("Starting bot...")
-            
-            # Create the Application
-            application = Application.builder().token(TOKEN).build()
-            
-            # Register command handlers
-            application.add_handler(CommandHandler("gay", gay_command))
-            application.add_handler(CommandHandler("couple", couple_command))
-            application.add_handler(CommandHandler("cringe", cringe_command))
-            application.add_handler(CommandHandler("chammar", chammar_command))
-            application.add_handler(CommandHandler("help", help_command))
-            
-            # Register error handler
-            application.add_error_handler(error_handler)
-            
-            # Start the Bot
-            logger.info("Bot started successfully!")
-            application.run_polling(
-                allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=True
-            )
-            
-        except KeyboardInterrupt:
-            logger.info("Bot stopped by user")
-            break
-        except Exception as e:
-            logger.error(f"Bot crashed with error: {e}")
-            logger.info("Restarting bot in 5 seconds...")
-            time.sleep(5)
-
-def main():
-    """Main function to start Flask and Bot."""
-    # Start Flask in a separate thread
-    flask_thread = Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    logger.info("Flask server started on port {}".format(os.environ.get('PORT', 10000)))
-    
-    # Start bot with auto-restart on crash
-    start_bot()
-
-if __name__ == '__main__':
-    main()
+# Add more commands similarly: /legend, /noob, /
