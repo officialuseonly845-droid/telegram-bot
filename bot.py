@@ -248,10 +248,12 @@ def start_bot():
             logger.info("Bot started successfully!")
             application.run_polling(
                 allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=True,
-                close_loop=False
+                drop_pending_updates=True
             )
             
+        except KeyboardInterrupt:
+            logger.info("Bot stopped by user")
+            break
         except Exception as e:
             logger.error(f"Bot crashed with error: {e}")
             logger.info("Restarting bot in 5 seconds...")
