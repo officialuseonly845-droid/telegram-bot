@@ -1,656 +1,619 @@
+import os
 import logging
+import random
+import asyncio
 from datetime import datetime, timedelta
+from threading import Thread
+from flask import Flask, jsonify
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-import random
-import os
 
-# Enable logging
+# Configure logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Daily selections storage {chat_id: {command: {date: YYYY-MM-DD, user: username}}}
-daily_selections = {}
+# Flask app for uptime monitoring
+app = Flask(__name__)
 
-def get_group_members(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    """Get list of non-bot members from the group"""
+# Daily locks storage (chat_id -> {command: {date, user, data}})
+daily_locks = {}
+
+# Roast messages
+ROASTS = [
+    "💀 {user} got roasted harder than a marshmallow! 🔥",
+    "😂 {user} needs ice for that BURN! 🧊",
+    "🤡 {user} just became the group's comedy show!",
+    "💥 {user} got destroyed! Call 911! 🚑",
+    "🔥 {user} is now extra crispy! 😭"
+]
+
+SIMP_MESSAGES = [
+    "💘 {user} is today's official SIMP! 🌚",
+    "😍 {user} simping level: MAXIMUM! 📈",
+    "💞 {user} won the simp championship! 🏆",
+    "🤡 {user} = Professional Simp 💯"
+]
+
+LEGEND_MESSAGES = [
+    "👑 {user} is THE LEGEND today! 😎",
+    "⚡ {user} unlocked LEGEND status! 🔥",
+    "🌟 All hail {user}, today's LEGEND! 👑",
+    "💪 {user} is the group ICON! 🔥"
+]
+
+NOOB_MESSAGES = [
+    "🍼 {user} is today's official NOOB! 😂",
+    "🤣 {user} needs a tutorial! 📖",
+    "😅 {user} = Beginner mode activated! 🎮",
+    "🤡 {user} still learning the basics! 📚"
+]
+
+BRAIN_MESSAGES = [
+    "🧠 {user}'s brain power: {pct}% 🤯",
+    "💭 {user}'s IQ today: {pct}% 😂",
+    "🤓 {user} is {pct}% smart today! 📊",
+    "🧠 {user}'s brain cells active: {pct}% 🔬"
+]
+
+SLEEP_MESSAGES = [
+    "😴 {user} is the sleepyhead of the day! 💤",
+    "🛌 {user} needs coffee ASAP! ☕",
+    "💤 {user} = Professional Sleeper 😂",
+    "😪 {user} forgot to wake up! ⏰"
+]
+
+FOODIE_MESSAGES = [
+    "🍔 {user} is today's FOODIE! 🍕",
+    "😋 {user} lives to EAT! 🍰",
+    "🍟 {user} = Food Champion! 🏆",
+    "🍜 {user} is always HUNGRY! 😂"
+]
+
+DEAD_MESSAGES = [
+    "💀 {user} is DONE for today! 😂",
+    "⚰️ {user} has left the chat (mentally) 💀",
+    "😵 {user} is officially DEAD! 🪦",
+    "💀 RIP {user}, you tried! 🕊️"
+]
+
+MONKEY_MESSAGES = [
+    "🐒 {user} is the group MONKEY! 🙈",
+    "🍌 {user} = Official Banana Lover! 🐵",
+    "🙉 {user} is going APE! 🐒",
+    "🐵 {user} needs a zoo! 😂"
+]
+
+CAP_MESSAGES = [
+    "🧢 {user} is CAPPING hard! 🤥",
+    "🤡 {user} lying level: 100% 🧢",
+    "😂 {user} = Professional Liar! 🧢",
+    "🧢 {user} stop the CAP! 🛑"
+]
+
+SUS_MESSAGES = [
+    "🤔 {user} is SUS today! 🚨",
+    "🕵️ {user} acting SUSPICIOUS! 👀",
+    "🚨 {user} = Imposter vibes! 🤡",
+    "😬 {user} is doing something shady! 🕵️"
+]
+
+DANCE_MESSAGES = [
+    "🕺 {user} is DANCING! 💃",
+    "💃 {user} got the moves! 🔥",
+    "🎵 {user} = Dance Champion! 🕺",
+    "🪩 {user} is on fire! 💃"
+]
+
+MIRROR_MESSAGES = [
+    "🪞 {user} looked in the mirror and ran away! 😬",
+    "😂 {user}'s reflection called for help! 🪞",
+    "🤡 {user}'s mirror cracked! 💀",
+    "🪞 {user}'s reflection needs therapy! 😭"
+]
+
+RANDOM_MESSAGES = [
+    "🎲 {user} got a {pct}% random rating! 🤡",
+    "🎰 {user}'s vibe today: {pct}% 😂",
+    "🎲 Random stats for {user}: {pct}% 🔥",
+    "🤪 {user} = {pct}% chaos energy! 🎲"
+]
+
+CHAMMAR_ROASTS = [
+    "SHAKTI? More like TOILET KING 🤡🚽, cleaning more than just his ego!",
+    "Watch out, everyone… Shakti is coming with his mop of doom! 🧹🤡",
+    "SHAKTI 💪🔥? Nah, more like SHAKTI 🤡🪣, master of flushing dreams!",
+    "Here comes Shakti, proving every day that scrubbing toilets > scrubbing reputations 🤡",
+    "Legends say Shakti once tried to touch fame… got flushed immediately 🚽🤣",
+    "SHAKTI's special skill: making toilets shine and hopes die simultaneously 🤣🤡",
+    "If humility was a toilet, Shakti would own the throne 🤡🚽"
+]
+
+# Flask routes
+@app.route('/')
+def home():
+    return jsonify({
+        "status": "online",
+        "bot": "Telegram Fun Bot",
+        "uptime": "active"
+    })
+
+@app.route('/ping')
+def ping():
+    return jsonify({"status": "ok", "timestamp": datetime.now().isoformat()})
+
+@app.route('/health')
+def health():
+    return jsonify({"status": "healthy", "service": "telegram-bot"})
+
+def run_flask():
+    """Run Flask server in a separate thread"""
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+
+async def get_random_member(update: Update):
+    """Get a random human member from the chat"""
     try:
-        # Get chat administrators and members
-        admins = context.bot.get_chat_administrators(chat_id)
-        members = [admin.user for admin in admins if not admin.user.is_bot]
-        return members
+        chat_id = update.effective_chat.id
+        admins = await update.effective_chat.get_administrators()
+        
+        # Filter out bots
+        human_members = [admin.user for admin in admins if not admin.user.is_bot]
+        
+        if human_members:
+            return random.choice(human_members)
+        
+        # Fallback to message sender
+        return update.effective_user
     except Exception as e:
-        logger.error(f"Error getting group members: {e}")
-        return []
+        logger.error(f"Error getting random member: {e}")
+        return update.effective_user
 
-def get_user_display_name(user):
-    """Get username or first name"""
+def get_user_display(user):
+    """Get user display name with @ if available"""
     if user.username:
         return f"@{user.username}"
     return user.first_name
 
-def get_daily_selection(chat_id: int, command: str, members: list):
-    """Get or create daily selection for a command"""
-    today = datetime.now().strftime('%Y-%m-%d')
+def check_daily_lock(chat_id, command):
+    """Check if command is locked for today, return None if expired or doesn't exist"""
+    today = datetime.now().date()
     
-    if chat_id not in daily_selections:
-        daily_selections[chat_id] = {}
+    if chat_id not in daily_locks:
+        return None
     
-    if command not in daily_selections[chat_id]:
-        daily_selections[chat_id][command] = {}
+    if command in daily_locks[chat_id]:
+        lock_date = daily_locks[chat_id][command]['date']
+        if lock_date == today:
+            return daily_locks[chat_id][command]
     
-    stored = daily_selections[chat_id][command]
+    return None
+
+def set_daily_lock(chat_id, command, data):
+    """Set daily lock for a command with data"""
+    today = datetime.now().date()
     
-    # Check if selection is from today
-    if stored.get('date') == today:
-        return stored.get('users')
+    if chat_id not in daily_locks:
+        daily_locks[chat_id] = {}
     
-    # Create new selection for today
-    if command == 'couple':
-        if len(members) < 2:
-            return None
-        selected = random.sample(members, 2)
-    else:
-        if len(members) < 1:
-            return None
-        selected = [random.choice(members)]
-    
-    daily_selections[chat_id][command] = {
+    daily_locks[chat_id][command] = {
         'date': today,
-        'users': selected
+        'data': data
     }
-    
-    return selected
 
-async def is_group_chat(update: Update) -> bool:
-    """Check if message is from a group"""
-    return update.effective_chat.type in ['group', 'supergroup']
+# Command handlers
+async def gay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Pick today's gay"""
+    chat_id = update.effective_chat.id
+    
+    locked = check_daily_lock(chat_id, 'gay')
+    if locked:
+        user = locked['data']['user']
+        pct = locked['data']['pct']
+        user_display = get_user_display(user)
+        await update.message.reply_text(f"🌈 Today's gay is still {user_display}! ({pct}% gay) 🌚")
+        return
+    
+    user = await get_random_member(update)
+    pct = random.randint(1, 100)
+    set_daily_lock(chat_id, 'gay', {'user': user, 'pct': pct})
+    
+    user_display = get_user_display(user)
+    await update.message.reply_text(f"🌈 Today's gay is {user_display}! ({pct}% gay) 🌚")
 
-async def gay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Gay percentage command"""
-    if not await is_group_chat(update):
-        await update.message.reply_text("This command only works in groups! 🌈")
+async def couple(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ship two random members"""
+    chat_id = update.effective_chat.id
+    
+    locked = check_daily_lock(chat_id, 'couple')
+    if locked:
+        user1 = locked['data']['user1']
+        user2 = locked['data']['user2']
+        pct = locked['data']['pct']
+        user1_display = get_user_display(user1)
+        user2_display = get_user_display(user2)
+        await update.message.reply_text(f"💞 Today's couple is still {user1_display} ❤️ {user2_display}! ({pct}% match)")
         return
     
-    members = get_group_members(context, update.effective_chat.id)
-    if not members:
-        await update.message.reply_text("Couldn't get group members! 😅")
-        return
+    user1 = await get_random_member(update)
+    user2 = await get_random_member(update)
     
-    selected = get_daily_selection(update.effective_chat.id, 'gay', members)
-    if not selected:
-        await update.message.reply_text("Not enough members in the group! 😅")
-        return
+    # Ensure different users
+    attempts = 0
+    while user1.id == user2.id and attempts < 5:
+        user2 = await get_random_member(update)
+        attempts += 1
     
-    user = selected[0]
-    percentage = random.randint(0, 100)
+    pct = random.randint(1, 100)
+    set_daily_lock(chat_id, 'couple', {'user1': user1, 'user2': user2, 'pct': pct})
     
-    responses = [
-        f"🌈 {get_user_display_name(user)} is {percentage}% gay today!",
-        f"🏳️‍🌈 Gay meter shows {percentage}% for {get_user_display_name(user)}!",
-        f"🌈 According to my calculations, {get_user_display_name(user)} is {percentage}% gay! 💅",
-        f"🏳️‍🌈 {get_user_display_name(user)} scored {percentage}% on the gay scale today!",
-    ]
+    user1_display = get_user_display(user1)
+    user2_display = get_user_display(user2)
     
-    await update.message.reply_text(random.choice(responses))
+    await update.message.reply_text(f"💞 Today's couple: {user1_display} ❤️ {user2_display}! ({pct}% match)")
 
-async def couple_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Couple of the day command"""
-    if not await is_group_chat(update):
-        await update.message.reply_text("This command only works in groups! 💞")
+async def cringe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Find the cringe king/queen"""
+    chat_id = update.effective_chat.id
+    
+    locked = check_daily_lock(chat_id, 'cringe')
+    if locked:
+        user = locked['data']['user']
+        user_display = get_user_display(user)
+        await update.message.reply_text(f"🤡 The cringe king/queen is still {user_display}! 😂")
         return
     
-    members = get_group_members(context, update.effective_chat.id)
-    if len(members) < 2:
-        await update.message.reply_text("Not enough members for a couple! 😅")
-        return
+    user = await get_random_member(update)
+    set_daily_lock(chat_id, 'cringe', {'user': user})
     
-    selected = get_daily_selection(update.effective_chat.id, 'couple', members)
-    if not selected:
-        await update.message.reply_text("Not enough members in the group! 😅")
-        return
-    
-    user1, user2 = selected
-    
-    responses = [
-        f"💞 Today's couple: {get_user_display_name(user1)} ❤️ {get_user_display_name(user2)}!",
-        f"💑 {get_user_display_name(user1)} and {get_user_display_name(user2)} are the couple of the day!",
-        f"❤️ Love is in the air! {get_user_display_name(user1)} × {get_user_display_name(user2)} 💕",
-        f"💘 {get_user_display_name(user1)} + {get_user_display_name(user2)} = Perfect match! 💖",
-    ]
-    
-    await update.message.reply_text(random.choice(responses))
+    user_display = get_user_display(user)
+    await update.message.reply_text(f"🤡 Today's cringe king/queen is {user_display}! 😂")
 
-async def cringe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cringe roast command"""
-    if not await is_group_chat(update):
-        await update.message.reply_text("This command only works in groups! 🤡")
-        return
-    
-    members = get_group_members(context, update.effective_chat.id)
-    if not members:
-        await update.message.reply_text("Couldn't get group members! 😅")
-        return
-    
-    selected = get_daily_selection(update.effective_chat.id, 'cringe', members)
-    if not selected:
-        await update.message.reply_text("Not enough members in the group! 😅")
-        return
-    
-    user = selected[0]
-    
-    responses = [
-        f"🤡 {get_user_display_name(user)} is the cringiest person today!",
-        f"😬 Cringe level: {get_user_display_name(user)} - MAXIMUM!",
-        f"🤦 {get_user_display_name(user)} makes everyone uncomfortable with their cringe!",
-        f"🙈 Can't watch {get_user_display_name(user)} without cringing!",
-    ]
-    
-    await update.message.reply_text(random.choice(responses))
+async def chammar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Always roasts Shakti - NO DAILY LOCK"""
+    roast = random.choice(CHAMMAR_ROASTS)
+    await update.message.reply_text(f"💪 {roast}")
 
-async def chammar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Chammar command - always replies SHAKTI"""
-    responses = [
-        "SHAKTI 💪🔥",
-        "💪 SHAKTI 🔥",
-        "🔥 SHAKTI 💪",
-        "⚡ SHAKTI POWER! 💪🔥",
-    ]
-    await update.message.reply_text(random.choice(responses))
+async def roast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Roast a random member"""
+    chat_id = update.effective_chat.id
+    
+    locked = check_daily_lock(chat_id, 'roast')
+    if locked:
+        user = locked['data']['user']
+        message = locked['data']['message']
+        await update.message.reply_text(message)
+        return
+    
+    user = await get_random_member(update)
+    user_display = get_user_display(user)
+    message = random.choice(ROASTS).format(user=user_display)
+    set_daily_lock(chat_id, 'roast', {'user': user, 'message': message})
+    await update.message.reply_text(message)
 
-async def roast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Savage roast command"""
-    if not await is_group_chat(update):
-        await update.message.reply_text("This command only works in groups! 🤣")
+async def simp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Expose the simp"""
+    chat_id = update.effective_chat.id
+    
+    locked = check_daily_lock(chat_id, 'simp')
+    if locked:
+        user = locked['data']['user']
+        message = locked['data']['message']
+        await update.message.reply_text(message)
         return
     
-    members = get_group_members(context, update.effective_chat.id)
-    if not members:
-        await update.message.reply_text("Couldn't get group members! 😅")
-        return
-    
-    selected = get_daily_selection(update.effective_chat.id, 'roast', members)
-    if not selected:
-        await update.message.reply_text("Not enough members in the group! 😅")
-        return
-    
-    user = selected[0]
-    
-    responses = [
-        f"🔥 {get_user_display_name(user)} got roasted harder than a marshmallow!",
-        f"🤣 {get_user_display_name(user)}, even your selfies know they deserve better!",
-        f"😂 {get_user_display_name(user)} is the reason shampoo has instructions!",
-        f"💀 {get_user_display_name(user)}, your birth certificate is an apology letter!",
-    ]
-    
-    await update.message.reply_text(random.choice(responses))
+    user = await get_random_member(update)
+    user_display = get_user_display(user)
+    message = random.choice(SIMP_MESSAGES).format(user=user_display)
+    set_daily_lock(chat_id, 'simp', {'user': user, 'message': message})
+    await update.message.reply_text(message)
 
-async def simp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Simp of the day command"""
-    if not await is_group_chat(update):
-        await update.message.reply_text("This command only works in groups! 🌚")
+async def legend(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Declare today's legend"""
+    chat_id = update.effective_chat.id
+    
+    locked = check_daily_lock(chat_id, 'legend')
+    if locked:
+        user = locked['data']['user']
+        message = locked['data']['message']
+        await update.message.reply_text(message)
         return
     
-    members = get_group_members(context, update.effective_chat.id)
-    if not members:
-        await update.message.reply_text("Couldn't get group members! 😅")
-        return
-    
-    selected = get_daily_selection(update.effective_chat.id, 'simp', members)
-    if not selected:
-        await update.message.reply_text("Not enough members in the group! 😅")
-        return
-    
-    user = selected[0]
-    
-    responses = [
-        f"🌚 Today's simp award goes to {get_user_display_name(user)}!",
-        f"😳 {get_user_display_name(user)} is the biggest simp in the chat!",
-        f"💸 {get_user_display_name(user)} simping so hard today!",
-        f"🤡 {get_user_display_name(user)} needs to stop simping fr!",
-    ]
-    
-    await update.message.reply_text(random.choice(responses))
+    user = await get_random_member(update)
+    user_display = get_user_display(user)
+    message = random.choice(LEGEND_MESSAGES).format(user=user_display)
+    set_daily_lock(chat_id, 'legend', {'user': user, 'message': message})
+    await update.message.reply_text(message)
 
-async def legend_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Legend of the day command"""
-    if not await is_group_chat(update):
-        await update.message.reply_text("This command only works in groups! 😎")
+async def noob(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Call out the noob"""
+    chat_id = update.effective_chat.id
+    
+    locked = check_daily_lock(chat_id, 'noob')
+    if locked:
+        user = locked['data']['user']
+        message = locked['data']['message']
+        await update.message.reply_text(message)
         return
     
-    members = get_group_members(context, update.effective_chat.id)
-    if not members:
-        await update.message.reply_text("Couldn't get group members! 😅")
-        return
-    
-    selected = get_daily_selection(update.effective_chat.id, 'legend', members)
-    if not selected:
-        await update.message.reply_text("Not enough members in the group! 😅")
-        return
-    
-    user = selected[0]
-    
-    responses = [
-        f"😎 {get_user_display_name(user)} is today's group legend!",
-        f"🏆 All hail {get_user_display_name(user)}, the legend!",
-        f"👑 {get_user_display_name(user)} is an absolute legend today!",
-        f"⭐ {get_user_display_name(user)} - LEGENDARY STATUS ACHIEVED!",
-    ]
-    
-    await update.message.reply_text(random.choice(responses))
+    user = await get_random_member(update)
+    user_display = get_user_display(user)
+    message = random.choice(NOOB_MESSAGES).format(user=user_display)
+    set_daily_lock(chat_id, 'noob', {'user': user, 'message': message})
+    await update.message.reply_text(message)
 
-async def noob_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Noob of the day command"""
-    if not await is_group_chat(update):
-        await update.message.reply_text("This command only works in groups! 😂")
+async def luck(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Rate someone's luck"""
+    chat_id = update.effective_chat.id
+    
+    locked = check_daily_lock(chat_id, 'luck')
+    if locked:
+        user = locked['data']['user']
+        pct = locked['data']['pct']
+        user_display = get_user_display(user)
+        await update.message.reply_text(f"🍀 {user_display}'s luck today: {pct}% 🎲")
         return
     
-    members = get_group_members(context, update.effective_chat.id)
-    if not members:
-        await update.message.reply_text("Couldn't get group members! 😅")
-        return
-    
-    selected = get_daily_selection(update.effective_chat.id, 'noob', members)
-    if not selected:
-        await update.message.reply_text("Not enough members in the group! 😅")
-        return
-    
-    user = selected[0]
-    
-    responses = [
-        f"😂 {get_user_display_name(user)} is today's certified noob!",
-        f"🤦 {get_user_display_name(user)} wins the noob award!",
-        f"😅 {get_user_display_name(user)} - professional noob!",
-        f"🙃 {get_user_display_name(user)} is the noobiest noob today!",
-    ]
-    
-    await update.message.reply_text(random.choice(responses))
+    user = await get_random_member(update)
+    user_display = get_user_display(user)
+    pct = random.randint(0, 100)
+    set_daily_lock(chat_id, 'luck', {'user': user, 'pct': pct})
+    await update.message.reply_text(f"🍀 {user_display}'s luck today: {pct}% 🎲")
 
-async def luck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Luck rating command"""
-    if not await is_group_chat(update):
-        await update.message.reply_text("This command only works in groups! 🎲")
+async def dance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show someone dancing"""
+    chat_id = update.effective_chat.id
+    
+    locked = check_daily_lock(chat_id, 'dance')
+    if locked:
+        user = locked['data']['user']
+        message = locked['data']['message']
+        await update.message.reply_text(message)
         return
     
-    members = get_group_members(context, update.effective_chat.id)
-    if not members:
-        await update.message.reply_text("Couldn't get group members! 😅")
-        return
-    
-    selected = get_daily_selection(update.effective_chat.id, 'luck', members)
-    if not selected:
-        await update.message.reply_text("Not enough members in the group! 😅")
-        return
-    
-    user = selected[0]
-    luck_level = random.randint(0, 100)
-    
-    responses = [
-        f"🎲 {get_user_display_name(user)} has {luck_level}% luck today!",
-        f"🍀 Luck meter: {get_user_display_name(user)} - {luck_level}%!",
-        f"🎰 {get_user_display_name(user)}'s luck level: {luck_level}%!",
-        f"✨ {get_user_display_name(user)} is {luck_level}% lucky today!",
-    ]
-    
-    await update.message.reply_text(random.choice(responses))
+    user = await get_random_member(update)
+    user_display = get_user_display(user)
+    message = random.choice(DANCE_MESSAGES).format(user=user_display)
+    set_daily_lock(chat_id, 'dance', {'user': user, 'message': message})
+    await update.message.reply_text(message)
 
-async def dance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Dance command"""
-    if not await is_group_chat(update):
-        await update.message.reply_text("This command only works in groups! 💃")
+async def brain(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Rate brainpower"""
+    chat_id = update.effective_chat.id
+    
+    locked = check_daily_lock(chat_id, 'brain')
+    if locked:
+        user = locked['data']['user']
+        pct = locked['data']['pct']
+        message = locked['data']['message']
+        await update.message.reply_text(message)
         return
     
-    members = get_group_members(context, update.effective_chat.id)
-    if not members:
-        await update.message.reply_text("Couldn't get group members! 😅")
-        return
-    
-    selected = get_daily_selection(update.effective_chat.id, 'dance', members)
-    if not selected:
-        await update.message.reply_text("Not enough members in the group! 😅")
-        return
-    
-    user = selected[0]
-    
-    responses = [
-        f"💃 {get_user_display_name(user)} is dancing like nobody's watching!",
-        f"🕺 {get_user_display_name(user)} got the moves today!",
-        f"💃🕺 {get_user_display_name(user)} is tearing up the dance floor!",
-        f"🎵 {get_user_display_name(user)} can't stop dancing!",
-    ]
-    
-    await update.message.reply_text(random.choice(responses))
+    user = await get_random_member(update)
+    user_display = get_user_display(user)
+    pct = random.randint(0, 200)
+    message = random.choice(BRAIN_MESSAGES).format(user=user_display, pct=pct)
+    set_daily_lock(chat_id, 'brain', {'user': user, 'pct': pct, 'message': message})
+    await update.message.reply_text(message)
 
-async def brain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Brain power rating command"""
-    if not await is_group_chat(update):
-        await update.message.reply_text("This command only works in groups! 🤯")
+async def sleep(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mark the sleepyhead"""
+    chat_id = update.effective_chat.id
+    
+    locked = check_daily_lock(chat_id, 'sleep')
+    if locked:
+        user = locked['data']['user']
+        message = locked['data']['message']
+        await update.message.reply_text(message)
         return
     
-    members = get_group_members(context, update.effective_chat.id)
-    if not members:
-        await update.message.reply_text("Couldn't get group members! 😅")
-        return
-    
-    selected = get_daily_selection(update.effective_chat.id, 'brain', members)
-    if not selected:
-        await update.message.reply_text("Not enough members in the group! 😅")
-        return
-    
-    user = selected[0]
-    brain_level = random.randint(0, 100)
-    
-    responses = [
-        f"🤯 {get_user_display_name(user)} has {brain_level}% brainpower today!",
-        f"🧠 Brain level: {get_user_display_name(user)} - {brain_level}%!",
-        f"🤓 {get_user_display_name(user)}'s IQ meter: {brain_level}%!",
-        f"💡 {get_user_display_name(user)} is using {brain_level}% of their brain!",
-    ]
-    
-    await update.message.reply_text(random.choice(responses))
+    user = await get_random_member(update)
+    user_display = get_user_display(user)
+    message = random.choice(SLEEP_MESSAGES).format(user=user_display)
+    set_daily_lock(chat_id, 'sleep', {'user': user, 'message': message})
+    await update.message.reply_text(message)
 
-async def sleep_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Sleepyhead command"""
-    if not await is_group_chat(update):
-        await update.message.reply_text("This command only works in groups! 💤")
+async def foodie(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Pick the foodie"""
+    chat_id = update.effective_chat.id
+    
+    locked = check_daily_lock(chat_id, 'foodie')
+    if locked:
+        user = locked['data']['user']
+        message = locked['data']['message']
+        await update.message.reply_text(message)
         return
     
-    members = get_group_members(context, update.effective_chat.id)
-    if not members:
-        await update.message.reply_text("Couldn't get group members! 😅")
-        return
-    
-    selected = get_daily_selection(update.effective_chat.id, 'sleep', members)
-    if not selected:
-        await update.message.reply_text("Not enough members in the group! 😅")
-        return
-    
-    user = selected[0]
-    
-    responses = [
-        f"💤 {get_user_display_name(user)} is the sleepyhead of the day!",
-        f"😴 {get_user_display_name(user)} can't stop yawning today!",
-        f"🛌 {get_user_display_name(user)} needs more sleep!",
-        f"😪 {get_user_display_name(user)} is sleep-deprived!",
-    ]
-    
-    await update.message.reply_text(random.choice(responses))
+    user = await get_random_member(update)
+    user_display = get_user_display(user)
+    message = random.choice(FOODIE_MESSAGES).format(user=user_display)
+    set_daily_lock(chat_id, 'foodie', {'user': user, 'message': message})
+    await update.message.reply_text(message)
 
-async def foodie_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Foodie command"""
-    if not await is_group_chat(update):
-        await update.message.reply_text("This command only works in groups! 🍕")
+async def dead(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Declare someone dead"""
+    chat_id = update.effective_chat.id
+    
+    locked = check_daily_lock(chat_id, 'dead')
+    if locked:
+        user = locked['data']['user']
+        message = locked['data']['message']
+        await update.message.reply_text(message)
         return
     
-    members = get_group_members(context, update.effective_chat.id)
-    if not members:
-        await update.message.reply_text("Couldn't get group members! 😅")
-        return
-    
-    selected = get_daily_selection(update.effective_chat.id, 'foodie', members)
-    if not selected:
-        await update.message.reply_text("Not enough members in the group! 😅")
-        return
-    
-    user = selected[0]
-    
-    responses = [
-        f"🍕 {get_user_display_name(user)} is today's foodie champion!",
-        f"🍔 {get_user_display_name(user)} is always hungry!",
-        f"🍰 {get_user_display_name(user)} lives for food!",
-        f"🌮 {get_user_display_name(user)} can't stop eating today!",
-    ]
-    
-    await update.message.reply_text(random.choice(responses))
+    user = await get_random_member(update)
+    user_display = get_user_display(user)
+    message = random.choice(DEAD_MESSAGES).format(user=user_display)
+    set_daily_lock(chat_id, 'dead', {'user': user, 'message': message})
+    await update.message.reply_text(message)
 
-async def dead_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Dead/done command"""
-    if not await is_group_chat(update):
-        await update.message.reply_text("This command only works in groups! 💀")
+async def monkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tag the group monkey"""
+    chat_id = update.effective_chat.id
+    
+    locked = check_daily_lock(chat_id, 'monkey')
+    if locked:
+        user = locked['data']['user']
+        message = locked['data']['message']
+        await update.message.reply_text(message)
         return
     
-    members = get_group_members(context, update.effective_chat.id)
-    if not members:
-        await update.message.reply_text("Couldn't get group members! 😅")
-        return
-    
-    selected = get_daily_selection(update.effective_chat.id, 'dead', members)
-    if not selected:
-        await update.message.reply_text("Not enough members in the group! 😅")
-        return
-    
-    user = selected[0]
-    
-    responses = [
-        f"💀 {get_user_display_name(user)} is done for today!",
-        f"☠️ {get_user_display_name(user)} has been eliminated!",
-        f"💀 RIP {get_user_display_name(user)}!",
-        f"⚰️ {get_user_display_name(user)} is dead inside!",
-    ]
-    
-    await update.message.reply_text(random.choice(responses))
+    user = await get_random_member(update)
+    user_display = get_user_display(user)
+    message = random.choice(MONKEY_MESSAGES).format(user=user_display)
+    set_daily_lock(chat_id, 'monkey', {'user': user, 'message': message})
+    await update.message.reply_text(message)
 
-async def monkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Monkey command"""
-    if not await is_group_chat(update):
-        await update.message.reply_text("This command only works in groups! 🙈")
+async def cap(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Call out someone lying"""
+    chat_id = update.effective_chat.id
+    
+    locked = check_daily_lock(chat_id, 'cap')
+    if locked:
+        user = locked['data']['user']
+        message = locked['data']['message']
+        await update.message.reply_text(message)
         return
     
-    members = get_group_members(context, update.effective_chat.id)
-    if not members:
-        await update.message.reply_text("Couldn't get group members! 😅")
-        return
-    
-    selected = get_daily_selection(update.effective_chat.id, 'monkey', members)
-    if not selected:
-        await update.message.reply_text("Not enough members in the group! 😅")
-        return
-    
-    user = selected[0]
-    
-    responses = [
-        f"🙈 {get_user_display_name(user)} is today's group monkey!",
-        f"🐵 {get_user_display_name(user)} is going bananas!",
-        f"🍌 {get_user_display_name(user)} - monkeying around!",
-        f"🙊 {get_user_display_name(user)} is the monkey of the day!",
-    ]
-    
-    await update.message.reply_text(random.choice(responses))
+    user = await get_random_member(update)
+    user_display = get_user_display(user)
+    message = random.choice(CAP_MESSAGES).format(user=user_display)
+    set_daily_lock(chat_id, 'cap', {'user': user, 'message': message})
+    await update.message.reply_text(message)
 
-async def cap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cap/lying command"""
-    if not await is_group_chat(update):
-        await update.message.reply_text("This command only works in groups! 🧢")
+async def sus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mark someone suspicious"""
+    chat_id = update.effective_chat.id
+    
+    locked = check_daily_lock(chat_id, 'sus')
+    if locked:
+        user = locked['data']['user']
+        message = locked['data']['message']
+        await update.message.reply_text(message)
         return
     
-    members = get_group_members(context, update.effective_chat.id)
-    if not members:
-        await update.message.reply_text("Couldn't get group members! 😅")
-        return
-    
-    selected = get_daily_selection(update.effective_chat.id, 'cap', members)
-    if not selected:
-        await update.message.reply_text("Not enough members in the group! 😅")
-        return
-    
-    user = selected[0]
-    
-    responses = [
-        f"🧢 {get_user_display_name(user)} is capping hard today!",
-        f"🤥 {get_user_display_name(user)} stop the cap!",
-        f"🧢 {get_user_display_name(user)} - biggest liar of the day!",
-        f"🎩 {get_user_display_name(user)} is wearing the cap!",
-    ]
-    
-    await update.message.reply_text(random.choice(responses))
+    user = await get_random_member(update)
+    user_display = get_user_display(user)
+    message = random.choice(SUS_MESSAGES).format(user=user_display)
+    set_daily_lock(chat_id, 'sus', {'user': user, 'message': message})
+    await update.message.reply_text(message)
 
-async def sus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Suspicious command"""
-    if not await is_group_chat(update):
-        await update.message.reply_text("This command only works in groups! 🚨")
+async def random_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Give a random rating"""
+    chat_id = update.effective_chat.id
+    
+    locked = check_daily_lock(chat_id, 'random')
+    if locked:
+        user = locked['data']['user']
+        pct = locked['data']['pct']
+        message = locked['data']['message']
+        await update.message.reply_text(message)
         return
     
-    members = get_group_members(context, update.effective_chat.id)
-    if not members:
-        await update.message.reply_text("Couldn't get group members! 😅")
-        return
-    
-    selected = get_daily_selection(update.effective_chat.id, 'sus', members)
-    if not selected:
-        await update.message.reply_text("Not enough members in the group! 😅")
-        return
-    
-    user = selected[0]
-    
-    responses = [
-        f"🚨 {get_user_display_name(user)} is acting sus today!",
-        f"👀 {get_user_display_name(user)} looking real suspicious!",
-        f"🤨 {get_user_display_name(user)} is the imposter!",
-        f"🚩 {get_user_display_name(user)} - major red flags!",
-    ]
-    
-    await update.message.reply_text(random.choice(responses))
+    user = await get_random_member(update)
+    user_display = get_user_display(user)
+    pct = random.randint(0, 100)
+    message = random.choice(RANDOM_MESSAGES).format(user=user_display, pct=pct)
+    set_daily_lock(chat_id, 'random', {'user': user, 'pct': pct, 'message': message})
+    await update.message.reply_text(message)
 
-async def random_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Random rating command"""
-    if not await is_group_chat(update):
-        await update.message.reply_text("This command only works in groups! 🤡")
+async def mirror(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Roast someone's reflection"""
+    chat_id = update.effective_chat.id
+    
+    locked = check_daily_lock(chat_id, 'mirror')
+    if locked:
+        user = locked['data']['user']
+        message = locked['data']['message']
+        await update.message.reply_text(message)
         return
     
-    members = get_group_members(context, update.effective_chat.id)
-    if not members:
-        await update.message.reply_text("Couldn't get group members! 😅")
-        return
-    
-    selected = get_daily_selection(update.effective_chat.id, 'random', members)
-    if not selected:
-        await update.message.reply_text("Not enough members in the group! 😅")
-        return
-    
-    user = selected[0]
-    rating = random.randint(0, 100)
-    
-    responses = [
-        f"🤡 {get_user_display_name(user)} scored {rating}% on the silly meter!",
-        f"🎲 Random rating for {get_user_display_name(user)}: {rating}%!",
-        f"🎪 {get_user_display_name(user)} is {rating}% chaotic today!",
-        f"🤪 {get_user_display_name(user)} got a {rating}% weirdness rating!",
-    ]
-    
-    await update.message.reply_text(random.choice(responses))
+    user = await get_random_member(update)
+    user_display = get_user_display(user)
+    message = random.choice(MIRROR_MESSAGES).format(user=user_display)
+    set_daily_lock(chat_id, 'mirror', {'user': user, 'message': message})
+    await update.message.reply_text(message)
 
-async def mirror_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Mirror roast command"""
-    if not await is_group_chat(update):
-        await update.message.reply_text("This command only works in groups! 😬")
-        return
-    
-    members = get_group_members(context, update.effective_chat.id)
-    if not members:
-        await update.message.reply_text("Couldn't get group members! 😅")
-        return
-    
-    selected = get_daily_selection(update.effective_chat.id, 'mirror', members)
-    if not selected:
-        await update.message.reply_text("Not enough members in the group! 😅")
-        return
-    
-    user = selected[0]
-    
-    responses = [
-        f"😬 {get_user_display_name(user)}'s mirror is filing a complaint!",
-        f"🪞 The mirror cracked when {get_user_display_name(user)} looked at it!",
-        f"😰 {get_user_display_name(user)}'s reflection ran away!",
-        f"🙈 Even the mirror can't handle {get_user_display_name(user)}!",
-    ]
-    
-    await update.message.reply_text(random.choice(responses))
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send help message with all commands"""
-    help_text = """
-🤖 **FUN BOT COMMANDS** 🤖
-
-🌈 /gay - Picks a random member and shows gay percentage
-💞 /couple - Picks two random members as couple of the day
-🤡 /cringe - Roasts a random member with cringe
-💪 /chammar - SHAKTI! 🔥
-🤣 /roast - Drops a savage roast on someone
-🌚 /simp - Exposes the simp of the day
-😎 /legend - Declares today's group legend
-😂 /noob - Calls out the noob of the day
-🎲 /luck - Gives a random luck rating
-💃 /dance - Shows a random member dancing
-🤯 /brain - Rates someone's brainpower
-💤 /sleep - Marks the sleepyhead
-🍕 /foodie - Picks today's foodie
-💀 /dead - Declares someone "done"
-🙈 /monkey - Tags the group monkey
-🧢 /cap - Calls out someone lying
-🚨 /sus - Marks someone suspicious
-🤡 /random - Gives a random silly rating
-😬 /mirror - Roasts someone's reflection
-❓ /help - Shows this help message
-
-**Note:** Most commands work only in groups and select the same person for 24 hours! 🎯
-    """
-    await update.message.reply_text(help_text)
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command"""
-    await update.message.reply_text(
-        "👋 Hi! I'm the Fun Bot!\n\n"
-        "Add me to a group and use /help to see all available commands!\n\n"
-        "Let's make your group more fun! 🎉"
-    )
+    welcome = """
+🎉 Welcome to Fun Bot! 🎉
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Log errors"""
-    logger.error(f"Update {update} caused error {context.error}")
+Available commands:
+🌈 /gay – Today's random gay
+💞 /couple – Random couple shipping
+🤡 /cringe – Cringe king/queen
+💪 /chammar – Roast Shakti
+💀 /roast – Savage roast
+💘 /simp – Simp of the day
+👑 /legend – Today's legend
+🍼 /noob – Noob of the day
+🍀 /luck – Luck rating
+🕺 /dance – Dancing member
+🧠 /brain – Brain power
+😴 /sleep – Sleepyhead
+🍔 /foodie – Group foodie
+💀 /dead – Done for today
+🐒 /monkey – Group monkey
+🧢 /cap – Liar callout
+🤔 /sus – Suspicious member
+🎲 /random – Random rating
+🪞 /mirror – Reflection roast
+
+Note: Results stay same for 24 hours (except /chammar)!
+"""
+    await update.message.reply_text(welcome)
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Handle errors"""
+    logger.error(f"Exception: {context.error}")
 
 def main():
-    """Start the bot"""
-    # Get token from environment variable
-    TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-    
-    if not TOKEN:
-        logger.error("No TELEGRAM_BOT_TOKEN found in environment variables!")
+    """Main function"""
+    # Get token from environment
+    token = os.environ.get('TELEGRAM_BOT_TOKEN')
+    if not token:
+        logger.error("TELEGRAM_BOT_TOKEN not found!")
         return
     
+    # Start Flask in background
+    flask_thread = Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logger.info("Flask server started")
+    
     # Create application
-    application = Application.builder().token(TOKEN).build()
+    application = Application.builder().token(token).build()
     
     # Add command handlers
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("gay", gay_command))
-    application.add_handler(CommandHandler("couple", couple_command))
-    application.add_handler(CommandHandler("cringe", cringe_command))
-    application.add_handler(CommandHandler("chammar", chammar_command))
-    application.add_handler(CommandHandler("roast", roast_command))
-    application.add_handler(CommandHandler("simp", simp_command))
-    application.add_handler(CommandHandler("legend", legend_command))
-    application.add_handler(CommandHandler("noob", noob_command))
-    application.add_handler(CommandHandler("luck", luck_command))
-    application.add_handler(CommandHandler("dance", dance_command))
-    application.add_handler(CommandHandler("brain", brain_command))
-    application.add_handler(CommandHandler("sleep", sleep_command))
-    application.add_handler(CommandHandler("foodie", foodie_command))
-    application.add_handler(CommandHandler("dead", dead_command))
-    application.add_handler(CommandHandler("monkey", monkey_command))
-    application.add_handler(CommandHandler("cap", cap_command))
-    application.add_handler(CommandHandler("sus", sus_command))
-    application.add_handler(CommandHandler("random", random_command))
-    application.add_handler(CommandHandler("mirror", mirror_command))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("gay", gay))
+    application.add_handler(CommandHandler("couple", couple))
+    application.add_handler(CommandHandler("cringe", cringe))
+    application.add_handler(CommandHandler("chammar", chammar))
+    application.add_handler(CommandHandler("roast", roast))
+    application.add_handler(CommandHandler("simp", simp))
+    application.add_handler(CommandHandler("legend", legend))
+    application.add_handler(CommandHandler("noob", noob))
+    application.add_handler(CommandHandler("luck", luck))
+    application.add_handler(CommandHandler("dance", dance))
+    application.add_handler(CommandHandler("brain", brain))
+    application.add_handler(CommandHandler("sleep", sleep))
+    application.add_handler(CommandHandler("foodie", foodie))
+    application.add_handler(CommandHandler("dead", dead))
+    application.add_handler(CommandHandler("monkey", monkey))
+    application.add_handler(CommandHandler("cap", cap))
+    application.add_handler(CommandHandler("sus", sus))
+    application.add_handler(CommandHandler("random", random_cmd))
+    application.add_handler(CommandHandler("mirror", mirror))
     
     # Add error handler
     application.add_error_handler(error_handler)
     
+    logger.info("Bot started polling...")
+    
     # Start the bot
-    logger.info("Bot started!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
