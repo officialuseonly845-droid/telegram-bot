@@ -24,8 +24,6 @@ lock_mutex = threading.Lock()
 
 # --- Config ---
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
-# Using Llama 3.1 8B for high-speed, high-limit free AI responses
-AI_MODEL = "meta-llama/llama-3.1-8b-instruct:free"
 WAKE_WORD = "beluga"
 
 # --- Helpers ---
@@ -39,39 +37,32 @@ def init_chat_data(chat_id):
     today = get_ist_time().date()
     with lock_mutex:
         if chat_id not in daily_locks or daily_locks[chat_id].get('date') != today:
-            daily_locks[chat_id] = {
-                'date': today,
-                'commands': {},
-                'user_strikes': {}, 
-                'seen_users': {}
-            }
+            daily_locks[chat_id] = {'date': today, 'commands': {}, 'user_strikes': {}, 'seen_users': {}}
         if chat_id not in chat_counters:
             chat_counters[chat_id] = 0
 
 async def get_ai_response(user_text):
-    if not OPENROUTER_KEY: return "Error: OpenRouter API Key missing."
-    try:
-        async with httpx.AsyncClient() as client:
-            res = await client.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENROUTER_KEY}",
-                    "HTTP-Referer": "https://stackhost.org", 
-                },
-                json={
-                    "model": AI_MODEL,
-                    "messages": [
-                        {"role": "system", "content": f"You are Beluga, a witty, sharp Telegram bot. Only answer if your name '{WAKE_WORD}' is mentioned. Be concise and clever."},
-                        {"role": "user", "content": user_text}
-                    ]
-                },
-                timeout=30.0
-            )
-            data = res.json()
-            return data['choices'][0]['message']['content']
-    except Exception as e:
-        logger.error(f"AI Error: {e}")
-        return "Beluga is taking a short nap. Try again in a minute! 💤"
+    if not OPENROUTER_KEY: return "Error: API Key missing!"
+    models = ["meta-llama/llama-3.3-70b-instruct:free", "meta-llama/llama-3.1-8b-instruct:free"]
+    for model in models:
+        try:
+            async with httpx.AsyncClient() as client:
+                res = await client.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {OPENROUTER_KEY}", "HTTP-Referer": "https://stackhost.org"},
+                    json={
+                        "model": model,
+                        "messages": [
+                            {"role": "system", "content": f"You are Beluga, a sharp Telegram bot. Only answer if '{WAKE_WORD}' is mentioned. Be brief."},
+                            {"role": "user", "content": user_text}
+                        ]
+                    },
+                    timeout=25.0
+                )
+                if res.status_code == 200:
+                    return res.json()['choices'][0]['message']['content']
+        except: continue
+    return "Llama is resting! Try in 10s. 💤"
 
 async def get_target_member(update: Update, chat_id, count=1):
     data = daily_locks[chat_id]
@@ -81,82 +72,63 @@ async def get_target_member(update: Update, chat_id, count=1):
         for a in admins:
             if not a.user.is_bot: candidates[a.user.id] = a.user
     except: pass
+    available = [uid for uid in candidates.keys() if data['user_strikes'].get(uid, 0) < 2]
+    if len(available) < count:
+        data['user_strikes'] = {}; available = list(candidates.keys())
+    chosen = random.sample(available, min(count, len(available)))
+    for cid in chosen: data['user_strikes'][cid] = data['user_strikes'].get(cid, 0) + 1
+    return [candidates[cid] for cid in chosen]
 
-    # STRIKE RULE: Pick users who haven't been picked twice today
-    available_ids = [uid for uid in candidates.keys() if data['user_strikes'].get(uid, 0) < 2]
-    if len(available_ids) < count:
-        data['user_strikes'] = {} 
-        available_ids = list(candidates.keys())
+# --- Core Handlers ---
 
-    if not available_ids: return [update.effective_user] * count
-    chosen_ids = random.sample(available_ids, min(count, len(available_ids)))
-    for cid in chosen_ids:
-        data['user_strikes'][cid] = data['user_strikes'].get(cid, 0) + 1
-    return [candidates[cid] for cid in chosen_ids]
-
-# --- Message Logic (Greeter, Reactor, AI Tracking) ---
-
-async def core_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def core_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or update.effective_user.is_bot: return
     chat_id = update.effective_chat.id
     init_chat_data(chat_id)
-    user = update.effective_user
     text = update.message.text.lower() if update.message.text else ""
+    daily_locks[chat_id]['seen_users'][update.effective_user.id] = update.effective_user
 
-    # 1. Track User
-    daily_locks[chat_id]['seen_users'][user.id] = user
+    if text in ["hi", "hello", "hey"]:
+        u = f"<b>{safe_h(update.effective_user.first_name)}</b>"
+        return await update.message.reply_text(f"Hi {u}! 👋", parse_mode=ParseMode.HTML)
 
-    # 2. Greet System
-    if text in ["hi", "hello", "hey", "hii", "heyy"]:
-        u_name = f"<b>{safe_h(user.first_name)}</b>"
-        replies = [f"Hello {u_name}, how are you? 😊", f"Hey {u_name}! ✨", f"Hi {u_name}! 👋", f"Hello {u_name}, nice to see you! 🌟", f"Hey there {u_name}! 🙌", f"Hi {u_name}, glad you're here! 🎈", f"Hello {u_name}, staying hydrated? 💧"]
-        return await update.message.reply_text(random.choice(replies), parse_mode=ParseMode.HTML)
-
-    # 3. React (Every 6th)
     with lock_mutex:
         chat_counters[chat_id] += 1
         count = chat_counters[chat_id]
     if count % 6 == 0:
-        try: await update.message.set_reaction(reaction=random.choice(["👍", "🔥", "😂", "❤️"]))
+        try: await update.message.set_reaction(reaction=random.choice(["🔥", "😂", "❤️", "👍"]))
         except: pass
 
-    # 4. AI Activation
-    is_reply_to_bot = update.message.reply_to_message and update.message.reply_to_message.from_user.id == context.bot.id
-    if WAKE_WORD in text or is_reply_to_bot:
+    if WAKE_WORD in text or (update.message.reply_to_message and update.message.reply_to_message.from_user.id == context.bot.id):
         await context.bot.send_chat_action(chat_id, "typing")
-        reply = await get_ai_response(text)
-        await update.message.reply_text(reply)
-
-# --- Fun Command Logic ---
+        await update.message.reply_text(await get_ai_response(text))
 
 async def fun_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text: return
     cmd = update.message.text.lower().split()[0].replace('/', '').split('@')[0]
     chat_id = update.effective_chat.id
     init_chat_data(chat_id)
-    
     if cmd in daily_locks[chat_id]['commands']:
-        return await update.message.reply_text(f"📌 <b>Daily Record:</b>\n{daily_locks[chat_id]['commands'][cmd]['msg']}", parse_mode=ParseMode.HTML)
+        return await update.message.reply_text(f"📌 {daily_locks[chat_id]['commands'][cmd]['msg']}", parse_mode=ParseMode.HTML)
 
     mapping = {
         "chammar": ([
-            "🚽 <b>Shakti</b> detected! The Harpic CEO is here! 🧴🤡", "🧹 <b>Shakti</b> doesn't have a future, just a longer mop! 😂",
-            "🧴 <b>Shakti</b>'s birth certificate is a Harpic receipt! 🧼", "🤡 <b>Shakti</b>'s talent is making the toilet seat shine! 👑",
-            "🧼 <b>Shakti</b> tried to think, but his brain was a scrub pad! 🧹", "💦 <b>Shakti</b> uses a mop as a selfie stick! 🧴💀",
-            "🧹 If scrubbing paid gold, <b>Shakti</b> would still be a beggar! 🥇", "🚽 <b>Shakti</b> drinks Harpic to stop the thoughts! 🧹💞",
-            "🧴 <b>Shakti</b> is {pct}% finished with the toilets. Work harder! 🤡", "🧼 <b>Shakti</b> is the reason Harpic sales are up! 🧹🧼",
-            "🪣 <b>Shakti</b>'s family tree is just janitors with buckets! 🤡", "🧼 Did the toilet stop clogging, <b>Shakti</b>? 🧹🤣",
-            "🚽 <b>Shakti</b> has {pct}% Harpic in his blood! 🧴💀", "🧹 <b>Shakti</b>'s mop is smarter! ({pct}%) 🧠",
-            "🧴 <b>Shakti</b> is {pct}% professional cleaner, 100% failure! 📉", "🪠 <b>Shakti</b> is the King of Commode! 👑🚽",
-            "💦 <b>Shakti</b>'s only contribution is a clean urinal! 🧹", "🧴 Stop texting and scrub, <b>Shakti</b>! 🧴💨",
-            "🧹 <b>Shakti</b> is {pct}% done. Get back in the stall! 🏃‍♂️", "🤡 <b>Shakti</b>'s dreams are flushed every morning! 🌊"
+            "🚽 <b>Shakti</b> detected! Harpic CEO is here! 🧴🤡", "🧹 <b>Shakti</b> found a new mop! 🏆",
+            "🧴 <b>Shakti</b>'s perfume? Harpic Blue! 🧼", "🤡 <b>Shakti</b>'s dreams are flushed! 🌊",
+            "🧼 <b>Shakti</b> drinks Harpic to stay clean! 💦", "🧹 Olympic Mop winner: <b>Shakti</b>! 🥇",
+            "🚽 <b>Shakti</b> + Mop = Love Story! 💞", "🧴 <b>Shakti</b>: {pct}% pro cleaner! 📉",
+            "🪠 <b>Shakti</b>, Sultan of Sewage! 🚽", "💦 <b>Shakti</b>'s contribution: a clean urinal! 🧹",
+            "🪣 <b>Shakti</b>'s family are janitors! 🤡", "🧼 Toilet clogged again, <b>Shakti</b>? 🤣",
+            "🚽 <b>Shakti</b> is {pct}% Harpic! 💀", "🧹 <b>Shakti</b>'s mop is smarter! ({pct}%) 🧠",
+            "🧴 Scrub, <b>Shakti</b>! Harpic is drying! 💨", "🧹 {pct}% shift done, <b>Shakti</b>! 🏃‍♂️",
+            "🧼 <b>Shakti</b>'s ID is a Harpic receipt! 🧼", "🤡 Sales are up because of <b>Shakti</b>! 🧴",
+            "🚽 <b>Shakti</b>'s kingdom is the toilet! 👑", "🧴 {pct}% done. Work harder, <b>Shakti</b>! 🤡"
         ], True),
         "gay": ([
             "🌈 Today's gay is {user}! ({pct}% gay) 🌚", "🦄 {user} is fabulous! {pct}% 🏳️‍🌈💅",
-            "🌈 {user} dropped their heterosexuality! {pct}% 📉", "🍭 {user} is {pct}% rainbow-coded! ⚡",
+            "🌈 {user} dropped heterosexuality! {pct}% 📉", "🍭 {user} is {pct}% rainbow-coded! ⚡",
             "💅 Slay {user}! You are {pct}% an icon! ✨", "🌈 Radar found {user}: {pct}% 📡",
             "✨ {user} is {pct}% glitter and rainbows! 🌈", "🔥 {user} is burning with {pct}% pride! 🏳️‍🌈",
-            "💅 {user} is {pct}% fabulous! 👑", "🌈 {user} is the group's official rainbow! {pct}% 🎨"
+            "💅 {user} is {pct}% more fabulous! 👑", "🌈 {user} is the group's official rainbow! {pct}% 🎨"
         ], True),
         "roast": ([
             "💀 {user} is the reason the gene pool needs a lifeguard! 🏊‍♂️", "🗑️ Mirror asked {user} for therapy! 😭",
@@ -167,7 +139,7 @@ async def fun_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ], False),
         "aura": ([
             "✨ {user}'s aura: {pct}% (Absolute Boss!) 👑", "📉 {user}'s aura: -{pct} (Cooked) 💀",
-            "🌟 {user} is glowing! {pct}% Main Character! 🌌", "🌑 {user} has the aura of a wet cardboard box. ({pct}%) 📦",
+            "🌟 {user} is glowing! {pct}% Main Character! 🌌", "🌑 {user} has aura of a wet cardboard box. ({pct}%) 📦",
             "💎 {user} has {pct}% diamond aura! ✨", "🦾 {user} aura level: {pct}% Chad! 🗿",
             "🧿 {user} is radiating {pct}% energy! 🔮", "💨 {user}'s aura evaporated! {pct}% left! 🌬️",
             "🔥 {user} has {pct}% legendary aura! ⚔️", "🌈 {user} has {pct}% colorful aura! 🎨"
@@ -186,6 +158,13 @@ async def fun_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🧠 {user} has {pct}% brain left! 📉", "📡 {user} searching for signal... {pct}%! 📡",
             "🧮 {user} can't count to {pct}! 😂", "🔌 {user}'s brain battery: {pct}%! 🔌"
         ], True),
+        "monkey": ([
+            "🐒 {user} is the group MONKEY! 🙈🍌", "🐵 {user} needs a zoo immediately! 😂🙊",
+            "🐒 {user} is going APE in the chat! 🦍🔥", "🍌 {user} is the official Banana Lover! 🐵",
+            "🙊 {user} is speaking Monkey language! 🐒💬", "🌴 {user} just escaped the jungle! 🏃‍♂️",
+            "🐒 {user} is {pct}% chimpanzee today! 🐒", "🙉 {user} hears no evil, but acts like it! 🙊",
+            "🍌 Keep {user} away from the fruit basket! 🐵", "🦍 {user} is the King of the Jungle! 👑🌴"
+        ], False),
         "couple": ([
             "💞 Today's couple: {u1} ❤️ {u2} ({pct}% match!) 🏩", "💍 Wedding bells for {u1} and {u2}! ({pct}%) 🔔",
             "🔥 {u1} ❤️ {u2} = Hottest Pair! ({pct}% fire) 🌶️", "💔 {u1} and {u2}: {pct}% chemistry. Friends! 🫂",
@@ -196,7 +175,7 @@ async def fun_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
     if cmd in mapping:
-        msgs, has_pct = mapping[cmd]
+        msgs, _ = mapping[cmd]
         if cmd == "chammar": 
             res = random.choice(msgs).format(user="<b>Shakti</b>", pct=random.randint(1, 100))
         elif cmd == "couple":
@@ -205,25 +184,19 @@ async def fun_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             m = (await get_target_member(update, chat_id))[0]
             res = random.choice(msgs).format(user=f"<b>{safe_h(m.first_name)}</b>", pct=random.randint(0, 100))
-        
-        daily_locks[chat_id]['commands'][cmd] = {'msg': res, 'time': get_ist_time()}
+        daily_locks[chat_id]['commands'][cmd] = {'msg': res}
         await update.message.reply_text(f"✨ {res}", parse_mode=ParseMode.HTML)
 
-# --- Server & Main ---
 @app.route('/')
-def health(): return jsonify({"status": "running"})
+def health(): return jsonify({"status": "alive"})
 
 def main():
     token = os.environ.get('TELEGRAM_BOT_TOKEN')
-    if not token: return
     Thread(target=lambda: app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000))), daemon=True).start()
-    application = Application.builder().token(token).build()
-    
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, core_message_handler), group=-1)
-    for c in ["chammar", "gay", "roast", "aura", "horny", "brain", "couple"]:
-        application.add_handler(CommandHandler(c, fun_dispatcher))
-    application.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("Beluga (Llama-Speed) is online! 🚀")))
-    
-    application.run_polling(drop_pending_updates=True)
+    bot = Application.builder().token(token).build()
+    bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, core_handler), group=-1)
+    for c in ["chammar", "gay", "roast", "aura", "horny", "brain", "monkey", "couple"]:
+        bot.add_handler(CommandHandler(c, fun_dispatcher))
+    bot.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__': main()
