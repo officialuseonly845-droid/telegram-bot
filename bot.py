@@ -48,7 +48,7 @@ def init_chat_data(chat_id):
             chat_counters[chat_id] = 0
 
 async def get_ai_response(user_text):
-    if not OPENROUTER_KEY: return "AI Error: Key missing."
+    if not OPENROUTER_KEY: return "Error: OpenRouter API Key is missing in Environment Variables."
     try:
         async with httpx.AsyncClient() as client:
             res = await client.post(
@@ -57,16 +57,16 @@ async def get_ai_response(user_text):
                 json={
                     "model": AI_MODEL,
                     "messages": [
-                        {"role": "system", "content": f"You are Beluga, a witty and sharp Telegram bot. Only answer if your name '{WAKE_WORD}' is taken. Be concise and funny."},
+                        {"role": "system", "content": f"You are Beluga, a witty, sharp, and slightly sarcastic Telegram bot. Only answer if your name '{WAKE_WORD}' is mentioned. Be concise and clever."},
                         {"role": "user", "content": user_text}
                     ]
                 },
-                timeout=15.0
+                timeout=20.0
             )
             return res.json()['choices'][0]['message']['content']
     except Exception as e:
         logger.error(f"AI Error: {e}")
-        return "Beluga is sleeping right now. Try later! 💤"
+        return "Beluga's brain is buffering... too many requests! 🧠💨"
 
 async def get_target_member(update: Update, chat_id, count=1):
     data = daily_locks[chat_id]
@@ -79,7 +79,7 @@ async def get_target_member(update: Update, chat_id, count=1):
 
     available_ids = [uid for uid in candidates.keys() if data['user_strikes'].get(uid, 0) < 2]
     if len(available_ids) < count:
-        data['user_strikes'] = {}
+        data['user_strikes'] = {} # Reset strikes if everyone is used
         available_ids = list(candidates.keys())
 
     if not available_ids: return [update.effective_user] * count
@@ -88,7 +88,7 @@ async def get_target_member(update: Update, chat_id, count=1):
         data['user_strikes'][cid] = data['user_strikes'].get(cid, 0) + 1
     return [candidates[cid] for cid in chosen_ids]
 
-# --- Core Message Handler (Greet, React, Track, AI) ---
+# --- Message Logic (Greeter, Reactor, AI) ---
 
 async def core_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or update.effective_user.is_bot: return
@@ -100,13 +100,13 @@ async def core_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     # 1. Track User
     daily_locks[chat_id]['seen_users'][user.id] = user
 
-    # 2. Greet System (Immediate response for 'hi')
+    # 2. Greeting Logic
     if text in ["hi", "hello", "hey", "hii", "heyy"]:
         u_name = f"<b>{safe_h(user.first_name)}</b>"
         replies = [f"Hello {u_name}, how are you? 😊", f"Hey {u_name}! ✨", f"Hi {u_name}! 👋", f"Hello {u_name}, nice to see you! 🌟", f"Hey there {u_name}! 🙌", f"Hi {u_name}, glad you're here! 🎈", f"Hello {u_name}, staying hydrated? 💧"]
         return await update.message.reply_text(random.choice(replies), parse_mode=ParseMode.HTML)
 
-    # 3. React (Every 6th message)
+    # 3. Message Reaction (Every 6th)
     with lock_mutex:
         chat_counters[chat_id] += 1
         count = chat_counters[chat_id]
@@ -114,14 +114,14 @@ async def core_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         try: await update.message.set_reaction(reaction=random.choice(["👍", "🔥", "😂", "❤️"]))
         except: pass
 
-    # 4. AI Activation Logic (Only if 'beluga' is mentioned or it's a reply)
+    # 4. AI Logic (Wake Word 'beluga' or Reply to bot)
     is_reply_to_bot = update.message.reply_to_message and update.message.reply_to_message.from_user.id == context.bot.id
     if WAKE_WORD in text or is_reply_to_bot:
         await context.bot.send_chat_action(chat_id, "typing")
         reply = await get_ai_response(text)
         await update.message.reply_text(reply)
 
-# --- Fun Command Handler ---
+# --- Fun Commands ---
 
 async def fun_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text: return
@@ -138,7 +138,7 @@ async def fun_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🧴 <b>Shakti</b>'s favorite perfume? Harpic Blue! 🧼", "🤡 <b>Shakti</b>'s dreams are flushed every morning! 🚽🌊",
             "🧼 <b>Shakti</b> drinks Harpic to stay clean! 💦", "🧹 Olympic Golden Mop winner: <b>Shakti</b>! 🥇",
             "🚽 <b>Shakti</b> + Mop = Love Story! 🧹💞", "🧴 <b>Shakti</b>: {pct}% pro cleaner, 100% failure! 📉",
-            "🪠 <b>Shakti</b>, Sultan of Sewage! 👑🚽", "💦 <b>Shakti</b>'s contribution: a clean urinal! 🧹",
+            "🪠 <b>Shakti</b>, Sultan of Sewage! 👑🚽", "💦 <b>Shakti</b>'s only contribution: a clean urinal! 🧹",
             "🪣 <b>Shakti</b>'s family tree is just buckets! 🤡", "🧼 Toilet clogged again, <b>Shakti</b>? 🧹🤣",
             "🚽 <b>Shakti</b> is {pct}% Harpic! 🧴💀", "🧹 <b>Shakti</b>'s mop is smarter! ({pct}%) 🧠",
             "🧴 Scrub, <b>Shakti</b>! Harpic is drying! 💨", "🧹 {pct}% shift done. Back to the stall, <b>Shakti</b>! 🏃‍♂️",
@@ -209,12 +209,20 @@ def health(): return jsonify({"status": "running"})
 
 def main():
     token = os.environ.get('TELEGRAM_BOT_TOKEN')
+    if not token: 
+        print("Error: TELEGRAM_BOT_TOKEN not found!")
+        return
+    
     Thread(target=lambda: app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000))), daemon=True).start()
     application = Application.builder().token(token).build()
+    
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, core_message_handler), group=-1)
+    
     for c in ["chammar", "gay", "roast", "aura", "horny", "brain", "couple"]:
         application.add_handler(CommandHandler(c, fun_dispatcher))
+    
     application.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("Beluga is online! 🚀")))
+    
     application.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__': main()
