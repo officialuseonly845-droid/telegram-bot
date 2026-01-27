@@ -24,7 +24,8 @@ lock_mutex = threading.Lock()
 
 # --- Config ---
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
-AI_MODEL = "google/gemini-2.0-flash-exp:free"
+# Using Llama 3.1 8B for high-speed, high-limit free AI responses
+AI_MODEL = "meta-llama/llama-3.1-8b-instruct:free"
 WAKE_WORD = "beluga"
 
 # --- Helpers ---
@@ -48,25 +49,29 @@ def init_chat_data(chat_id):
             chat_counters[chat_id] = 0
 
 async def get_ai_response(user_text):
-    if not OPENROUTER_KEY: return "Error: OpenRouter API Key is missing in Environment Variables."
+    if not OPENROUTER_KEY: return "Error: OpenRouter API Key missing."
     try:
         async with httpx.AsyncClient() as client:
             res = await client.post(
                 "https://openrouter.ai/api/v1/chat/completions",
-                headers={"Authorization": f"Bearer {OPENROUTER_KEY}"},
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_KEY}",
+                    "HTTP-Referer": "https://stackhost.org", 
+                },
                 json={
                     "model": AI_MODEL,
                     "messages": [
-                        {"role": "system", "content": f"You are Beluga, a witty, sharp, and slightly sarcastic Telegram bot. Only answer if your name '{WAKE_WORD}' is mentioned. Be concise and clever."},
+                        {"role": "system", "content": f"You are Beluga, a witty, sharp Telegram bot. Only answer if your name '{WAKE_WORD}' is mentioned. Be concise and clever."},
                         {"role": "user", "content": user_text}
                     ]
                 },
-                timeout=20.0
+                timeout=30.0
             )
-            return res.json()['choices'][0]['message']['content']
+            data = res.json()
+            return data['choices'][0]['message']['content']
     except Exception as e:
         logger.error(f"AI Error: {e}")
-        return "Beluga's brain is buffering... too many requests! 🧠💨"
+        return "Beluga is taking a short nap. Try again in a minute! 💤"
 
 async def get_target_member(update: Update, chat_id, count=1):
     data = daily_locks[chat_id]
@@ -77,9 +82,10 @@ async def get_target_member(update: Update, chat_id, count=1):
             if not a.user.is_bot: candidates[a.user.id] = a.user
     except: pass
 
+    # STRIKE RULE: Pick users who haven't been picked twice today
     available_ids = [uid for uid in candidates.keys() if data['user_strikes'].get(uid, 0) < 2]
     if len(available_ids) < count:
-        data['user_strikes'] = {} # Reset strikes if everyone is used
+        data['user_strikes'] = {} 
         available_ids = list(candidates.keys())
 
     if not available_ids: return [update.effective_user] * count
@@ -88,7 +94,7 @@ async def get_target_member(update: Update, chat_id, count=1):
         data['user_strikes'][cid] = data['user_strikes'].get(cid, 0) + 1
     return [candidates[cid] for cid in chosen_ids]
 
-# --- Message Logic (Greeter, Reactor, AI) ---
+# --- Message Logic (Greeter, Reactor, AI Tracking) ---
 
 async def core_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or update.effective_user.is_bot: return
@@ -100,13 +106,13 @@ async def core_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     # 1. Track User
     daily_locks[chat_id]['seen_users'][user.id] = user
 
-    # 2. Greeting Logic
+    # 2. Greet System
     if text in ["hi", "hello", "hey", "hii", "heyy"]:
         u_name = f"<b>{safe_h(user.first_name)}</b>"
         replies = [f"Hello {u_name}, how are you? 😊", f"Hey {u_name}! ✨", f"Hi {u_name}! 👋", f"Hello {u_name}, nice to see you! 🌟", f"Hey there {u_name}! 🙌", f"Hi {u_name}, glad you're here! 🎈", f"Hello {u_name}, staying hydrated? 💧"]
         return await update.message.reply_text(random.choice(replies), parse_mode=ParseMode.HTML)
 
-    # 3. Message Reaction (Every 6th)
+    # 3. React (Every 6th)
     with lock_mutex:
         chat_counters[chat_id] += 1
         count = chat_counters[chat_id]
@@ -114,14 +120,14 @@ async def core_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         try: await update.message.set_reaction(reaction=random.choice(["👍", "🔥", "😂", "❤️"]))
         except: pass
 
-    # 4. AI Logic (Wake Word 'beluga' or Reply to bot)
+    # 4. AI Activation
     is_reply_to_bot = update.message.reply_to_message and update.message.reply_to_message.from_user.id == context.bot.id
     if WAKE_WORD in text or is_reply_to_bot:
         await context.bot.send_chat_action(chat_id, "typing")
         reply = await get_ai_response(text)
         await update.message.reply_text(reply)
 
-# --- Fun Commands ---
+# --- Fun Command Logic ---
 
 async def fun_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text: return
@@ -134,58 +140,58 @@ async def fun_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     mapping = {
         "chammar": ([
-            "🚽 <b>Shakti</b> detected! Harpic CEO is here! 🧴🤡", "🧹 <b>Shakti</b> won 'Mop Man of the Year'! 🏆",
-            "🧴 <b>Shakti</b>'s favorite perfume? Harpic Blue! 🧼", "🤡 <b>Shakti</b>'s dreams are flushed every morning! 🚽🌊",
-            "🧼 <b>Shakti</b> drinks Harpic to stay clean! 💦", "🧹 Olympic Golden Mop winner: <b>Shakti</b>! 🥇",
-            "🚽 <b>Shakti</b> + Mop = Love Story! 🧹💞", "🧴 <b>Shakti</b>: {pct}% pro cleaner, 100% failure! 📉",
-            "🪠 <b>Shakti</b>, Sultan of Sewage! 👑🚽", "💦 <b>Shakti</b>'s only contribution: a clean urinal! 🧹",
-            "🪣 <b>Shakti</b>'s family tree is just buckets! 🤡", "🧼 Toilet clogged again, <b>Shakti</b>? 🧹🤣",
-            "🚽 <b>Shakti</b> is {pct}% Harpic! 🧴💀", "🧹 <b>Shakti</b>'s mop is smarter! ({pct}%) 🧠",
-            "🧴 Scrub, <b>Shakti</b>! Harpic is drying! 💨", "🧹 {pct}% shift done. Back to the stall, <b>Shakti</b>! 🏃‍♂️",
-            "🧼 <b>Shakti</b>'s ID is a Harpic receipt! 🧼", "🤡 Sales are up because of <b>Shakti</b>! 🧴",
-            "🚽 <b>Shakti</b>'s kingdom is the public toilet! 👑", "🧴 {pct}% finished. Work harder, <b>Shakti</b>! 🤡"
+            "🚽 <b>Shakti</b> detected! The Harpic CEO is here! 🧴🤡", "🧹 <b>Shakti</b> doesn't have a future, just a longer mop! 😂",
+            "🧴 <b>Shakti</b>'s birth certificate is a Harpic receipt! 🧼", "🤡 <b>Shakti</b>'s talent is making the toilet seat shine! 👑",
+            "🧼 <b>Shakti</b> tried to think, but his brain was a scrub pad! 🧹", "💦 <b>Shakti</b> uses a mop as a selfie stick! 🧴💀",
+            "🧹 If scrubbing paid gold, <b>Shakti</b> would still be a beggar! 🥇", "🚽 <b>Shakti</b> drinks Harpic to stop the thoughts! 🧹💞",
+            "🧴 <b>Shakti</b> is {pct}% finished with the toilets. Work harder! 🤡", "🧼 <b>Shakti</b> is the reason Harpic sales are up! 🧹🧼",
+            "🪣 <b>Shakti</b>'s family tree is just janitors with buckets! 🤡", "🧼 Did the toilet stop clogging, <b>Shakti</b>? 🧹🤣",
+            "🚽 <b>Shakti</b> has {pct}% Harpic in his blood! 🧴💀", "🧹 <b>Shakti</b>'s mop is smarter! ({pct}%) 🧠",
+            "🧴 <b>Shakti</b> is {pct}% professional cleaner, 100% failure! 📉", "🪠 <b>Shakti</b> is the King of Commode! 👑🚽",
+            "💦 <b>Shakti</b>'s only contribution is a clean urinal! 🧹", "🧴 Stop texting and scrub, <b>Shakti</b>! 🧴💨",
+            "🧹 <b>Shakti</b> is {pct}% done. Get back in the stall! 🏃‍♂️", "🤡 <b>Shakti</b>'s dreams are flushed every morning! 🌊"
         ], True),
         "gay": ([
-            "🌈 Today's gay is {user}! ({pct}%) 🌚", "🦄 {user} is fabulous! {pct}% 🏳️‍🌈💅",
-            "🌈 {user} is {pct}% rainbow-coded! ⚡", "💅 Slay {user}! {pct}% an icon! ✨",
-            "🌈 Radar found {user}: {pct}% 📡", "✨ {user} is {pct}% glitter! 🌈",
-            "🔥 {user} is {pct}% pride! 🏳️‍🌈", "💅 {user} is {pct}% fabulous! 👑",
-            "🌈 {user} is the rainbow! {pct}% 🎨", "🌈 {user} dropped heterosexuality! {pct}% 📉"
+            "🌈 Today's gay is {user}! ({pct}% gay) 🌚", "🦄 {user} is fabulous! {pct}% 🏳️‍🌈💅",
+            "🌈 {user} dropped their heterosexuality! {pct}% 📉", "🍭 {user} is {pct}% rainbow-coded! ⚡",
+            "💅 Slay {user}! You are {pct}% an icon! ✨", "🌈 Radar found {user}: {pct}% 📡",
+            "✨ {user} is {pct}% glitter and rainbows! 🌈", "🔥 {user} is burning with {pct}% pride! 🏳️‍🌈",
+            "💅 {user} is {pct}% fabulous! 👑", "🌈 {user} is the group's official rainbow! {pct}% 🎨"
         ], True),
         "roast": ([
             "💀 {user} is the reason the gene pool needs a lifeguard! 🏊‍♂️", "🗑️ Mirror asked {user} for therapy! 😭",
             "🦴 {user} is starving for attention! 🦴", "🤡 {user} dropped their brain! 🚫",
-            "🔥 {user} roasted like a marshmallow! 🍗", "🚑 {user} destroyed! 💨",
-            "🚮 {user} is human trash! 🚮", "🤏 {user}'s contribution: 0%! 📉",
+            "🔥 {user} roasted like a marshmallow! 🍗", "🚑 {user} just got destroyed! 💨",
+            "🚮 {user} is human trash! 🚮", "🤏 {user}'s contribution is like 0%! 📉",
             "🦷 {user} is so ugly, the doctor slapped their mom! 🤱", "🧟 Zombies won't eat {user}... no brains! 🧠"
         ], False),
         "aura": ([
-            "✨ {user}'s aura: {pct}% (Boss!) 👑", "📉 {user}'s aura: -{pct} (Cooked) 💀",
-            "🌟 {user} is glowing! {pct}% Main Character! 🌌", "🌑 {user} has aura of wet cardboard box. ({pct}%) 📦",
-            "💎 {user} has {pct}% diamond aura! ✨", "🦾 {user} aura: {pct}% Chad! 🗿",
-            "🧿 {user} radiating {pct}% energy! 🔮", "💨 {user}'s aura evaporated! {pct}% left! 🌬️",
+            "✨ {user}'s aura: {pct}% (Absolute Boss!) 👑", "📉 {user}'s aura: -{pct} (Cooked) 💀",
+            "🌟 {user} is glowing! {pct}% Main Character! 🌌", "🌑 {user} has the aura of a wet cardboard box. ({pct}%) 📦",
+            "💎 {user} has {pct}% diamond aura! ✨", "🦾 {user} aura level: {pct}% Chad! 🗿",
+            "🧿 {user} is radiating {pct}% energy! 🔮", "💨 {user}'s aura evaporated! {pct}% left! 🌬️",
             "🔥 {user} has {pct}% legendary aura! ⚔️", "🌈 {user} has {pct}% colorful aura! 🎨"
         ], True),
         "horny": ([
-            "🚨 {user} horny level: {pct}% (BONK!) 🚔", "🥵 {user} is {pct}% thirsty! 💧",
-            "👮 Calling Horny Police for {user}! {pct}% 👮‍♂️", "🧊 {user} needs a cold shower! {pct}% ❄️",
-            "😈 {user} has demon energy! {pct}% 🍷", "🧿 {user} is calm. Only {pct}% thirsty! 😇",
-            "🥵 {user} is {pct}% down bad! 📉", "⚡ {user} vibrating at {pct}% frequency! ⚡",
-            "📝 {user} is on the most-wanted list! {pct}% 📝", "💦 {user} is drooling! {pct}% 💦"
+            "🚨 {user} horny level: {pct}% (BONK!) 🚔", "🥵 {user} is thirsty! {pct}% 💧",
+            "🚔 Calling Horny Police for {user}! Level: {pct}% 👮‍♂️", "🧊 {user} needs a cold shower! {pct}% ❄️",
+            "😈 {user} has pure demon energy! {pct}% 🍷", "🧿 {user} is calm. Only {pct}% thirsty! 😇",
+            "🥵 {user} is {pct}% down bad! 📉", "🔥 {user} vibrating at {pct}% frequency! ⚡",
+            "👮 {user} is on the most-wanted list! {pct}% 📝", "🤤 {user} is drooling! {pct}% 💦"
         ], True),
         "brain": ([
             "🧠 {user}'s brain cells active: {pct}% 🔋", "💡 {user}'s lightbulb: {pct}% brightness! 🕯️",
-            "🥔 {user}'s IQ today: {pct}% (Potato) 🥔", "⚙️ {user} processing at {pct}%! ⚙️",
-            "💨 {user}'s head is empty! ({pct}%) 💨", "🤯 {user} using {pct}% of power! 🤯",
-            "📉 {user} has {pct}% of brain left! 💀", "📡 {user} searching for signal... {pct}%! 📡",
-            "🔢 {user} can't count to {pct}! 😂", "🔌 {user}'s brain battery: {pct}%! 🔌"
+            "🥔 {user}'s IQ today: {pct}% (Potato) 🥔", "🤖 {user} is processing at {pct}% efficiency! ⚙️",
+            "🌪️ {user}'s head is empty! ({pct}%) 💨", "🧬 {user} is using {pct}% of power! 🤯",
+            "🧠 {user} has {pct}% brain left! 📉", "📡 {user} searching for signal... {pct}%! 📡",
+            "🧮 {user} can't count to {pct}! 😂", "🔌 {user}'s brain battery: {pct}%! 🔌"
         ], True),
         "couple": ([
             "💞 Today's couple: {u1} ❤️ {u2} ({pct}% match!) 🏩", "💍 Wedding bells for {u1} and {u2}! ({pct}%) 🔔",
-            "🔥 {u1} ❤️ {u2} = Hottest Pair! ({pct}% fire) 🌶️", "💔 {u1} and {u2}: {pct}% chemistry! 🫂",
+            "🔥 {u1} ❤️ {u2} = Hottest Pair! ({pct}% fire) 🌶️", "💔 {u1} and {u2}: {pct}% chemistry. Friends! 🫂",
             "🏩 {u1} and {u2} need a room! ({pct}% spicy) 🔞", "✨ Destined: {u1} ❤️ {u2}! ({pct}%) 🌌",
-            "🍭 {u1} and {u2} are sweet! ({pct}%) 🍬", "🥊 {u1} and {u2} in the ring! ({pct}%) 🥊",
-            "🍬 {u1} and {u2} are {pct}% sweet together! 🍬", "🚢 Shipping {u1} and {u2}! ({pct}%) ⚓"
+            "🧸 {u1} and {u2} are a cute match! ({pct}%) 🍭", "🥊 {u1} and {u2} in a boxing ring! ({pct}%) 🥊",
+            "🍭 {u1} and {u2} are {pct}% sweet together! 🍬", "🚢 Shipping {u1} and {u2}! ({pct}% match) ⚓"
         ], True)
     }
 
@@ -209,19 +215,14 @@ def health(): return jsonify({"status": "running"})
 
 def main():
     token = os.environ.get('TELEGRAM_BOT_TOKEN')
-    if not token: 
-        print("Error: TELEGRAM_BOT_TOKEN not found!")
-        return
-    
+    if not token: return
     Thread(target=lambda: app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000))), daemon=True).start()
     application = Application.builder().token(token).build()
     
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, core_message_handler), group=-1)
-    
     for c in ["chammar", "gay", "roast", "aura", "horny", "brain", "couple"]:
         application.add_handler(CommandHandler(c, fun_dispatcher))
-    
-    application.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("Beluga is online! 🚀")))
+    application.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("Beluga (Llama-Speed) is online! 🚀")))
     
     application.run_polling(drop_pending_updates=True)
 
