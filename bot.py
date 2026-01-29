@@ -4,12 +4,17 @@ import random
 import threading
 import html
 import httpx
+import asyncio
 from datetime import datetime, timedelta
 from threading import Thread
 from flask import Flask, jsonify
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.constants import ParseMode
+
+# --- Third Party AI Libraries ---
+import google.generativeai as genai
+from groq import Groq
 
 # --- Logging ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -22,9 +27,17 @@ daily_locks = {}
 chat_counters = {}
 lock_mutex = threading.Lock()
 
-# --- Config ---
+# --- Configuration (Add these to Render/StackHost Env) ---
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
+GROQ_KEY = os.environ.get("GROQ_API_KEY")
 WAKE_WORD = "beluga"
+
+# Initialize Clients
+if GEMINI_KEY:
+    genai.configure(api_key=GEMINI_KEY)
+if GROQ_KEY:
+    groq_client = Groq(api_key=GROQ_KEY)
 
 # --- Helpers ---
 def get_ist_time():
@@ -41,40 +54,49 @@ def init_chat_data(chat_id):
         if chat_id not in chat_counters:
             chat_counters[chat_id] = 0
 
-# --- The AI Engine (Liquid-Only) ---
+# --- THE TRIPLE-API FAILOVER ENGINE ---
 async def get_ai_response(user_text):
-    if not OPENROUTER_KEY: return "⚠️ API Key missing!"
-    
-    model = "liquid/lfm-2.5-1.2b-thinking:free"
-    
-    try:
-        # 15s Total limit, 3s Connect limit
-        timeout_cfg = httpx.Timeout(15.0, connect=3.0) 
-        async with httpx.AsyncClient(timeout=timeout_cfg) as client:
-            res = await client.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENROUTER_KEY}",
-                    "HTTP-Referer": "https://stackhost.org", 
-                    "X-Title": "Beluga Bot V2"
-                },
-                json={
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": "You are Beluga, a sharp, witty bot. Be brief."},
-                        {"role": "user", "content": user_text}
-                    ]
-                }
+    sys_msg = "You are Beluga, a sharp, witty, and concise bot. Answer in 1-2 short sentences."
+
+    # 1. PRIMARY: OpenRouter (Liquid Thinking)
+    if OPENROUTER_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                res = await client.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {OPENROUTER_KEY}", "HTTP-Referer": "https://stackhost.org", "X-Title": "Beluga Bot"},
+                    json={
+                        "model": "liquid/lfm-2.5-1.2b-thinking:free",
+                        "messages": [{"role": "system", "content": sys_msg}, {"role": "user", "content": user_text}]
+                    }
+                )
+                if res.status_code == 200:
+                    return res.json()['choices'][0]['message']['content']
+        except Exception as e:
+            logger.error(f"OpenRouter Fail: {e}")
+
+    # 2. SECONDARY: Google Gemini (1.5 Flash - Best Free Model)
+    if GEMINI_KEY:
+        try:
+            model = genai.GenerativeModel('gemini-1.5-flash', system_instruction=sys_msg)
+            response = model.generate_content(user_text)
+            if response.text:
+                return response.text
+        except Exception as e:
+            logger.error(f"Gemini Fail: {e}")
+
+    # 3. TERTIARY: Groq (Mixtral 8x7b)
+    if GROQ_KEY:
+        try:
+            chat_completion = groq_client.chat.completions.create(
+                messages=[{"role": "system", "content": sys_msg}, {"role": "user", "content": user_text}],
+                model="mixtral-8x7b-32768",
             )
-            if res.status_code == 200:
-                return res.json()['choices'][0]['message']['content']
-            
-            # Debugging for you
-            logger.error(f"Liquid AI Error: {res.status_code}")
-            return f"❌ AI Error {res.status_code}. OpenRouter might be busy."
-    except Exception as e:
-        logger.error(f"Connection error: {e}")
-        return "⚠️ Connection lost. Try again in 10s! 💤"
+            return chat_completion.choices[0].message.content
+        except Exception as e:
+            logger.error(f"Groq Fail: {e}")
+
+    return "All my API brains are currently sleeping. Try again in 10s! 💤"
 
 async def get_target_member(update: Update, chat_id, count=1):
     data = daily_locks[chat_id]
@@ -99,7 +121,7 @@ async def core_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").lower()
     daily_locks[chat_id]['seen_users'][update.effective_user.id] = update.effective_user
 
-    # Reaction & AI Activation
+    # Reaction every 6th message
     with lock_mutex:
         chat_counters[chat_id] += 1
         count = chat_counters[chat_id]
@@ -122,7 +144,7 @@ async def fun_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     mapping = {
         "chammar": ([
-            "🚽 <b>Shakti</b> detected! Harpic CEO is here! 🧴🤡", "🧹 <b>Shakti</b>'s mop! 🏆",
+            "🚽 <b>Shakti</b> detected! Harpic CEO is here! 🧴🤡", "🧹 <b>Shakti</b> found a new mop! 🏆",
             "🧴 <b>Shakti</b>'s perfume? Harpic Blue! 🧼", "🤡 <b>Shakti</b>'s dreams are flushed! 🌊",
             "🧼 <b>Shakti</b> drinks Harpic to stay clean! 💦", "🧹 Olympic Mop winner: <b>Shakti</b>! 🥇",
             "🚽 <b>Shakti</b> + Mop = Love Story! 💞", "🪠 <b>Shakti</b>, Sultan of Sewage! 🚽",
@@ -153,17 +175,20 @@ async def fun_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
         daily_locks[chat_id]['commands'][cmd] = {'msg': res}
         await update.message.reply_text(f"✨ {res}", parse_mode=ParseMode.HTML)
 
-# --- Run ---
+# --- Server & Startup ---
 @app.route('/')
-def health(): return jsonify({"status": "running"})
+def health(): return jsonify({"status": "active"})
 
 def main():
     token = os.environ.get('TELEGRAM_BOT_TOKEN')
+    # Run server in thread
     Thread(target=lambda: app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000))), daemon=True).start()
+    
     bot = Application.builder().token(token).build()
     bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, core_handler), group=-1)
     for c in ["chammar", "gay", "roast", "aura", "horny", "brain", "monkey", "couple"]:
         bot.add_handler(CommandHandler(c, fun_dispatcher))
+    
     bot.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__': main()
