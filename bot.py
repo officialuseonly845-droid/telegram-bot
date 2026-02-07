@@ -70,7 +70,7 @@ def init_chat_data(chat_id):
             daily_locks[chat_id] = {'date': today, 'commands': {}, 'seen_users': {}}
         if chat_id not in chat_counters: chat_counters[chat_id] = 0
 
-# --- AI Engine ---
+# --- AI Engine (Dedicated Callers) ---
 async def try_openrouter(text):
     if not OPENROUTER_KEY: return None
     try:
@@ -94,22 +94,21 @@ async def try_nvidia(text):
 async def try_groq(text):
     if not GROQ_KEY: return None
     try:
-        # Mixtral 8x7b as requested
-        res = groq_client.chat.completions.create(model="mixtral-8x7b-32768",
+        res = groq_client.chat.completions.create(model="llama-3.1-8b-instant",
             messages=[{"role": "user", "content": f"RULES: {BELUGA_IDENTITY}\n\nUSER: {text}"}])
         return res.choices[0].message.content
     except: return None
 
 async def get_ai_response(chat_id, user_text, is_image=False):
     choice = manual_api_choice.get(chat_id)
-    if choice == "opr": return await try_openrouter(user_text) or "OpenRouter down hai bhai."
-    if choice == "nvi": return await try_nvidia(user_text) or "Nvidia nakhre kar raha hai."
-    if choice == "gro": return await try_groq(user_text) or "Groq so gaya shayad."
+    if choice == "opr": return await try_openrouter(user_text) or "OpenRouter nakhre kar raha hai."
+    if choice == "nvi": return await try_nvidia(user_text) or "Nvidia offline hai."
+    if choice == "gro": return await try_groq(user_text) or "Groq down hai."
 
-    if is_image: return await try_nvidia(user_text) or await try_groq(user_text) or "Photo samajh nahi aayi, saaf bhejo."
-    return await try_openrouter(user_text) or await try_nvidia(user_text) or await try_groq(user_text) or "Sab offline hain, main bhi chala sone."
+    if is_image: return await try_nvidia(user_text) or await try_groq(user_text) or "Photo samajh nahi aayi."
+    return await try_openrouter(user_text) or await try_nvidia(user_text) or await try_groq(user_text) or "Brains offline hain."
 
-# --- Admin Handlers ---
+# --- Admin Feature: /belu ---
 async def belu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS: return await update.message.reply_text("Beta admin bano pehle. 🤡")
     keyboard = [[InlineKeyboardButton("nvi", callback_data="nvi"), InlineKeyboardButton("gro", callback_data="gro")],
@@ -122,18 +121,20 @@ async def api_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     manual_api_choice[update.effective_chat.id] = None if choice == "auto" else choice
     await query.edit_message_text(f"✅ **System Update:** Locked to {choice.upper() if choice != 'auto' else 'Auto Switch'}")
 
-# --- Message Logic ---
+# --- Message Handler ---
 async def core_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or update.effective_user.is_bot: return
     chat_id = update.effective_chat.id
     init_chat_data(chat_id)
     
+    # Store user (Privacy off ensures we see more people)
     daily_locks[chat_id]['seen_users'][update.effective_user.id] = update.effective_user
     
+    # Reaction Logic
     with lock_mutex:
         chat_counters[chat_id] += 1
         if chat_counters[chat_id] >= 6:
-            try: await update.message.set_reaction(reaction=random.choice(["🔥", "😂", "❤️", "😈"])); chat_counters[chat_id] = 0
+            try: await update.message.set_reaction(reaction=random.choice(["🔥", "😂", "❤️", "⚡", "😈"])); chat_counters[chat_id] = 0
             except: pass
 
     text = (update.message.text or update.message.caption or "").lower()
@@ -144,7 +145,7 @@ async def core_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_chat_action(chat_id, "typing")
         await update.message.reply_text(await get_ai_response(chat_id, text, is_image))
 
-# --- Fun Commands Dispatcher ---
+# --- Fun Commands ---
 async def fun_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cmd = update.message.text.lower().split()[0].replace('/', '').split('@')[0]
     chat_id = update.effective_chat.id
@@ -154,38 +155,22 @@ async def fun_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text(f"📌 {daily_locks[chat_id]['commands'][cmd]['msg']}", parse_mode=ParseMode.HTML)
 
     mapping = {
-        "chammar": [
-            "🚽 <b>Shakti</b> detected! Harpic CEO is here! 🧴🤡", "🧹 <b>Shakti</b>'s mop! 🏆", "🧴 <b>Shakti</b>'s perfume? Harpic Blue! 🧼", "🤡 <b>Shakti</b>'s dreams are flushed! 🌊", "🧼 <b>Shakti</b> drinks Harpic to stay clean! 💦", "🧹 Olympic Mop winner: <b>Shakti</b>! 🥇", "🚽 <b>Shakti</b> + Mop = Love Story! 💞", "🪠 <b>Shakti</b>, Sultan of Sewage! 🚽", "💦 <b>Shakti</b>'s contribution: a clean urinal! 🧹", "🧼 Toilet clogged again, <b>Shakti</b>? 🤣", "🚽 <b>Shakti</b> is {pct}% Harpic! 💀", "🧹 <b>Shakti</b>'s mop is smarter! ({pct}%) 🧠", "🧴 Scrub, <b>Shakti</b>! Harpic is drying! 💨", "🧹 {pct}% shift done, <b>Shakti</b>! 🏃‍♂️", "🧼 <b>Shakti</b>'s ID is a Harpic receipt! 🧼", "🤡 Sales are up because of <b>Shakti</b>! 🧴", "🚽 <b>Shakti</b>'s kingdom is the toilet! 👑", "🧴 {pct}% done. Work harder, <b>Shakti</b>! 🤡"
-        ],
-        "gay": [
-            "🌈 Today's gay: <b>{user_name}</b> ({pct}%) 🌚", "🦄 <b>{user_name}</b> is fabulous! {pct}% 🏳️‍🌈💅", "🌈 <b>{user_name}</b> dropped heterosexuality! {pct}% 📉", "🍭 <b>{user_name}</b> is {pct}% rainbow-coded! ⚡", "💅 Slay <b>{user_name}</b>! {pct}% icon! ✨", "🌈 Radar found <b>{user_name}</b>: {pct}% 📡", "✨ <b>{user_name}</b> is {pct}% glitter! 🌈", "🔥 <b>{user_name}</b> is burning with {pct}% pride! 🏳️‍🌈", "👑 <b>{user_name}</b> is {pct}% fabulous! 👑", "🎨 <b>{user_name}</b> is the rainbow! {pct}%"
-        ],
-        "roast": [
-            "💀 <b>{user_name}</b> is pure trash! 🚮", "🗑️ Mirror asked <b>{user_name}</b> for therapy! 😭", "🦴 <b>{user_name}</b> starving for attention! 🦴", "🤡 <b>{user_name}</b> dropped their brain! 🚫", "🔥 <b>{user_name}</b> roasted like a marshmallow! 🍗", "🚑 <b>{user_name}</b> destroyed! 💨", "🚮 <b>{user_name}</b> is human trash! 🚮", "🤏 <b>{user_name}</b>'s contribution: 0%! 📉", "🦷 <b>{user_name}</b> so ugly, doc slapped mom! 🤱", "🧟 Zombies won't eat <b>{user_name}</b>... no brains! 🧠"
-        ],
-        "aura": [
-            "✨ <b>{user_name}</b>'s aura: {pct}% 👑", "📉 -{pct} Aura for <b>{user_name}</b>! 💀", "🌟 <b>{user_name}</b> glowing! {pct}%! 🌌", "🌑 <b>{user_name}</b> cardboard aura: {pct}% 📦", "💎 <b>{user_name}</b> has {pct}% diamond aura! ✨", "🗿 <b>{user_name}</b> aura: {pct}% Chad! 🗿", "🧿 <b>{user_name}</b> radiating {pct}% energy! 🔮", "💨 <b>{user_name}</b>'s aura evaporated! {pct}%! 🌬️", "🔥 <b>{user_name}</b> has {pct}% legendary aura! ⚔️", "🌈 <b>{user_name}</b> has {pct}% colorful aura! 🎨"
-        ],
-        "horny": [
-            "🚨 <b>{user_name}</b> horny level: {pct}% (BONK!) 🚔", "🥵 <b>{user_name}</b> is thirsty! {pct}% 💧", "👮 Calling Horny Police for <b>{user_name}</b>! {pct}%", "❄️ <b>{user_name}</b> needs cold shower! {pct}%", "🍷 <b>{user_name}</b> demon energy! {pct}%", "😇 <b>{user_name}</b> is calm. {pct}% thirsty.", "📉 <b>{user_name}</b> is {pct}% down bad!", "⚡ <b>{user_name}</b> vibrating at {pct}%!", "📝 <b>{user_name}</b> is on the list! {pct}%", "💦 <b>{user_name}</b> is drooling! {pct}%"
-        ],
-        "brain": [
-            "🧠 <b>{user_name}</b>'s brain cells: {pct}% 🔋", "💡 <b>{user_name}</b>'s lightbulb: {pct}%! 🕯️", "🥔 <b>{user_name}</b>'s IQ: {pct}% (Potato) 🥔", "⚙️ Processing at {pct}%! ⚙️", "🌪️ Head is empty! ({pct}%) 💨", "🤯 Using {pct}% of power! 🤯", "📉 <b>{user_name}</b> has {pct}% brain left!", "📡 Searching for signal... {pct}%!", "🔢 Can't count to {pct}! 😂", "🔌 Brain battery: {pct}%! 🔌"
-        ],
-        "monkey": [
-            "🐒 <b>{user_name}</b> is the group MONKEY! 🙈", "🍌 <b>{user_name}</b> Banana Lover! 🐵", "🐒 <b>{user_name}</b> is {pct}% chimpanzee!", "🏃‍♂️ <b>{user_name}</b> escaped the jungle!", "🙊 <b>{user_name}</b> speaking Monkey! 🐒", "🦍 <b>{user_name}</b> is the King! 👑", "🦍 <b>{user_name}</b> is going APE! 🔥", "🙉 Hears no evil, acts like it!", "🍌 Keep <b>{user_name}</b> away from fruit!", "🐒 <b>{user_name}</b> climbing trees!"
-        ],
-        "couple": [
-            "💞 Couple: <b>{u1}</b> ❤️ <b>{u2}</b> ({pct}% match!) 🏩", "💍 Wedding bells: <b>{u1}</b> & <b>{u2}</b>! ({pct}%) 🔔", "🔥 <b>{u1}</b> ❤️ <b>{u2}</b> = Hottest Pair! ({pct}% fire)", "💔 {pct}% chemistry. Friends! 🫂", "🏩 <b>{u1}</b> & <b>{u2}</b> need a room! ({pct}% spicy)", "✨ Destined: <b>{u1}</b> ❤️ <b>{u2}</b>! ({pct}%) 🌌", "🧸 Cute match! ({pct}%) 🍭", "🥊 In a boxing ring! ({pct}%) 🥊", "🍭 Sweet together! ({pct}%) 🍬", "🚢 Shipping <b>{u1}</b> & <b>{u2}</b>! ({pct}%) ⚓"
-        ]
+        "chammar": ["🚽 <b>Shakti</b> detected! Harpic CEO is here! 🧴🤡", "🧹 <b>Shakti</b>'s mop! 🏆", "🧴 <b>Shakti</b>'s perfume? Harpic Blue! 🧼", "🤡 <b>Shakti</b>'s dreams are flushed! 🌊", "🧼 <b>Shakti</b> drinks Harpic to stay clean! 💦", "🪠 <b>Shakti</b>, Sultan of Sewage! 🚽", "🚽 <b>Shakti</b> is {pct}% Harpic! 💀"],
+        "gay": ["🌈 Today's gay: <b>{user_name}</b> ({pct}%) 🌚", "🦄 <b>{user_name}</b> is fabulous! {pct}% 🏳️‍🌈💅", "💅 Slay <b>{user_name}</b>! {pct}% icon! ✨", "🎨 <b>{user_name}</b> is the rainbow! {pct}%"],
+        "roast": ["💀 <b>{user_name}</b> is pure trash! 🚮", "🗑️ Mirror asked <b>{user_name}</b> for therapy! 😭", "🤡 <b>{user_name}</b> dropped their brain! 🚫", "🧟 Zombies won't eat <b>{user_name}</b>... no brains! 🧠"],
+        "aura": ["✨ <b>{user_name}</b>'s aura: {pct}% 👑", "🗿 <b>{user_name}</b> aura: {pct}% Chad! 🗿", "💎 <b>{user_name}</b> has {pct}% diamond aura! ✨"],
+        "horny": ["🚨 <b>{user_name}</b> horny level: {pct}% (BONK!) 🚔", "🥵 <b>{user_name}</b> is thirsty! {pct}% 💧", "❄️ <b>{user_name}</b> needs cold shower! {pct}%"],
+        "brain": ["🧠 <b>{user_name}</b>'s brain cells: {pct}% 🔋", "🥔 <b>{user_name}</b>'s IQ: {pct}% (Potato) 🥔", "🤯 Using {pct}% of power! 🤯"],
+        "monkey": ["🐒 <b>{user_name}</b> is the group MONKEY! 🙈", "🍌 <b>{user_name}</b> Banana Lover! 🐵", "🦍 <b>{user_name}</b> is going APE! 🔥"],
+        "couple": ["💞 Couple: <b>{u1}</b> ❤️ <b>{u2}</b> ({pct}% match!) 🏩", "💍 Wedding bells: <b>{u1}</b> & <b>{u2}</b>! ({pct}%) 🔔", "🏩 <b>{u1}</b> & <b>{u2}</b> need a room! ({pct}% spicy)", "🚢 Shipping <b>{u1}</b> & <b>{u2}</b>! ({pct}%) ⚓"]
     }
 
     if cmd in mapping:
         users = list(daily_locks[chat_id]['seen_users'].values())
-        if not users: return await update.message.reply_text("Pehle baat toh karo, tab pehchanunga! 🤡")
+        if not users: return await update.message.reply_text("I need to see some people first! 🤡")
         
         if cmd == "couple":
-            if len(users) < 2: res = "Kam se kam 2 bande chahiye! 💔"
+            if len(users) < 2: res = "Need more people! 💔"
             else:
                 m = random.sample(users, 2)
                 res = random.choice(mapping[cmd]).format(u1=safe_h(m[0].first_name), u2=safe_h(m[1].first_name), pct=random.randint(1, 100))
@@ -198,7 +183,7 @@ async def fun_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
         daily_locks[chat_id]['commands'][cmd] = {'msg': res}
         await update.message.reply_text(f"✨ {res}", parse_mode=ParseMode.HTML)
 
-# --- Start ---
+# --- Server & Main ---
 @app.route('/')
 def health(): return jsonify({"status": "active"})
 
