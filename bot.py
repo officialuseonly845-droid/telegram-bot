@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 daily_locks = {}
 chat_counters = {} 
-manual_api_choice = {} # Stores {chat_id: "brain_1/2/3"}
+manual_api_choice = {} 
 lock_mutex = threading.Lock()
 
 # --- Config ---
@@ -36,16 +36,16 @@ ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x]
 WAKE_WORD = "beluga"
 
 BELUGA_IDENTITY = (
-    "Your name is Beluga. You are a savage and witty Telegram bot. "
-    "Stay in character. Answer in 1-2 sentences max. Be sharp."
+    "Your name is Beluga. Tum ek savage aur witty Telegram bot ho. "
+    "Hamesha Hinglish (Hindi + English) mein reply karo. "
+    "Be sharp, sarcastic, and funny. Answer 1-2 sentences max."
 )
 
 if GROQ_KEY: groq_client = Groq(api_key=GROQ_KEY)
 
-# --- Render Keep-Alive Server (aiohttp) ---
+# --- Render Keep-Alive Server ---
 async def checkHealth(request):
-    advice = "Fuck excuses, keep fucking going, learn from every fuck up."
-    return Response(text=advice, content_type="text/plain")
+    return Response(text="Beluga is awake and savage!", content_type="text/plain")
 
 async def startKeepAliveServer() -> None:
     port = int(os.environ.get('PORT', 8080))
@@ -56,14 +56,12 @@ async def startKeepAliveServer() -> None:
     await runner.setup()
     site = TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    logger.info(f"✅ Render Keep-Alive listening on port {port}")
 
-# --- Helper Functions ---
+# --- Helpers ---
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    tb_list = traceback.format_exception(None, context.error, context.error.__traceback__)
-    logger.error(f"🚨 CRASH: {''.join(tb_list)}")
+    logger.error(f"🚨 CRASH: {context.error}")
 
-def safe_h(text): return html.escape(text or "Friend")
+def safe_h(text): return html.escape(text or "Dost")
 
 def init_chat_data(chat_id):
     today = (datetime.utcnow() + timedelta(hours=5, minutes=30)).date()
@@ -72,7 +70,7 @@ def init_chat_data(chat_id):
             daily_locks[chat_id] = {'date': today, 'commands': {}, 'seen_users': {}}
         if chat_id not in chat_counters: chat_counters[chat_id] = 0
 
-# --- AI Engine (API Callers) ---
+# --- AI Engine ---
 async def try_openrouter(text):
     if not OPENROUTER_KEY: return None
     try:
@@ -96,7 +94,7 @@ async def try_nvidia(text):
 async def try_groq(text):
     if not GROQ_KEY: return None
     try:
-        # AS REQUESTED: Reverted to mixtral-8x7b-32768
+        # Mixtral 8x7b as requested
         res = groq_client.chat.completions.create(model="mixtral-8x7b-32768",
             messages=[{"role": "user", "content": f"RULES: {BELUGA_IDENTITY}\n\nUSER: {text}"}])
         return res.choices[0].message.content
@@ -104,59 +102,41 @@ async def try_groq(text):
 
 async def get_ai_response(chat_id, user_text, is_image=False):
     choice = manual_api_choice.get(chat_id)
-    
-    # 1. Manual Admin Override
-    if choice == "brain_1":
-        resp = await try_openrouter(user_text)
-        if resp: return resp
-        manual_api_choice[chat_id] = None 
-    elif choice == "brain_2":
-        resp = await try_nvidia(user_text)
-        if resp: return resp
-        manual_api_choice[chat_id] = None
-    elif choice == "brain_3":
-        resp = await try_groq(user_text)
-        if resp: return resp
-        manual_api_choice[chat_id] = None
+    if choice == "opr": return await try_openrouter(user_text) or "OpenRouter down hai bhai."
+    if choice == "nvi": return await try_nvidia(user_text) or "Nvidia nakhre kar raha hai."
+    if choice == "gro": return await try_groq(user_text) or "Groq so gaya shayad."
 
-    # 2. Automatic Logic & Image Failover
-    if is_image: return await try_nvidia(user_text) or await try_groq(user_text) or "Image is weird. 💤"
-    return await try_openrouter(user_text) or await try_nvidia(user_text) or await try_groq(user_text) or "Fried. 💤"
+    if is_image: return await try_nvidia(user_text) or await try_groq(user_text) or "Photo samajh nahi aayi, saaf bhejo."
+    return await try_openrouter(user_text) or await try_nvidia(user_text) or await try_groq(user_text) or "Sab offline hain, main bhi chala sone."
 
-# --- Admin Feature: /belu ---
+# --- Admin Handlers ---
 async def belu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        return await update.message.reply_text("Admin only. 🤡")
-    keyboard = [
-        [InlineKeyboardButton("Animation", callback_data="brain_1"), InlineKeyboardButton("Photo", callback_data="brain_2")],
-        [InlineKeyboardButton("Brain 3", callback_data="brain_3"), InlineKeyboardButton("Auto Switch", callback_data="auto")]
-    ]
-    await update.message.reply_text("💕 **Choose Media Type / Brain**", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+    if update.effective_user.id not in ADMIN_IDS: return await update.message.reply_text("Beta admin bano pehle. 🤡")
+    keyboard = [[InlineKeyboardButton("nvi", callback_data="nvi"), InlineKeyboardButton("gro", callback_data="gro")],
+                [InlineKeyboardButton("opr", callback_data="opr"), InlineKeyboardButton("auto switch", callback_data="auto")]]
+    await update.message.reply_text("current active brains 🧠", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def api_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if query.from_user.id not in ADMIN_IDS: return await query.answer("Access Denied. 😡", show_alert=True)
     choice = query.data
     manual_api_choice[update.effective_chat.id] = None if choice == "auto" else choice
-    await query.edit_message_text(f"✅ **System Locked to:** {'Auto Switch' if choice=='auto' else choice.replace('_',' ').title()}")
+    await query.edit_message_text(f"✅ **System Update:** Locked to {choice.upper() if choice != 'auto' else 'Auto Switch'}")
 
-# --- Core Logic ---
+# --- Message Logic ---
 async def core_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or update.effective_user.is_bot: return
     chat_id = update.effective_chat.id
     init_chat_data(chat_id)
     
-    # Every 6th message reaction logic
+    daily_locks[chat_id]['seen_users'][update.effective_user.id] = update.effective_user
+    
     with lock_mutex:
         chat_counters[chat_id] += 1
         if chat_counters[chat_id] >= 6:
-            try:
-                await update.message.set_reaction(reaction=random.choice(["🔥", "😂", "❤️", "⚡", "😈"]))
-                chat_counters[chat_id] = 0
+            try: await update.message.set_reaction(reaction=random.choice(["🔥", "😂", "❤️", "😈"])); chat_counters[chat_id] = 0
             except: pass
 
     text = (update.message.text or update.message.caption or "").lower()
-    daily_locks[chat_id]['seen_users'][update.effective_user.id] = update.effective_user
     is_image = bool(update.message.photo)
     is_reply = update.message.reply_to_message and update.message.reply_to_message.from_user.id == context.bot.id
     
@@ -164,6 +144,7 @@ async def core_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_chat_action(chat_id, "typing")
         await update.message.reply_text(await get_ai_response(chat_id, text, is_image))
 
+# --- Fun Commands Dispatcher ---
 async def fun_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cmd = update.message.text.lower().split()[0].replace('/', '').split('@')[0]
     chat_id = update.effective_chat.id
@@ -201,20 +182,23 @@ async def fun_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if cmd in mapping:
         users = list(daily_locks[chat_id]['seen_users'].values())
-        if not users: return await update.message.reply_text("I need to see some people first! 🤡")
+        if not users: return await update.message.reply_text("Pehle baat toh karo, tab pehchanunga! 🤡")
+        
         if cmd == "couple":
-            if len(users) < 2: res = "Need more people! 💔"
+            if len(users) < 2: res = "Kam se kam 2 bande chahiye! 💔"
             else:
                 m = random.sample(users, 2)
                 res = random.choice(mapping[cmd]).format(u1=safe_h(m[0].first_name), u2=safe_h(m[1].first_name), pct=random.randint(1, 100))
-        elif cmd == "chammar": res = random.choice(mapping[cmd]).format(pct=random.randint(1, 100))
+        elif cmd == "chammar":
+            res = random.choice(mapping[cmd]).format(pct=random.randint(1, 100))
         else:
             m = random.choice(users)
             res = random.choice(mapping[cmd]).format(user_name=safe_h(m.first_name), pct=random.randint(0, 100))
+        
         daily_locks[chat_id]['commands'][cmd] = {'msg': res}
         await update.message.reply_text(f"✨ {res}", parse_mode=ParseMode.HTML)
 
-# --- Main ---
+# --- Start ---
 @app.route('/')
 def health(): return jsonify({"status": "active"})
 
@@ -222,15 +206,12 @@ async def main():
     token = os.environ.get('TELEGRAM_BOT_TOKEN')
     await startKeepAliveServer()
     Thread(target=lambda: app.run(host='0.0.0.0', port=10000), daemon=True).start()
-    
     bot = Application.builder().token(token).build()
-    bot.add_error_handler(error_handler)
     bot.add_handler(CommandHandler("belu", belu_command))
     bot.add_handler(CallbackQueryHandler(api_callback))
     bot.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, core_handler), group=-1)
     for c in ["chammar", "gay", "roast", "aura", "horny", "brain", "monkey", "couple"]:
         bot.add_handler(CommandHandler(c, fun_dispatcher))
-    
     await bot.initialize(); await bot.start(); await bot.updater.start_polling(drop_pending_updates=True)
     while True: await asyncio.sleep(3600)
 
