@@ -1,30 +1,38 @@
-import os, logging, random, threading, html, httpx, asyncio
+import os, logging, random, html, httpx, asyncio, json
 from datetime import datetime, timedelta
-from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
 from telegram.constants import ParseMode
 
-# --- Logging & Global State ---
+# --- Logging & Data Persistence ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-logger = logging.getLogger(__name__)
+DATA_FILE = "beluga_persistent_data.json"
 
-app = Flask(__name__)
-daily_locks, chat_counters = {}, {}
+def load_data():
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, 'r') as f: return json.load(f)
+        except: return {"daily_locks": {}, "seen_users": {}}
+    return {"daily_locks": {}, "seen_users": {}}
+
+def save_data():
+    with open(DATA_FILE, 'w') as f:
+        json.dump({"daily_locks": daily_locks, "seen_users": seen_users}, f)
+
+data = load_data()
+daily_locks = data["daily_locks"]
+seen_users = data["seen_users"]
 games, naughty_index = {}, {}
-lock_mutex = threading.Lock()
 
 # --- Config ---
-OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
-WAKE_WORD = "beluga"
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 NAUGHTY_PHOTOS = ["https://docs.google.com/uc?export=download&id=1ha0a76nLE61Wkl-GTChueWzFzBzg9Evm"]
-BELUGA_IDENTITY = "Your name is Beluga. Tum ek savage aur witty Telegram bot ho. Hinglish mein reply karo."
 
-# --- Tic-Tac-Toe Helpers ---
+# --- Tic-Tac-Toe Logic ---
 def draw_tt_board(board):
     kb = []
     for i in range(0, 9, 3):
-        row = [InlineKeyboardButton(board[i+j] if board[i+j] != "-" else " - ", callback_data=f"tt_{i+j}") for j in range(3)]
+        row = [InlineKeyboardButton("⬜" if board[i+j] == "-" else board[i+j], callback_data=f"tt_{i+j}") for j in range(3)]
         kb.append(row)
     return InlineKeyboardMarkup(kb)
 
@@ -34,131 +42,118 @@ def check_winner(b):
         if b[p[0]] == b[p[1]] == b[p[2]] != "-": return b[p[0]]
     return "Draw" if "-" not in b else None
 
-def init_chat_data(chat_id):
-    today = (datetime.utcnow() + timedelta(hours=5, minutes=30)).date()
-    with lock_mutex:
-        if chat_id not in daily_locks or daily_locks[chat_id].get('date') != today:
-            daily_locks[chat_id] = {'date': today, 'commands': {}, 'seen_users': {}}
-        if chat_id not in chat_counters: chat_counters[chat_id] = 0
-
-# --- AI Engine ---
-async def get_ai_response(user_text):
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as c:
-            r = await c.post("https://openrouter.ai/api/v1/chat/completions", 
-                headers={"Authorization": f"Bearer {OPENROUTER_KEY}"},
-                json={"model": "liquid/lfm-2.5-1.2b-thinking:free", "messages": [{"role": "system", "content": BELUGA_IDENTITY}, {"role": "user", "content": user_text}]})
-            return r.json()['choices'][0]['message']['content']
-    except: return "Net slow hai, dimaag mat kha."
-
 # --- Handlers ---
-async def tictac_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id, user, reply = update.effective_chat.id, update.effective_user, update.message.reply_to_message
-    init_chat_data(chat_id)
-    p1_id, p1_name = user.id, user.first_name
-    p2_id, p2_name = (reply.from_user.id, reply.from_user.first_name) if reply else (context.bot.id, "Beluga")
-    games[chat_id] = {'board': ["-"]*9, 'players': {p1_id: {"n": p1_name, "s": "❌"}, p2_id: {"n": p2_name, "s": "⭕"}}, 'turn': p1_id}
-    await update.message.reply_text(f"<b>{p1_name} (❌) vs. {p2_name} (⭕)</b>\n\nKhel shuru!", reply_markup=draw_tt_board(games[chat_id]['board']), parse_mode=ParseMode.HTML)
-
-async def naughty_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    naughty_index[chat_id] = 0
-    kb = [[InlineKeyboardButton("Next Photo ➡️ 🌸", callback_data="ng_next"), InlineKeyboardButton("Refresh 🔃 🍎", callback_data="ng_ref")]]
-    await update.message.reply_photo(photo=NAUGHTY_PHOTOS[0], caption=f"🔞 Photo: 1 / {len(NAUGHTY_PHOTOS)}", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
-
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    data, chat_id, uid = query.data, query.message.chat.id, query.from_user.id
-    if data.startswith("tt_"):
-        if chat_id not in games or uid != games[chat_id]['turn']: return await query.answer("Wait kar!")
-        idx = int(data.split("_")[1]); b = games[chat_id]['board']
-        if b[idx] != "-": return await query.answer("Occupied!")
-        b[idx] = games[chat_id]['players'][uid]['s']; win = check_winner(b)
-        if win:
-            p = games[chat_id]['players']
-            await query.edit_message_text(f"Congratulations {p[uid]['n']}! 🎉\n\n{p[list(p.keys())[0]]['n']} vs {p[list(p.keys())[1]]['n']}\n<b>{p[uid]['n']} wins! Well played!</b> ❤️", reply_markup=draw_tt_board(b), parse_mode=ParseMode.HTML)
-            del games[chat_id]
-        else:
-            ids = list(games[chat_id]['players'].keys())
-            games[chat_id]['turn'] = ids[1] if uid == ids[0] else ids[0]
-            await query.edit_message_text(f"Turn: {games[chat_id]['players'][games[chat_id]['turn']]['n']}", reply_markup=draw_tt_board(b))
-    elif data.startswith("ng_"):
-        idx = (naughty_index.get(chat_id, 0) + 1) % len(NAUGHTY_PHOTOS) if data == "ng_next" else random.randint(0, len(NAUGHTY_PHOTOS)-1)
-        naughty_index[chat_id] = idx
-        await query.edit_message_media(media=InputMediaPhoto(media=NAUGHTY_PHOTOS[idx], caption=f"🔞 Photo: {idx+1}/{len(NAUGHTY_PHOTOS)}"), reply_markup=query.message.reply_markup)
-    await query.answer()
 
 async def fun_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cmd = update.message.text.lower().split()[0].replace('/', '').split('@')[0]
-    chat_id = update.effective_chat.id; init_chat_data(chat_id)
-    if cmd in daily_locks[chat_id]['commands']: return await update.message.reply_text(f"📌 {daily_locks[chat_id]['commands'][cmd]['msg']}", parse_mode=ParseMode.HTML)
-    users = list(daily_locks[chat_id]['seen_users'].values())
-    if not users: return await update.message.reply_text("Bande kam hain!")
+    chat_id = str(update.effective_chat.id)
+    today = str(datetime.now().date())
 
-    # --- ALL 78+ REPLIES INTEGRATED ---
+    if chat_id not in daily_locks or daily_locks[chat_id].get("date") != today:
+        daily_locks[chat_id] = {"date": today, "commands": {}}
+
+    if cmd in daily_locks[chat_id]["commands"]:
+        return await update.message.reply_text(f"📌 {daily_locks[chat_id]['commands'][cmd]}", parse_mode=ParseMode.HTML)
+
+    users = list(seen_users.get(chat_id, {}).values())
+    if not users: return await update.message.reply_text("Pehle group mein thodi bakchodi karo tabhi list banegi! 🤡")
+
+    # 🔥 POORE 78+ REPLIES YAHAN HAIN 🔥
     mapping = {
         "gay": [
-            "🌈 <b>{user_name}</b> is {pct}% GAY! 🌚", "💅 <b>{user_name}</b> is a Diva! {pct}% ✨", "🍭 Rainbow-coded: <b>{user_name}</b> ({pct}%) 🏳️‍🌈", 
-            "💄 Heterosexuality dropped: {pct}% 📉", "👠 <b>{user_name}</b>, slay queen! {pct}% 👑", "🏳️‍🌈 Proudly Gay: <b>{user_name}</b> ({pct}%)",
-            "🌈 <b>{user_name}</b> is {pct}% into boys! 👦", "💅 Fabulous meter: {pct}% for <b>{user_name}</b>", "🦄 Unicorn energy: {pct}%! 🌈",
-            "🍭 Sweet & Gay: <b>{user_name}</b> ({pct}%)", "✨ {user_name} is {pct}% glittery! 🏳️‍🌈"
+            "🌈 <b>{u}</b> is {p}% GAY! 🌚", "💅 <b>{u}</b> is a pure Diva! {p}% ✨", "💄 Gay radar on <b>{u}</b>: {p}% 🏳️‍🌈", 
+            "👠 <b>{u}</b>, slay queen! {p}% 👑", "🏳️‍🌈 <b>{u}</b> dropped heterosexuality! {p}% 📈", "🍭 Sweet & Gay: <b>{u}</b> ({p}%)",
+            "🦄 Unicorn energy: {p}% for <b>{u}</b>! 🌈", "✨ <b>{u}</b> is {p}% glittery! 🏳️‍🌈", "👦 <b>{u}</b> loves boys {p}%! 💖",
+            "🎀 <b>{u}</b> is {p}% feminine tonight! 💅", "🌈 Rainbow boy <b>{u}</b>: {p}%! 🍭"
         ],
         "roast": [
-            "💀 <b>{user_name}</b> is pure garbage! 🚮", "🗑️ Face is a crime scene: <b>{user_name}</b>! 😭", "🦴 Starving for attention: <b>{user_name}</b>! 🦴", 
-            "🤡 Dropped your brain? {user_name} 🚫", "🔥 Roasted like a chicken: <b>{user_name}</b>! 🍗", "🚑 Mental help needed for <b>{user_name}</b>! 💨",
-            "📉 <b>{user_name}</b>'s IQ: Error 404! 🚫", "🧟 Zombies won't eat <b>{user_name}</b>... no brains! 🧠", "🚮 <b>{user_name}</b> is the reason why shampoo has instructions! 🧴",
-            "💩 <b>{user_name}</b>'s birth certificate is an apology from the condom factory! 👶", "🛑 Stop talking, <b>{user_name}</b>, you're lowering the IQ of the whole chat! 📉"
+            "💀 <b>{u}</b> is pure garbage! 🚮", "🗑️ <b>{u}</b>'s face is a crime scene! 😭", "🤡 <b>{u}</b> dropped their only 2 brain cells! 🚫",
+            "🔥 Roasted like a chicken: <b>{u}</b>! 🍗", "🚑 <b>{u}</b> needs mental help ASAP! 💨", "🧟 Zombies ignored <b>{u}</b>... no brains! 🧠",
+            "📉 <b>{u}</b>'s IQ is lower than the room temperature! 🧊", "🚮 <b>{u}</b> is the reason why shampoo has instructions! 🧴",
+            "💩 <b>{u}</b>'s birth certificate is an apology from the factory! 👶", "🛑 Stop talking, <b>{u}</b>, you're lowering the IQ of the group! 📉",
+            "🤮 Looking at <b>{u}</b> makes me support abortion! 🚫", "🦴 <b>{u}</b> is so skinny, he uses a Cheeto as a walking stick! 🥢"
         ],
         "chammar": [
             "🚽 <b>Shakti</b> (Harpic CEO) spotted! 🧴", "🧹 <b>Shakti</b>'s mop is smarter than them! 🏆", "🧴 Perfume? Harpic Blue for <b>Shakti</b>! 🧼", 
-            "🪠 <b>Shakti</b>, Sultan of Sewage! 🚽", "🧼 <b>Shakti</b> wash the floor! {pct}% done! 🧹", "🤡 Circus called, <b>Shakti</b>, they want their clown back! 🎪",
-            "🪣 <b>Shakti</b>'s bucket list: Just a bucket! 🪣", "🧹 Clean it up, <b>Shakti</b>! Harpic is waiting! 🧴", "🧼 <b>Shakti</b>'s only talent: Scrubbing! 🧼",
-            "🚽 <b>Shakti</b>'s castle is the public urinal! 🏰", "🧴 <b>Shakti</b> drinks Harpic for breakfast! 🥛"
+            "🪠 <b>Shakti</b>, Sultan of Sewage! 🚽", "🧼 <b>Shakti</b>, wash the floor! {p}% done! 🧹", "🤡 <b>Shakti</b>, the floor is still dirty! 🧼",
+            "🪣 <b>Shakti</b>'s bucket list is just a bucket! 🪣", "🧴 <b>Shakti</b> drinks Harpic for breakfast! 🥛", "🧹 Olympic Mop Winner: <b>Shakti</b>! 🥇",
+            "🚽 <b>Shakti</b>'s kingdom is the public urinal! 🏰", "🧼 Scrub harder <b>Shakti</b>! {p}% left! 🧼"
         ],
         "aura": [
-            "✨ <b>{user_name}</b>'s Aura: {pct}% 👑", "📉 -{pct} Aura for <b>{user_name}</b>! 💀", "🌟 Glowing at {pct}%! 🌌", "🌑 Cardboard Aura: {pct}% 📦",
-            "🔥 Godly Aura: <b>{user_name}</b> ({pct}%)! ⚡", "💩 Shitty Aura: <b>{user_name}</b> ({pct}%)! 🤢", "🗿 Chad Aura: <b>{user_name}</b> ({pct}%)! 🗿",
-            "🤡 Clown Aura: <b>{user_name}</b> ({pct}%)! 🎪", "🌈 Rainbow Aura: <b>{user_name}</b> ({pct}%)! 🏳️‍🌈", "💎 Diamond Aura: <b>{user_name}</b> ({pct}%)! ✨"
+            "✨ <b>{u}</b>'s Aura: {p}% 👑", "📉 -{p} Aura for <b>{u}</b>! 💀", "🌟 Glowing at {p}%! 🌌", "🌑 Cardboard Aura: {p}% 📦",
+            "🔥 Godly Aura: <b>{u}</b> ({p}%)! ⚡", "💩 Shitty Aura: <b>{u}</b> ({p}%)! 🤢", "🗿 Chad Aura: <b>{u}</b> ({p}%)! 🗿",
+            "🤡 Clown Aura: <b>{u}</b> ({p}%)! 🎪", "🌈 Rainbow Aura: <b>{u}</b> ({p}%)! 🏳️‍🌈", "💎 Diamond Aura: <b>{u}</b> ({p}%)! ✨"
         ],
         "monkey": [
-            "🐒 <b>{user_name}</b> is {pct}% Gorilla! 🦍", "🍌 Banana lover: <b>{user_name}</b>! 🐵", "🐒 Jungle king: <b>{user_name}</b>! ({pct}%) 🌲",
-            "🦧 <b>{user_name}</b> is a pure Orangutan! 🐵", "🐒 Monkey business detected from <b>{user_name}</b>! 🍌"
+            "🐒 <b>{u}</b> is {p}% Gorilla! 🦍", "🍌 Banana lover: <b>{u}</b>! 🐵", "🐒 Jungle king: <b>{u}</b>! ({p}%) 🌲",
+            "🦧 <b>{u}</b> is a pure Orangutan! 🐵", "🐒 Monkey business detected from <b>{u}</b>! 🍌"
         ],
         "couple": [
-            "💞 Couple: <b>{u1}</b> ❤️ <b>{u2}</b> ({pct}% match!) 🏩", "💍 Wedding bells for <b>{u1}</b> & <b>{u2}</b>! {pct}% 🔔", "🔥 Toxic goals: <b>{u1}</b> & <b>{u2}</b>! {pct}% ☢️",
-            "💕 Rab Ne Bana Di Jodi: <b>{u1}</b> & <b>{u2}</b>! ({pct}%) 🥰", "💔 Breakup loading for <b>{u1}</b> & <b>{u2}</b>! {pct}% 📉", "🥀 One-sided love: <b>{u1}</b> for <b>{u2}</b>! ({pct}%) 😭"
+            "💞 Couple: <b>{u1}</b> ❤️ <b>{u2}</b> ({p}% match!) 🏩", "💍 Wedding bells: <b>{u1}</b> & <b>{u2}</b>! {p}% 🔔", "🔥 Toxic goals: <b>{u1}</b> & <b>{u2}</b>! {p}% ☢️",
+            "💕 Rab Ne Bana Di Jodi: <b>{u1}</b> & <b>{u2}</b>! ({p}%) 🥰", "💔 Breakup loading for <b>{u1}</b> & <b>{u2}</b>! {p}% 📉", "🥀 One-sided love: <b>{u1}</b> for <b>{u2}</b>! ({p}%) 😭"
         ],
         "brain": [
-            "🧠 <b>{user_name}</b>'s Brain: {pct}% 🔋", "💡 Intelligence: <b>{user_name}</b> ({pct}%)! 🕯️", "🥔 Potato Brain: <b>{user_name}</b> ({pct}%)! 🥔",
-            "⚙️ Processing... <b>{user_name}</b> is {pct}% slow! 🐌", "🧠 Big Brain Energy: <b>{user_name}</b> ({pct}%)! ⚡"
+            "🧠 <b>{u}</b>'s Brain: {p}% 🔋", "💡 Intelligence: <b>{u}</b> ({p}%)! 🕯️", "🥔 Potato Brain: <b>{u}</b> ({p}%)! 🥔",
+            "⚙️ Processing... <b>{u}</b> is {p}% slow! 🐌", "🧠 Big Brain Energy: <b>{u}</b> ({p}%)! ⚡"
         ]
     }
 
     if cmd == "couple":
         m = random.sample(users, 2) if len(users) >= 2 else users*2
-        res = random.choice(mapping[cmd]).format(u1=html.escape(m[0].first_name), u2=html.escape(m[1].first_name), pct=random.randint(1, 100))
+        res = random.choice(mapping[cmd]).format(u1=m[0]['n'], u2=m[1]['n'], p=random.randint(1, 100))
     else:
-        m = random.choice(users); res = random.choice(mapping[cmd]).format(user_name=html.escape(m.first_name), pct=random.randint(0, 100))
-    daily_locks[chat_id]['commands'][cmd] = {'msg': res}
-    await update.message.reply_text(f"✨ {res}", parse_mode=ParseMode.HTML)
+        m = random.choice(users); res = random.choice(mapping[cmd]).format(u=m['n'], p=random.randint(0, 100))
+    
+    daily_locks[chat_id]["commands"][cmd] = res
+    save_data(); await update.message.reply_text(f"✨ {res}", parse_mode=ParseMode.HTML)
 
+# --- Tictac & Callback Handlers (Samina Style) ---
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; data, chat_id, uid = query.data, query.message.chat.id, str(query.from_user.id)
+    await query.answer()
+
+    if data.startswith("tt_"):
+        if chat_id not in games or uid != games[chat_id]['turn']: return
+        idx = int(data.split("_")[1]); b = games[chat_id]['board']
+        if b[idx] != "-": return
+        b[idx] = games[chat_id]['players'][uid]['s']; win = check_winner(b)
+        
+        if win:
+            p = games[chat_id]['players']; ids = list(p.keys())
+            txt = f"Congratulations {p[uid]['n']}! 🎉\n\n{p[ids[0]]['n']} vs {p[ids[1]]['n']}\n<b>{p[uid]['n']} wins! Well played!</b> ❤️" if win != "Draw" else "🤝 Match Draw!"
+            await query.edit_message_text(txt, reply_markup=draw_tt_board(b), parse_mode=ParseMode.HTML)
+            del games[chat_id]
+        else:
+            ids = list(games[chat_id]['players'].keys())
+            next_t = ids[1] if uid == ids[0] else ids[0]; games[chat_id]['turn'] = next_t
+            if games[chat_id]['vs_bot'] and next_t == str(context.bot.id):
+                empty = [i for i, v in enumerate(b) if v == "-"]; b[random.choice(empty)] = "⭕"
+                games[chat_id]['turn'] = uid
+                await query.edit_message_text(f"Turn: {p[uid]['n']}", reply_markup=draw_tt_board(b))
+            else:
+                await query.edit_message_text(f"Turn: {games[chat_id]['players'][next_t]['n']}", reply_markup=draw_tt_board(b))
+
+    elif data.startswith("ng_"):
+        idx = (naughty_index.get(chat_id, 0) + 1) % len(NAUGHTY_PHOTOS) if data == "ng_next" else random.randint(0, len(NAUGHTY_PHOTOS)-1)
+        naughty_index[chat_id] = idx
+        await query.edit_message_media(media=InputMediaPhoto(media=NAUGHTY_PHOTOS[idx], caption=f"🔞 Photo: {idx+1}/{len(NAUGHTY_PHOTOS)}"), reply_markup=query.message.reply_markup)
+
+# --- Tracking & Main ---
 async def core_msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or update.effective_user.is_bot: return
-    chat_id = update.effective_chat.id; init_chat_data(chat_id)
-    daily_locks[chat_id]['seen_users'][update.effective_user.id] = update.effective_user
-    text = (update.message.text or "").lower()
-    if WAKE_WORD in text or (update.message.reply_to_message and update.message.reply_to_message.from_user.id == context.bot.id):
-        await update.message.reply_text(await get_ai_response(text))
+    chat_id, user_id = str(update.effective_chat.id), str(update.effective_user.id)
+    if chat_id not in seen_users: seen_users[chat_id] = {}
+    seen_users[chat_id][user_id] = {"n": update.effective_user.first_name}
+    save_data()
 
-async def main():
-    bot = Application.builder().token(os.environ.get('TELEGRAM_BOT_TOKEN')).build()
-    bot.add_handler(CommandHandler("tictac", tictac_handler))
-    bot.add_handler(CommandHandler("naughty", naughty_handler))
-    bot.add_handler(CallbackQueryHandler(callback_handler))
-    bot.add_handler(MessageHandler(filters.PHOTO & filters.FORWARDED, lambda u, c: u.message.reply_text(f"✅ ID: `{u.message.photo[-1].file_id}`", parse_mode=ParseMode.MARKDOWN)))
-    for c in ["chammar", "gay", "roast", "aura", "couple", "monkey", "brain"]: bot.add_handler(CommandHandler(c, fun_dispatcher))
-    bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, core_msg_handler))
-    await bot.initialize(); await bot.start(); await bot.updater.start_polling(drop_pending_updates=True)
-    while True: await asyncio.sleep(3600)
+def main():
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("tictac", tictac_handler))
+    app.add_handler(CommandHandler("naughty", naughty_handler))
+    app.add_handler(CallbackQueryHandler(callback_handler))
+    for c in ["gay", "roast", "chammar", "aura", "couple", "monkey", "brain"]: app.add_handler(CommandHandler(c, fun_dispatcher))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, core_msg_handler))
+    app.add_handler(MessageHandler(filters.PHOTO & filters.FORWARDED, lambda u, c: u.message.reply_text(f"ID: `{u.message.photo[-1].file_id}`")))
+    app.run_polling()
 
-if __name__ == '__main__': asyncio.run(main())
+if __name__ == '__main__': main()
