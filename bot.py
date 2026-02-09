@@ -1,20 +1,10 @@
-import os
-import logging
-import random
-import threading
-import html
-import httpx
-import asyncio
-import traceback
+import os, logging, random, threading, html, httpx, asyncio, traceback
 from datetime import datetime, timedelta
 from threading import Thread
 from flask import Flask, jsonify
-
-# Render Keep-Alive Script (aiohttp)
 from aiohttp.web import Application as AioApp, AppRunner, TCPSite, Response
-
 from groq import Groq
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
 from telegram.constants import ParseMode
 
@@ -23,45 +13,36 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-daily_locks = {}
-chat_counters = {} 
-manual_api_choice = {} 
+daily_locks, chat_counters, manual_api_choice = {}, {}, {}
+games = {} 
+naughty_index = {} 
 lock_mutex = threading.Lock()
 
 # --- Config ---
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
-NVIDIA_KEY = os.environ.get("NVIDIA_API_KEY")
 GROQ_KEY = os.environ.get("GROQ_API_KEY")
-ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x]
 WAKE_WORD = "beluga"
 
-BELUGA_IDENTITY = (
-    "Your name is Beluga. Tum ek savage aur witty Telegram bot ho. "
-    "Hamesha Hinglish (Hindi + English) mein reply karo. "
-    "Be sharp, sarcastic, and funny. Answer 1-2 sentences max."
-)
+# Yahan apni File IDs daalte rehna
+NAUGHTY_PHOTOS = ["https://docs.google.com/uc?export=download&id=1ha0a76nLE61Wkl-GTChueWzFzBzg9Evm"]
+
+BELUGA_IDENTITY = "Your name is Beluga. Tum ek savage aur witty Telegram bot ho. Hinglish mein reply karo. Answer 1-2 sentences max."
 
 if GROQ_KEY: groq_client = Groq(api_key=GROQ_KEY)
 
-# --- Render Keep-Alive Server ---
-async def checkHealth(request):
-    return Response(text="Beluga is awake and savage!", content_type="text/plain")
+# --- Tic-Tac-Toe Helpers ---
+def draw_tt_board(board):
+    kb = []
+    for i in range(0, 9, 3):
+        row = [InlineKeyboardButton(board[i+j] if board[i+j] != "-" else " - ", callback_data=f"tt_{i+j}") for j in range(3)]
+        kb.append(row)
+    return InlineKeyboardMarkup(kb)
 
-async def startKeepAliveServer() -> None:
-    port = int(os.environ.get('PORT', 8080))
-    server_app = AioApp()
-    server_app.router.add_get('/', checkHealth)
-    server_app.router.add_get('/healthz', checkHealth)
-    runner = AppRunner(server_app, access_log=None)
-    await runner.setup()
-    site = TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-
-# --- Helpers ---
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error(f"🚨 CRASH: {context.error}")
-
-def safe_h(text): return html.escape(text or "Dost")
+def check_winner(b):
+    pts = [(0,1,2),(3,4,5),(6,7,8),(0,3,6),(1,4,7),(2,5,8),(0,4,8),(2,4,6)]
+    for p in pts:
+        if b[p[0]] == b[p[1]] == b[p[2]] != "-": return b[p[0]]
+    return "Draw" if "-" not in b else None
 
 def init_chat_data(chat_id):
     today = (datetime.utcnow() + timedelta(hours=5, minutes=30)).date()
@@ -70,133 +51,132 @@ def init_chat_data(chat_id):
             daily_locks[chat_id] = {'date': today, 'commands': {}, 'seen_users': {}}
         if chat_id not in chat_counters: chat_counters[chat_id] = 0
 
-# --- AI Engine (Dedicated Callers) ---
-async def try_openrouter(text):
-    if not OPENROUTER_KEY: return None
+# --- AI Engine ---
+async def get_ai_response(user_text):
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            res = await client.post("https://openrouter.ai/api/v1/chat/completions",
+        async with httpx.AsyncClient(timeout=10.0) as c:
+            r = await c.post("https://openrouter.ai/api/v1/chat/completions", 
                 headers={"Authorization": f"Bearer {OPENROUTER_KEY}"},
-                json={"model": "liquid/lfm-2.5-1.2b-thinking:free", "messages": [{"role": "system", "content": BELUGA_IDENTITY}, {"role": "user", "content": text}]})
-            return res.json()['choices'][0]['message']['content'] if res.status_code == 200 else None
-    except: return None
+                json={"model": "liquid/lfm-2.5-1.2b-thinking:free", "messages": [{"role": "system", "content": BELUGA_IDENTITY}, {"role": "user", "content": user_text}]})
+            return r.json()['choices'][0]['message']['content']
+    except: return "Dimaag mat kha, network down hai."
 
-async def try_nvidia(text):
-    if not NVIDIA_KEY: return None
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            res = await client.post("https://integrate.api.nvidia.com/v1/chat/completions",
-                headers={"Authorization": f"Bearer {NVIDIA_KEY}"},
-                json={"model": "nvidia/nemoretriever-page-elements-v3", "messages": [{"role": "user", "content": f"{BELUGA_IDENTITY}\n\nTask: {text}"}]})
-            return res.json()['choices'][0]['message']['content'] if res.status_code == 200 else None
-    except: return None
+# --- Handlers ---
+async def tictac_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id, user, reply = update.effective_chat.id, update.effective_user, update.message.reply_to_message
+    p1_id, p1_name = user.id, user.first_name
+    p2_id, p2_name = (reply.from_user.id, reply.from_user.first_name) if reply else (context.bot.id, "Beluga")
+    games[chat_id] = {'board': ["-"]*9, 'players': {p1_id: {"n": p1_name, "s": "❌"}, p2_id: {"n": p2_name, "s": "⭕"}}, 'turn': p1_id}
+    await update.message.reply_text(f"<b>{p1_name} (❌) vs. {p2_name} (⭕)</b>\n\nKhel shuru!", reply_markup=draw_tt_board(games[chat_id]['board']), parse_mode=ParseMode.HTML)
 
-async def try_groq(text):
-    if not GROQ_KEY: return None
-    try:
-        res = groq_client.chat.completions.create(model="llama-3.1-8b-instant",
-            messages=[{"role": "user", "content": f"RULES: {BELUGA_IDENTITY}\n\nUSER: {text}"}])
-        return res.choices[0].message.content
-    except: return None
-
-async def get_ai_response(chat_id, user_text, is_image=False):
-    choice = manual_api_choice.get(chat_id)
-    if choice == "opr": return await try_openrouter(user_text) or "OpenRouter nakhre kar raha hai."
-    if choice == "nvi": return await try_nvidia(user_text) or "Nvidia offline hai."
-    if choice == "gro": return await try_groq(user_text) or "Groq down hai."
-
-    if is_image: return await try_nvidia(user_text) or await try_groq(user_text) or "Photo samajh nahi aayi."
-    return await try_openrouter(user_text) or await try_nvidia(user_text) or await try_groq(user_text) or "Brains offline hain."
-
-# --- Admin Feature: /belu ---
-async def belu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS: return await update.message.reply_text("Beta admin bano pehle. 🤡")
-    keyboard = [[InlineKeyboardButton("nvi", callback_data="nvi"), InlineKeyboardButton("gro", callback_data="gro")],
-                [InlineKeyboardButton("opr", callback_data="opr"), InlineKeyboardButton("auto switch", callback_data="auto")]]
-    await update.message.reply_text("current active brains 🧠", reply_markup=InlineKeyboardMarkup(keyboard))
-
-async def api_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    choice = query.data
-    manual_api_choice[update.effective_chat.id] = None if choice == "auto" else choice
-    await query.edit_message_text(f"✅ **System Update:** Locked to {choice.upper() if choice != 'auto' else 'Auto Switch'}")
-
-# --- Message Handler ---
-async def core_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or update.effective_user.is_bot: return
+async def naughty_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    init_chat_data(chat_id)
-    
-    # Store user (Privacy off ensures we see more people)
-    daily_locks[chat_id]['seen_users'][update.effective_user.id] = update.effective_user
-    
-    # Reaction Logic
-    with lock_mutex:
-        chat_counters[chat_id] += 1
-        if chat_counters[chat_id] >= 6:
-            try: await update.message.set_reaction(reaction=random.choice(["🔥", "😂", "❤️", "⚡", "😈"])); chat_counters[chat_id] = 0
-            except: pass
+    naughty_index[chat_id] = 0
+    kb = [[InlineKeyboardButton("Next Photo ➡️ 🌸", callback_data="ng_next"), InlineKeyboardButton("Refresh 🔃 🍎", callback_data="ng_ref")]]
+    await update.message.reply_photo(photo=NAUGHTY_PHOTOS[0], caption=f"🔞 **Collection**\nPhoto: 1 / {len(NAUGHTY_PHOTOS)}", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
 
-    text = (update.message.text or update.message.caption or "").lower()
-    is_image = bool(update.message.photo)
-    is_reply = update.message.reply_to_message and update.message.reply_to_message.from_user.id == context.bot.id
-    
-    if WAKE_WORD in text or is_reply:
-        await context.bot.send_chat_action(chat_id, "typing")
-        await update.message.reply_text(await get_ai_response(chat_id, text, is_image))
+async def get_id_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.photo:
+        await update.message.reply_text(f"✅ **ID:** `{update.message.photo[-1].file_id}`", parse_mode=ParseMode.MARKDOWN)
 
-# --- Fun Commands ---
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data, chat_id, uid = query.data, query.message.chat.id, query.from_user.id
+    if data.startswith("tt_"):
+        if chat_id not in games or uid != games[chat_id]['turn']: return await query.answer("Wait kar!")
+        idx = int(data.split("_")[1])
+        if games[chat_id]['board'][idx] != "-": return await query.answer("Occupied!")
+        games[chat_id]['board'][idx] = games[chat_id]['players'][uid]['s']
+        win = check_winner(games[chat_id]['board'])
+        if win:
+            p = games[chat_id]['players']
+            await query.edit_message_text(f"Congratulations {p[uid]['n']}! 🎉\n<b>Winner: {p[uid]['n']}</b>", reply_markup=draw_tt_board(games[chat_id]['board']), parse_mode=ParseMode.HTML)
+            del games[chat_id]
+        else:
+            ids = list(games[chat_id]['players'].keys())
+            games[chat_id]['turn'] = ids[1] if uid == ids[0] else ids[0]
+            await query.edit_message_text(f"Turn: {games[chat_id]['players'][games[chat_id]['turn']]['n']}", reply_markup=draw_tt_board(games[chat_id]['board']))
+    elif data.startswith("ng_"):
+        idx = (naughty_index.get(chat_id, 0) + 1) % len(NAUGHTY_PHOTOS) if data == "ng_next" else random.randint(0, len(NAUGHTY_PHOTOS)-1)
+        naughty_index[chat_id] = idx
+        await query.edit_message_media(media=InputMediaPhoto(media=NAUGHTY_PHOTOS[idx], caption=f"🔞 Photo: {idx+1}/{len(NAUGHTY_PHOTOS)}"), reply_markup=query.message.reply_markup)
+    await query.answer()
+
 async def fun_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cmd = update.message.text.lower().split()[0].replace('/', '').split('@')[0]
     chat_id = update.effective_chat.id
     init_chat_data(chat_id)
     
-    if cmd in daily_locks[chat_id]['commands']:
-        return await update.message.reply_text(f"📌 {daily_locks[chat_id]['commands'][cmd]['msg']}", parse_mode=ParseMode.HTML)
-
     mapping = {
-        "chammar": ["🚽 <b>Shakti</b> detected! Harpic CEO is here! 🧴🤡", "🧹 <b>Shakti</b>'s mop! 🏆", "🧴 <b>Shakti</b>'s perfume? Harpic Blue! 🧼", "🤡 <b>Shakti</b>'s dreams are flushed! 🌊", "🧼 <b>Shakti</b> drinks Harpic to stay clean! 💦", "🪠 <b>Shakti</b>, Sultan of Sewage! 🚽", "🚽 <b>Shakti</b> is {pct}% Harpic! 💀"],
-        "gay": ["🌈 Today's gay: <b>{user_name}</b> ({pct}%) 🌚", "🦄 <b>{user_name}</b> is fabulous! {pct}% 🏳️‍🌈💅", "💅 Slay <b>{user_name}</b>! {pct}% icon! ✨", "🎨 <b>{user_name}</b> is the rainbow! {pct}%"],
-        "roast": ["💀 <b>{user_name}</b> is pure trash! 🚮", "🗑️ Mirror asked <b>{user_name}</b> for therapy! 😭", "🤡 <b>{user_name}</b> dropped their brain! 🚫", "🧟 Zombies won't eat <b>{user_name}</b>... no brains! 🧠"],
-        "aura": ["✨ <b>{user_name}</b>'s aura: {pct}% 👑", "🗿 <b>{user_name}</b> aura: {pct}% Chad! 🗿", "💎 <b>{user_name}</b> has {pct}% diamond aura! ✨"],
-        "horny": ["🚨 <b>{user_name}</b> horny level: {pct}% (BONK!) 🚔", "🥵 <b>{user_name}</b> is thirsty! {pct}% 💧", "❄️ <b>{user_name}</b> needs cold shower! {pct}%"],
-        "brain": ["🧠 <b>{user_name}</b>'s brain cells: {pct}% 🔋", "🥔 <b>{user_name}</b>'s IQ: {pct}% (Potato) 🥔", "🤯 Using {pct}% of power! 🤯"],
-        "monkey": ["🐒 <b>{user_name}</b> is the group MONKEY! 🙈", "🍌 <b>{user_name}</b> Banana Lover! 🐵", "🦍 <b>{user_name}</b> is going APE! 🔥"],
-        "couple": ["💞 Couple: <b>{u1}</b> ❤️ <b>{u2}</b> ({pct}% match!) 🏩", "💍 Wedding bells: <b>{u1}</b> & <b>{u2}</b>! ({pct}%) 🔔", "🏩 <b>{u1}</b> & <b>{u2}</b> need a room! ({pct}% spicy)", "🚢 Shipping <b>{u1}</b> & <b>{u2}</b>! ({pct}%) ⚓"]
+        "chammar": [
+            "🚽 <b>Shakti</b> detected! Harpic CEO is here! 🧴🤡", "🧹 <b>Shakti</b>'s mop! 🏆", 
+            "🧴 <b>Shakti</b>'s perfume? Harpic Blue! 🧼", "🤡 <b>Shakti</b>'s dreams are flushed! 🌊",
+            "🧼 <b>Shakti</b> drinks Harpic to stay clean! 💦", "🧹 Olympic Mop winner: <b>Shakti</b>! 🥇",
+            "🚽 <b>Shakti</b> + Mop = Love Story! 💞", "🪠 <b>Shakti</b>, Sultan of Sewage! 🚽",
+            "💦 <b>Shakti</b>'s contribution: a clean urinal! 🧹", "🧼 Toilet clogged again, <b>Shakti</b>? 🤣",
+            "🚽 <b>Shakti</b> is {pct}% Harpic! 💀", "🧹 <b>Shakti</b>'s mop is smarter! ({pct}%) 🧠",
+            "🧴 Scrub, <b>Shakti</b>! Harpic is drying! 💨", "🧹 {pct}% shift done, <b>Shakti</b>! 🏃‍♂️",
+            "🧼 <b>Shakti</b>'s ID is a Harpic receipt! 🧼", "🤡 Sales are up because of <b>Shakti</b>! 🧴",
+            "🚽 <b>Shakti</b>'s kingdom is the toilet! 👑", "🧴 {pct}% done. Work harder, <b>Shakti</b>! 🤡"
+        ],
+        "gay": [
+            "🌈 Today's gay: <b>{user_name}</b> ({pct}%) 🌚", "🦄 <b>{user_name}</b> is fabulous! {pct}% 🏳️‍🌈💅", 
+            "🌈 <b>{user_name}</b> dropped heterosexuality! {pct}% 📉", "🍭 <b>{user_name}</b> is {pct}% rainbow-coded! ⚡",
+            "💅 Slay <b>{user_name}</b>! {pct}% icon! ✨", "🌈 Radar found <b>{user_name}</b>: {pct}% 📡",
+            "✨ <b>{user_name}</b> is {pct}% glitter! 🌈", "🔥 <b>{user_name}</b> is burning with {pct}% pride! 🏳️‍🌈",
+            "👑 <b>{user_name}</b> is {pct}% fabulous! 👑", "🎨 <b>{user_name}</b> is the rainbow! {pct}%"
+        ],
+        "roast": [
+            "💀 <b>{user_name}</b> is pure trash! 🚮", "🗑️ Mirror asked <b>{user_name}</b> for therapy! 😭", 
+            "🦴 <b>{user_name}</b> starving for attention! 🦴", "🤡 <b>{user_name}</b> dropped their brain! 🚫",
+            "🔥 <b>{user_name}</b> roasted like a marshmallow! 🍗", "🚑 <b>{user_name}</b> destroyed! 💨",
+            "🚮 <b>{user_name}</b> is human trash! 🚮", "🤏 <b>{user_name}</b>'s contribution: 0%! 📉",
+            "🦷 <b>{user_name}</b> so ugly, doc slapped mom! 🤱", "🧟 Zombies won't eat <b>{user_name}</b>... no brains! 🧠"
+        ],
+        "aura": [
+            "✨ <b>{user_name}</b>'s aura: {pct}% 👑", "📉 -{pct} Aura for <b>{user_name}</b>! 💀",
+            "🌟 <b>{user_name}</b> glowing! {pct}%! 🌌", "🌑 <b>{user_name}</b> cardboard aura: {pct}% 📦",
+            "💎 <b>{user_name}</b> has {pct}% diamond aura! ✨", "🗿 <b>{user_name}</b> aura: {pct}% Chad! 🗿"
+        ],
+        "brain": [
+            "🧠 <b>{user_name}</b>'s brain cells: {pct}% 🔋", "💡 <b>{user_name}</b>'s lightbulb: {pct}%! 🕯️",
+            "🥔 <b>{user_name}</b>'s IQ: {pct}% (Potato) 🥔", "⚙️ Processing at {pct}%! ⚙️"
+        ],
+        "monkey": ["🐒 <b>{user_name}</b> is the group MONKEY! 🙈", "🍌 <b>{user_name}</b> Banana Lover! 🐵", "🐒 <b>{user_name}</b> is {pct}% chimpanzee!"],
+        "couple": ["💞 Couple: <b>{u1}</b> ❤️ <b>{u2}</b> ({pct}% match!) 🏩", "💍 Wedding bells: <b>{u1}</b> & <b>{u2}</b>! ({pct}%) 🔔"]
     }
 
-    if cmd in mapping:
-        users = list(daily_locks[chat_id]['seen_users'].values())
-        if not users: return await update.message.reply_text("I need to see some people first! 🤡")
-        
-        if cmd == "couple":
-            if len(users) < 2: res = "Need more people! 💔"
-            else:
-                m = random.sample(users, 2)
-                res = random.choice(mapping[cmd]).format(u1=safe_h(m[0].first_name), u2=safe_h(m[1].first_name), pct=random.randint(1, 100))
-        elif cmd == "chammar":
-            res = random.choice(mapping[cmd]).format(pct=random.randint(1, 100))
-        else:
-            m = random.choice(users)
-            res = random.choice(mapping[cmd]).format(user_name=safe_h(m.first_name), pct=random.randint(0, 100))
-        
-        daily_locks[chat_id]['commands'][cmd] = {'msg': res}
-        await update.message.reply_text(f"✨ {res}", parse_mode=ParseMode.HTML)
+    if cmd in daily_locks[chat_id]['commands']: return await update.message.reply_text(f"📌 {daily_locks[chat_id]['commands'][cmd]['msg']}", parse_mode=ParseMode.HTML)
+    users = list(daily_locks[chat_id]['seen_users'].values())
+    if not users: return await update.message.reply_text("Bande kahan hain? 🤡")
+    
+    if cmd == "couple":
+        m = random.sample(users, 2) if len(users) >= 2 else users*2
+        res = random.choice(mapping[cmd]).format(u1=html.escape(m[0].first_name), u2=html.escape(m[1].first_name), pct=random.randint(1, 100))
+    else:
+        m = random.choice(users)
+        res = random.choice(mapping[cmd]).format(user_name=html.escape(m.first_name), pct=random.randint(0, 100))
+    
+    daily_locks[chat_id]['commands'][cmd] = {'msg': res}
+    await update.message.reply_text(f"✨ {res}", parse_mode=ParseMode.HTML)
 
-# --- Server & Main ---
-@app.route('/')
-def health(): return jsonify({"status": "active"})
+async def core_msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or update.effective_user.is_bot: return
+    chat_id = update.effective_chat.id
+    init_chat_data(chat_id)
+    daily_locks[chat_id]['seen_users'][update.effective_user.id] = update.effective_user
+    text = (update.message.text or "").lower()
+    if WAKE_WORD in text or (update.message.reply_to_message and update.message.reply_to_message.from_user.id == context.bot.id):
+        await update.message.reply_text(await get_ai_response(text))
 
 async def main():
-    token = os.environ.get('TELEGRAM_BOT_TOKEN')
-    await startKeepAliveServer()
-    Thread(target=lambda: app.run(host='0.0.0.0', port=10000), daemon=True).start()
-    bot = Application.builder().token(token).build()
-    bot.add_handler(CommandHandler("belu", belu_command))
-    bot.add_handler(CallbackQueryHandler(api_callback))
-    bot.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, core_handler), group=-1)
-    for c in ["chammar", "gay", "roast", "aura", "horny", "brain", "monkey", "couple"]:
-        bot.add_handler(CommandHandler(c, fun_dispatcher))
+    bot = Application.builder().token(os.environ.get('TELEGRAM_BOT_TOKEN')).build()
+    bot.add_handler(CommandHandler("tictac", tictac_handler))
+    bot.add_handler(CommandHandler("naughty", naughty_handler))
+    bot.add_handler(CallbackQueryHandler(callback_handler))
+    bot.add_handler(MessageHandler(filters.PHOTO & filters.FORWARDED, get_id_handler))
+    for c in ["chammar", "gay", "roast", "aura", "brain", "monkey", "couple"]: bot.add_handler(CommandHandler(c, fun_dispatcher))
+    bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, core_msg_handler))
     await bot.initialize(); await bot.start(); await bot.updater.start_polling(drop_pending_updates=True)
     while True: await asyncio.sleep(3600)
 
