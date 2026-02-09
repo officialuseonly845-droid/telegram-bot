@@ -157,3 +157,33 @@ def main():
     app.run_polling()
 
 if __name__ == '__main__': main()
+
+# Is part ko code ke sabse niche check karo, indentation sahi honi chahiye
+def main():
+    # Token check
+    if not TOKEN:
+        print("Error: TELEGRAM_BOT_TOKEN set nahi hai!")
+        return
+
+    app = Application.builder().token(TOKEN).build()
+    
+    # Handlers
+    app.add_handler(CommandHandler("tictac", tictac_handler))
+    app.add_handler(CommandHandler("naughty", naughty_handler))
+    app.add_handler(CallbackQueryHandler(callback_handler))
+    
+    for c in ["gay", "roast", "chammar", "aura", "couple", "monkey", "brain"]:
+        app.add_handler(CommandHandler(c, fun_dispatcher))
+        
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, core_msg_handler))
+    app.add_handler(MessageHandler(filters.PHOTO & filters.FORWARDED, lambda u, c: u.message.reply_text(f"ID: `{u.message.photo[-1].file_id}`")))
+    
+    print("Beluga is starting...")
+    app.run_polling(drop_pending_updates=True)
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as e:
+        print(f"Bot crash ho gaya: {e}")
+
