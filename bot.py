@@ -222,8 +222,8 @@ def get_keyboard(gid, board):
 
 def check_winner(board):
     def sym(cell):
-        if cell == "🔴": return "O"  # Red with ⭕
-        if cell == "🟢": return "X"  # Green with ❌
+        if cell == "🔴": return "X"  # Red = X (❌)
+        if cell == "🟢": return "O"  # Green = O (⭕)
         return None
     
     for row in board:
@@ -356,6 +356,18 @@ async def tictac_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         game = tictac_games[gid]
         board = game["board"]
         uid = query.from_user.id
+        
+        # Check game timeout (5 minutes)
+        game_time = datetime.fromisoformat(game.get("created_at", datetime.now().isoformat()))
+        if datetime.now() - game_time > timedelta(minutes=5):
+            game["winner"] = "Timeout"
+            save_data()
+            await query.answer("⏰ Game timed out after 5 minutes of inactivity", show_alert=True)
+            await query.edit_message_text("⏰ <b>Game Timeout</b>\n\nThis game was inactive for too long.", parse_mode=ParseMode.HTML)
+            return
+        
+        # Update last activity time
+        game["created_at"] = datetime.now().isoformat()
         
         # Check if player is part of this game (for 2-player games)
         if not game["vs_bot"]:
@@ -501,22 +513,44 @@ async def core_msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         seen_users[chat_id][user_id] = {"n": html.escape(update.effective_user.first_name)}
         save_data()
         
-        # Check if message mentions bot name "beluga"
+        # Check spam cooldown
+        current_time = datetime.now()
+        last_response_time = ai_cooldown.get(user_id)
+        if last_response_time:
+            time_diff = (current_time - last_response_time).total_seconds()
+            if time_diff < AI_COOLDOWN_SECONDS:
+                return  # Silent cooldown, don't respond
+        
+        # Check if message mentions bot name "beluga" or is reply to bot
+        should_respond = False
+        user_message = ""
+        
         message_text = update.message.text.lower() if update.message.text else ""
-        if BOT_NAME in message_text:
-            # Extract the message after bot name
-            msg_after_name = update.message.text.split(BOT_NAME, 1)[1].strip() if BOT_NAME in message_text else ""
+        
+        # Check if replying to bot's message
+        if update.message.reply_to_message and update.message.reply_to_message.from_user.id == context.bot.id:
+            should_respond = True
+            user_message = update.message.text.strip() if update.message.text else ""
+        # Check if message contains "beluga"
+        elif BOT_NAME in message_text:
+            should_respond = True
+            # Extract message (everything in the text)
+            user_message = update.message.text.strip() if update.message.text else ""
+        
+        if should_respond and user_message:
+            # Update cooldown
+            ai_cooldown[user_id] = current_time
             
-            if msg_after_name:  # Only respond if there's actual content
-                thinking = await update.message.reply_text("🤔 Thinking...")
-                
-                sys = "You are Beluga, a helpful, witty, and slightly sarcastic AI assistant. Keep responses concise, fun, and engaging."
-                resp = await get_ai_response(msg_after_name, sys)
-                
-                if resp:
-                    await thinking.edit_text(f"🤖 <b>Beluga:</b>\n\n{html.escape(resp)}", parse_mode=ParseMode.HTML)
-                else:
-                    await thinking.delete()
+            thinking = await update.message.reply_text("🤔...")
+            
+            sys = "You are Beluga, a friendly, witty, and helpful AI assistant. Use emojis naturally. Keep responses concise (2-4 sentences) and casual."
+            resp = await get_ai_response(user_message, sys)
+            
+            if resp:
+                # Add emoji to response
+                await thinking.edit_text(f"💬 {html.escape(resp)}", parse_mode=ParseMode.HTML)
+            else:
+                await thinking.delete()
     except Exception as e:
         logger.error(f"Message handler error: {e}")
 
@@ -542,7 +576,6 @@ def main():
     
     app.add_handler(CommandHandler("kitty", kitty_command))
     app.add_handler(CommandHandler("tictac", tictac_command))
-    app.add_handler(CommandHandler("ai", ai_command))
     
     for c in ["gay", "roast", "chammar", "aura", "couple", "monkey", "brain"]:
         app.add_handler(CommandHandler(c, fun_dispatcher))
@@ -550,8 +583,10 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_query_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, core_msg_handler))
     
-    logger.info("🔥 Beluga Bot Online! Commands: /kitty /tictac /ai /gay /roast /chammar /aura /couple /monkey /brain")
-    logger.info("💬 AI responds when 'beluga' is mentioned in messages")
+    logger.info("🔥 Beluga Bot Online!")
+    logger.info("✨ Commands: /kitty /tictac /gay /roast /chammar /aura /couple /monkey /brain")
+    logger.info("💬 AI responds when 'beluga' is mentioned or when users reply to bot messages")
+    logger.info(f"⏱️  AI cooldown: {AI_COOLDOWN_SECONDS} seconds")
     
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
