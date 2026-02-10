@@ -1,5 +1,5 @@
 import os, logging, random, html, json, asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, CallbackQueryHandler, filters
 from telegram.constants import ParseMode
@@ -20,6 +20,7 @@ TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 PORT = int(os.getenv("PORT", 8080))
+BOT_NAME = "beluga"  # Bot's name for AI trigger
 
 # Initialize Groq
 groq_client = None
@@ -36,7 +37,7 @@ flask_app = Flask(__name__)
 @flask_app.route('/')
 @flask_app.route('/healthz')
 def health():
-    return Response("Fuck excuses, keep fucking going, learn from every fuck up, fuck the doubt in your fucking head, and build your fucking life in your own fucking way.", mimetype='text/plain')
+    return Response("Beluga Bot Online! 🐋", mimetype='text/plain')
 
 def run_flask():
     flask_app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
@@ -114,13 +115,26 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # --- Kitty Command ---
 KITTY_PHOTOS = [
     "https://i.postimg.cc/8kKLbdqh/IMG-20260209-195025-385.jpg",
-    "https://cataas.com/cat/cute",
-    "https://cataas.com/cat/says/Hello",
-    "https://placekitten.com/400/300",
-    "https://placekitten.com/500/400",
-    "https://cataas.com/cat/gif",
+    "https://i.postimg.cc/25cQZKnR/410e358034ac6b1204b7168eb79d8f72.jpg",
+    "https://i.postimg.cc/DzjrXMLt/71MShhna21L_UF1000_1000_QL80.jpg",
+    "https://i.postimg.cc/FKWyLB3w/girl_with_anime_her_head_777271_50263.jpg",
+    "https://i.postimg.cc/W4WGkHgH/images_(2).jpg",
+    "https://i.postimg.cc/LsCt1bL7/images_(3).jpg",
+    "https://i.postimg.cc/s26YhN5F/images_(4).jpg",
+    "https://i.postimg.cc/CKPGqQbp/images_(5).jpg",
+    "https://i.postimg.cc/Jh6Nk2ZY/IMG_20260209_110418_808.jpg",
+    "https://i.postimg.cc/pTmDYJJ1/kyu_nahi_ho_rahi_padhai_v0_im1xf6f2u6ae1.jpg",
 ]
 chat_kitty_index = {}
+
+async def delete_message_after_delay(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: int):
+    """Delete message after specified delay in seconds"""
+    await asyncio.sleep(delay)
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        logger.info(f"Deleted kitty message {message_id} in chat {chat_id}")
+    except Exception as e:
+        logger.error(f"Failed to delete message: {e}")
 
 async def kitty_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -132,12 +146,21 @@ async def kitty_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("Refresh 🔃 🍎", callback_data="kitty_refresh")
         ]]
         
-        await update.message.reply_photo(
+        sent_message = await update.message.reply_photo(
             photo=KITTY_PHOTOS[0],
             caption="🌸 Cute Kitty! 🐱✨",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
-        logger.info(f"✅ Kitty sent to chat {chat_id}")
+        
+        # Schedule deletion after 30 minutes (1800 seconds)
+        asyncio.create_task(delete_message_after_delay(
+            context, 
+            update.effective_chat.id, 
+            sent_message.message_id, 
+            1800
+        ))
+        
+        logger.info(f"✅ Kitty sent to chat {chat_id}, will auto-delete in 30 min")
     except Exception as e:
         logger.error(f"Kitty error: {e}", exc_info=True)
         await update.message.reply_text("❌ Kitty failed!")
@@ -170,23 +193,26 @@ async def kitty_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Kitty callback error: {e}")
 
-# --- TicTac Game ---
+# --- TicTac Game (Redesigned) ---
 def create_board():
     return [["⬜" for _ in range(3)] for _ in range(3)]
 
 def get_keyboard(gid, board):
+    """Create keyboard with larger buttons (using spaces for width)"""
     keyboard = []
     for i in range(3):
         row = []
         for j in range(3):
-            row.append(InlineKeyboardButton(board[i][j], callback_data=f"tictac_{gid}_{i}_{j}"))
+            # Make buttons wider with spaces
+            button_text = f"  {board[i][j]}  "
+            row.append(InlineKeyboardButton(button_text, callback_data=f"tictac_{gid}_{i}_{j}"))
         keyboard.append(row)
     return InlineKeyboardMarkup(keyboard)
 
 def check_winner(board):
     def sym(cell):
-        if cell == "🟥": return "X"
-        if cell == "🟩": return "O"
+        if cell == "🔴": return "O"  # Red with ⭕
+        if cell == "🟢": return "X"  # Green with ❌
         return None
     
     for row in board:
@@ -208,8 +234,8 @@ def check_winner(board):
 
 def bot_move(board):
     def sym(c):
-        if c == "🟥": return "X"
-        if c == "🟩": return "O"
+        if c == "🟢": return "X"
+        if c == "🔴": return "O"
         return None
     
     def check_line(pos):
@@ -246,6 +272,19 @@ def bot_move(board):
 
 async def tictac_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
+        # Check if user has active game (within 10 minutes)
+        user_id = update.effective_user.id
+        current_time = datetime.now()
+        
+        # Find if user has any active game
+        for gid, game in list(tictac_games.items()):
+            if game.get("player_x") == user_id or game.get("player_o") == user_id:
+                # Check if game is within 10 minutes
+                game_time = datetime.fromisoformat(game.get("created_at", "2000-01-01T00:00:00"))
+                if current_time - game_time < timedelta(minutes=10) and not game.get("winner"):
+                    await update.message.reply_text("⏳ You already have an active game! Finish it first or wait 10 minutes.")
+                    return
+        
         gid = f"{update.effective_chat.id}_{update.message.message_id}"
         
         if update.message.reply_to_message and not update.message.reply_to_message.from_user.is_bot:
@@ -254,18 +293,26 @@ async def tictac_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             vs_bot = False
         else:
             opp_id = None
-            opp_name = "🤖 Bot"
+            opp_name = "OLD MAN"
             vs_bot = True
         
         board = create_board()
         tictac_games[gid] = {
-            "board": board, "current_turn": "X", "player_x": update.effective_user.id,
-            "player_o": opp_id, "player_x_name": update.effective_user.first_name,
-            "player_o_name": opp_name, "vs_bot": vs_bot, "winner": None
+            "board": board,
+            "current_turn": "X",  # X = Green with ⭕, O = Red with ❌
+            "player_x": update.effective_user.id,
+            "player_o": opp_id,
+            "player_x_name": update.effective_user.first_name,
+            "player_o_name": opp_name,
+            "vs_bot": vs_bot,
+            "winner": None,
+            "created_at": current_time.isoformat()
         }
         save_data()
         
-        cap = f"🎮 <b>Tic-Tac-Toe!</b>\n\n🟥 <b>{html.escape(update.effective_user.first_name)}</b> (X)\n🟩 <b>{html.escape(opp_name)}</b> (O)\n\nTurn: 🟥 <b>X</b>"
+        # Updated message format: "Player1 ⭕ vs Player2 ❌"
+        cap = f"🍃 <b>{html.escape(update.effective_user.first_name)} ⭕ vs {html.escape(opp_name)} ❌</b> 🍃\n\n"
+        cap += f"<i>It's your turn to start! You're playing as ⭕</i>"
         
         await update.message.reply_text(cap, reply_markup=get_keyboard(gid, board), parse_mode=ParseMode.HTML)
         logger.info(f"✅ TicTac started: {gid}")
@@ -308,11 +355,12 @@ async def tictac_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("Not your turn!", show_alert=True)
             return
         
+        # X = Player 1 (Green ⭕), O = Player 2 (Red ❌)
         if game["current_turn"] == "X":
-            board[row][col] = "🟥"
+            board[row][col] = "🟢"  # Green circle for Player 1
             game["current_turn"] = "O"
         else:
-            board[row][col] = "🟩"
+            board[row][col] = "🔴"  # Red cross for Player 2
             game["current_turn"] = "X"
         
         winner = check_winner(board)
@@ -320,15 +368,20 @@ async def tictac_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if winner:
             game["winner"] = winner
             if winner == "Draw":
-                cap = f"🎮 <b>Game Over!</b>\n\n🟥 <b>{html.escape(game['player_x_name'])}</b> (X)\n🟩 <b>{html.escape(game['player_o_name'])}</b> (O)\n\n🤝 <b>Draw!</b>"
+                cap = f"🍃 <b>{html.escape(game['player_x_name'])} ⭕ vs {html.escape(game['player_o_name'])} ❌</b> 🍃\n\n"
+                cap += f"🤝 <b>It's a Draw!</b> 🤝"
             else:
+                # X wins = Player 1 (⭕), O wins = Player 2 (❌)
                 wname = game['player_x_name'] if winner == "X" else game['player_o_name']
-                wemoji = "🟥" if winner == "X" else "🟩"
-                cap = f"🎉🎊 <b>CONGRATULATIONS!</b> 🎊🎉\n\n{wemoji} <b>{html.escape(wname)}</b> ({winner}) WINS! 🏆✨\n\n🌟 Champion! 🌟"
+                wsym = "⭕" if winner == "X" else "❌"
+                cap = f"🎉🎊 <b>CONGRATULATIONS!</b> 🎊🎉\n\n"
+                cap += f"<b>{html.escape(wname)} {wsym} WINS!</b> 🏆✨\n\n"
+                cap += f"🌟 Absolute Champion! 🌟"
         else:
-            csym = "🟥 X" if game["current_turn"] == "X" else "🟩 O"
+            csym = "⭕" if game["current_turn"] == "X" else "❌"
             cname = game['player_x_name'] if game["current_turn"] == "X" else game['player_o_name']
-            cap = f"🎮 <b>Tic-Tac-Toe!</b>\n\n🟥 <b>{html.escape(game['player_x_name'])}</b> (X)\n🟩 <b>{html.escape(game['player_o_name'])}</b> (O)\n\nTurn: {csym} <b>{html.escape(cname)}</b>"
+            cap = f"🍃 <b>{html.escape(game['player_x_name'])} ⭕ vs {html.escape(game['player_o_name'])} ❌</b> 🍃\n\n"
+            cap += f"<i>Your turn again! Show me what you got! 🙌</i>"
         
         save_data()
         await query.edit_message_text(cap, reply_markup=get_keyboard(gid, board), parse_mode=ParseMode.HTML)
@@ -339,20 +392,24 @@ async def tictac_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bp = bot_move(board)
             if bp:
                 br, bc = bp
-                board[br][bc] = "🟩"
+                board[br][bc] = "🔴"  # Bot plays as ❌ (red)
                 game["current_turn"] = "X"
                 
                 winner = check_winner(board)
                 if winner:
                     game["winner"] = winner
                     if winner == "Draw":
-                        cap = f"🎮 <b>Game Over!</b>\n\n🟥 <b>{html.escape(game['player_x_name'])}</b> (X)\n🟩 <b>{html.escape(game['player_o_name'])}</b> (O)\n\n🤝 <b>Draw!</b>"
+                        cap = f"🍃 <b>{html.escape(game['player_x_name'])} ⭕ vs {html.escape(game['player_o_name'])} ❌</b> 🍃\n\n"
+                        cap += f"🤝 <b>It's a Draw!</b> 🤝"
                     else:
                         wname = game['player_x_name'] if winner == "X" else game['player_o_name']
-                        wemoji = "🟥" if winner == "X" else "🟩"
-                        cap = f"🎉🎊 <b>CONGRATULATIONS!</b> 🎊🎉\n\n{wemoji} <b>{html.escape(wname)}</b> ({winner}) WINS! 🏆✨\n\n🌟 Champion! 🌟"
+                        wsym = "⭕" if winner == "X" else "❌"
+                        cap = f"🎉🎊 <b>CONGRATULATIONS!</b> 🎊🎉\n\n"
+                        cap += f"<b>{html.escape(wname)} {wsym} WINS!</b> 🏆✨\n\n"
+                        cap += f"🌟 Absolute Champion! 🌟"
                 else:
-                    cap = f"🎮 <b>Tic-Tac-Toe!</b>\n\n🟥 <b>{html.escape(game['player_x_name'])}</b> (X)\n🟩 <b>{html.escape(game['player_o_name'])}</b> (O)\n\nTurn: 🟥 <b>X</b>"
+                    cap = f"🍃 <b>{html.escape(game['player_x_name'])} ⭕ vs {html.escape(game['player_o_name'])} ❌</b> 🍃\n\n"
+                    cap += f"<i>Your turn again! Show me what you got! 🙌</i>"
                 
                 save_data()
                 await query.edit_message_text(cap, reply_markup=get_keyboard(gid, board), parse_mode=ParseMode.HTML)
@@ -369,11 +426,11 @@ async def ai_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         thinking = await update.message.reply_text("🤔 Thinking...")
         
-        sys = "You are a helpful, witty AI assistant. Keep responses concise and fun."
+        sys = "You are Beluga, a helpful, witty AI assistant. Keep responses concise and fun."
         resp = await get_ai_response(msg, sys)
         
         if resp:
-            await thinking.edit_text(f"🤖 <b>AI:</b>\n\n{html.escape(resp)}", parse_mode=ParseMode.HTML)
+            await thinking.edit_text(f"🤖 <b>Beluga:</b>\n\n{html.escape(resp)}", parse_mode=ParseMode.HTML)
         else:
             await thinking.edit_text("❌ AI unavailable. Add GROQ_API_KEY or OPENROUTER_API_KEY.")
     except Exception as e:
@@ -421,16 +478,36 @@ async def fun_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Fun error: {e}")
         await update.message.reply_text("❌ Command failed!")
 
-# --- Message Handler ---
+# --- Message Handler (with AI name recognition) ---
 async def core_msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        if not update.effective_user or update.effective_user.is_bot: return
+        if not update.effective_user or update.effective_user.is_bot: 
+            return
+        
         chat_id, user_id = str(update.effective_chat.id), str(update.effective_user.id)
-        if chat_id not in seen_users: seen_users[chat_id] = {}
+        if chat_id not in seen_users: 
+            seen_users[chat_id] = {}
         seen_users[chat_id][user_id] = {"n": html.escape(update.effective_user.first_name)}
         save_data()
-    except:
-        pass
+        
+        # Check if message mentions bot name "beluga"
+        message_text = update.message.text.lower() if update.message.text else ""
+        if BOT_NAME in message_text:
+            # Extract the message after bot name
+            msg_after_name = update.message.text.split(BOT_NAME, 1)[1].strip() if BOT_NAME in message_text else ""
+            
+            if msg_after_name:  # Only respond if there's actual content
+                thinking = await update.message.reply_text("🤔 Thinking...")
+                
+                sys = "You are Beluga, a helpful, witty, and slightly sarcastic AI assistant. Keep responses concise, fun, and engaging."
+                resp = await get_ai_response(msg_after_name, sys)
+                
+                if resp:
+                    await thinking.edit_text(f"🤖 <b>Beluga:</b>\n\n{html.escape(resp)}", parse_mode=ParseMode.HTML)
+                else:
+                    await thinking.delete()
+    except Exception as e:
+        logger.error(f"Message handler error: {e}")
 
 # --- Callback Router ---
 async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -463,6 +540,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, core_msg_handler))
     
     logger.info("🔥 Beluga Bot Online! Commands: /kitty /tictac /ai /gay /roast /chammar /aura /couple /monkey /brain")
+    logger.info("💬 AI responds when 'beluga' is mentioned in messages")
     
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
