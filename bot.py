@@ -21,6 +21,11 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 PORT = int(os.getenv("PORT", 8080))
 BOT_NAME = "beluga"  # Bot's name for AI trigger
+BOT_USERNAME = None  # Will be set on startup
+
+# AI Spam cooldown (user_id -> last_response_time)
+ai_cooldown = {}
+AI_COOLDOWN_SECONDS = 10
 
 # Initialize Groq
 groq_client = None
@@ -142,8 +147,8 @@ async def kitty_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_kitty_index[chat_id] = 0
         
         keyboard = [[
-            InlineKeyboardButton("Next ➡️ 🌸", callback_data="kitty_next"),
-            InlineKeyboardButton("Refresh 🔃 🍎", callback_data="kitty_refresh")
+            InlineKeyboardButton("💗 Next ➡️", callback_data="kitty_next"),
+            InlineKeyboardButton("❤️ Refresh 🔃", callback_data="kitty_refresh")
         ]]
         
         sent_message = await update.message.reply_photo(
@@ -182,8 +187,8 @@ async def kitty_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption = "🔃 Refreshed! 🍎✨"
         
         keyboard = [[
-            InlineKeyboardButton("Next ➡️ 🌸", callback_data="kitty_next"),
-            InlineKeyboardButton("Refresh 🔃 🍎", callback_data="kitty_refresh")
+            InlineKeyboardButton("💗 Next ➡️", callback_data="kitty_next"),
+            InlineKeyboardButton("❤️ Refresh 🔃", callback_data="kitty_refresh")
         ]]
         
         await query.edit_message_media(
@@ -198,13 +203,19 @@ def create_board():
     return [["⬜" for _ in range(3)] for _ in range(3)]
 
 def get_keyboard(gid, board):
-    """Create keyboard with larger buttons (using spaces for width)"""
+    """Create keyboard with BIG buttons for better visibility"""
     keyboard = []
     for i in range(3):
         row = []
         for j in range(3):
-            # Make buttons wider with spaces
-            button_text = f"  {board[i][j]}  "
+            # Make buttons MUCH wider - large square appearance
+            cell = board[i][j]
+            if cell == "⬜":
+                button_text = "           ⬜           "  # Empty cell - large white square
+            elif cell == "🔴":
+                button_text = "           ❌           "  # Red X
+            else:  # 🟢
+                button_text = "           ⭕           "  # Green O
             row.append(InlineKeyboardButton(button_text, callback_data=f"tictac_{gid}_{i}_{j}"))
         keyboard.append(row)
     return InlineKeyboardMarkup(keyboard)
@@ -310,9 +321,16 @@ async def tictac_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         save_data()
         
-        # Updated message format: "Player1 ⭕ vs Player2 ❌"
-        cap = f"🍃 <b>{html.escape(update.effective_user.first_name)} ⭕ vs {html.escape(opp_name)} ❌</b> 🍃\n\n"
-        cap += f"<i>It's your turn to start! You're playing as ⭕</i>"
+        # New format: "🎮 Tic Tac Toe Started" with player names
+        if vs_bot:
+            cap = f"🎮 <b>Tic Tac Toe Started</b>\n\n"
+            cap += f"<b>Player 1:</b> {html.escape(update.effective_user.first_name)} ❌\n"
+            cap += f"<b>Player 2:</b> Beluga 🤖 ⭕\n\n"
+            cap += f"<i>Turn: ❌ {html.escape(update.effective_user.first_name)}</i>"
+        else:
+            cap = f"🎮 <b>Tic Tac Toe</b>\n\n"
+            cap += f"<b>{html.escape(update.effective_user.first_name)} ❌</b> vs <b>{html.escape(opp_name)} ⭕</b>\n\n"
+            cap += f"<i>Turn: ❌ {html.escape(update.effective_user.first_name)}</i>"
         
         await update.message.reply_text(cap, reply_markup=get_keyboard(gid, board), parse_mode=ParseMode.HTML)
         logger.info(f"✅ TicTac started: {gid}")
@@ -337,6 +355,13 @@ async def tictac_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         game = tictac_games[gid]
         board = game["board"]
+        uid = query.from_user.id
+        
+        # Check if player is part of this game (for 2-player games)
+        if not game["vs_bot"]:
+            if uid != game["player_x"] and uid != game["player_o"]:
+                await query.answer("🔒 You are not part of this game.", show_alert=True)
+                return
         
         if game["winner"]:
             await query.answer("Game finished!", show_alert=True)
@@ -355,12 +380,12 @@ async def tictac_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("Not your turn!", show_alert=True)
             return
         
-        # X = Player 1 (Green ⭕), O = Player 2 (Red ❌)
+        # X = Player 1 (❌ Red), O = Player 2 (⭕ Green)
         if game["current_turn"] == "X":
-            board[row][col] = "🟢"  # Green circle for Player 1
+            board[row][col] = "🔴"  # Red for X (❌)
             game["current_turn"] = "O"
         else:
-            board[row][col] = "🔴"  # Red cross for Player 2
+            board[row][col] = "🟢"  # Green for O (⭕)
             game["current_turn"] = "X"
         
         winner = check_winner(board)
@@ -368,20 +393,26 @@ async def tictac_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if winner:
             game["winner"] = winner
             if winner == "Draw":
-                cap = f"🍃 <b>{html.escape(game['player_x_name'])} ⭕ vs {html.escape(game['player_o_name'])} ❌</b> 🍃\n\n"
+                cap = f"🎮 <b>Game Over!</b>\n\n"
                 cap += f"🤝 <b>It's a Draw!</b> 🤝"
             else:
-                # X wins = Player 1 (⭕), O wins = Player 2 (❌)
+                # X wins = ❌, O wins = ⭕
                 wname = game['player_x_name'] if winner == "X" else game['player_o_name']
-                wsym = "⭕" if winner == "X" else "❌"
-                cap = f"🎉🎊 <b>CONGRATULATIONS!</b> 🎊🎉\n\n"
-                cap += f"<b>{html.escape(wname)} {wsym} WINS!</b> 🏆✨\n\n"
-                cap += f"🌟 Absolute Champion! 🌟"
+                wsym = "❌" if winner == "X" else "⭕"
+                cap = f"🎉 <b>GAME OVER!</b> 🎉\n\n"
+                cap += f"<b>Winner: {html.escape(wname)} {wsym}</b> 🏆\n\n"
+                cap += f"🌟 Congratulations! 🌟"
         else:
-            csym = "⭕" if game["current_turn"] == "X" else "❌"
+            # Show current turn
+            csym = "❌" if game["current_turn"] == "X" else "⭕"
             cname = game['player_x_name'] if game["current_turn"] == "X" else game['player_o_name']
-            cap = f"🍃 <b>{html.escape(game['player_x_name'])} ⭕ vs {html.escape(game['player_o_name'])} ❌</b> 🍃\n\n"
-            cap += f"<i>Your turn again! Show me what you got! 🙌</i>"
+            if game["vs_bot"]:
+                cap = f"🎮 <b>Tic Tac Toe</b>\n\n"
+                cap += f"<b>{html.escape(game['player_x_name'])} ❌</b> vs <b>Beluga 🤖 ⭕</b>\n\n"
+            else:
+                cap = f"🎮 <b>Tic Tac Toe</b>\n\n"
+                cap += f"<b>{html.escape(game['player_x_name'])} ❌</b> vs <b>{html.escape(game['player_o_name'])} ⭕</b>\n\n"
+            cap += f"<i>Turn: {csym} {html.escape(cname)}</i>"
         
         save_data()
         await query.edit_message_text(cap, reply_markup=get_keyboard(gid, board), parse_mode=ParseMode.HTML)
@@ -392,50 +423,30 @@ async def tictac_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bp = bot_move(board)
             if bp:
                 br, bc = bp
-                board[br][bc] = "🔴"  # Bot plays as ❌ (red)
+                board[br][bc] = "🟢"  # Bot plays as ⭕ (green)
                 game["current_turn"] = "X"
                 
                 winner = check_winner(board)
                 if winner:
                     game["winner"] = winner
                     if winner == "Draw":
-                        cap = f"🍃 <b>{html.escape(game['player_x_name'])} ⭕ vs {html.escape(game['player_o_name'])} ❌</b> 🍃\n\n"
+                        cap = f"🎮 <b>Game Over!</b>\n\n"
                         cap += f"🤝 <b>It's a Draw!</b> 🤝"
                     else:
                         wname = game['player_x_name'] if winner == "X" else game['player_o_name']
-                        wsym = "⭕" if winner == "X" else "❌"
-                        cap = f"🎉🎊 <b>CONGRATULATIONS!</b> 🎊🎉\n\n"
-                        cap += f"<b>{html.escape(wname)} {wsym} WINS!</b> 🏆✨\n\n"
-                        cap += f"🌟 Absolute Champion! 🌟"
+                        wsym = "❌" if winner == "X" else "⭕"
+                        cap = f"🎉 <b>GAME OVER!</b> 🎉\n\n"
+                        cap += f"<b>Winner: {html.escape(wname)} {wsym}</b> 🏆\n\n"
+                        cap += f"🌟 Congratulations! 🌟"
                 else:
-                    cap = f"🍃 <b>{html.escape(game['player_x_name'])} ⭕ vs {html.escape(game['player_o_name'])} ❌</b> 🍃\n\n"
-                    cap += f"<i>Your turn again! Show me what you got! 🙌</i>"
+                    cap = f"🎮 <b>Tic Tac Toe</b>\n\n"
+                    cap += f"<b>{html.escape(game['player_x_name'])} ❌</b> vs <b>Beluga 🤖 ⭕</b>\n\n"
+                    cap += f"<i>Turn: ❌ {html.escape(game['player_x_name'])}</i>"
                 
                 save_data()
                 await query.edit_message_text(cap, reply_markup=get_keyboard(gid, board), parse_mode=ParseMode.HTML)
     except Exception as e:
         logger.error(f"TicTac callback error: {e}", exc_info=True)
-
-# --- AI Command ---
-async def ai_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        msg = update.message.text.replace('/ai', '').strip()
-        if not msg:
-            await update.message.reply_text("🤖 Usage: /ai <question>\n\nExample: /ai Tell me a joke")
-            return
-        
-        thinking = await update.message.reply_text("🤔 Thinking...")
-        
-        sys = "You are Beluga, a helpful, witty AI assistant. Keep responses concise and fun."
-        resp = await get_ai_response(msg, sys)
-        
-        if resp:
-            await thinking.edit_text(f"🤖 <b>Beluga:</b>\n\n{html.escape(resp)}", parse_mode=ParseMode.HTML)
-        else:
-            await thinking.edit_text("❌ AI unavailable. Add GROQ_API_KEY or OPENROUTER_API_KEY.")
-    except Exception as e:
-        logger.error(f"AI error: {e}")
-        await update.message.reply_text("❌ AI failed!")
 
 # --- Fun Commands ---
 async def fun_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
