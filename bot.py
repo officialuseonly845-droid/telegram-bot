@@ -20,7 +20,8 @@ TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 PORT = int(os.getenv("PORT", 8080))
-BOT_NAME = "beluga"  # Bot's name for AI trigger
+BOT_NAME = "miko"  # Bot's name for AI trigger (case-insensitive)
+BOT_DISPLAY_NAME = "MIKO"  # Display name in messages
 BOT_USERNAME = None  # Will be set on startup
 
 # AI Spam cooldown (user_id -> last_response_time)
@@ -42,7 +43,7 @@ flask_app = Flask(__name__)
 @flask_app.route('/')
 @flask_app.route('/healthz')
 def health():
-    return Response("Beluga Bot Online! 🐋", mimetype='text/plain')
+    return Response("MIKO Bot Online! 🤖", mimetype='text/plain')
 
 def run_flask():
     flask_app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
@@ -304,7 +305,7 @@ async def tictac_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             vs_bot = False
         else:
             opp_id = None
-            opp_name = "OLD MAN"
+            opp_name = BOT_DISPLAY_NAME  # Use "MIKO" as opponent name
             vs_bot = True
         
         board = create_board()
@@ -324,8 +325,7 @@ async def tictac_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # New format: "🎮 Tic Tac Toe Started" with player names
         if vs_bot:
             cap = f"🎮 <b>Tic Tac Toe Started</b>\n\n"
-            cap += f"<b>Player 1:</b> {html.escape(update.effective_user.first_name)} ❌\n"
-            cap += f"<b>Player 2:</b> Beluga 🤖 ⭕\n\n"
+            cap += f"<b>{html.escape(update.effective_user.first_name)} ❌</b> vs <b>{BOT_DISPLAY_NAME} ⭕</b>\n\n"
             cap += f"<i>Turn: ❌ {html.escape(update.effective_user.first_name)}</i>"
         else:
             cap = f"🎮 <b>Tic Tac Toe</b>\n\n"
@@ -420,7 +420,7 @@ async def tictac_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cname = game['player_x_name'] if game["current_turn"] == "X" else game['player_o_name']
             if game["vs_bot"]:
                 cap = f"🎮 <b>Tic Tac Toe</b>\n\n"
-                cap += f"<b>{html.escape(game['player_x_name'])} ❌</b> vs <b>Beluga 🤖 ⭕</b>\n\n"
+                cap += f"<b>{html.escape(game['player_x_name'])} ❌</b> vs <b>{BOT_DISPLAY_NAME} ⭕</b>\n\n"
             else:
                 cap = f"🎮 <b>Tic Tac Toe</b>\n\n"
                 cap += f"<b>{html.escape(game['player_x_name'])} ❌</b> vs <b>{html.escape(game['player_o_name'])} ⭕</b>\n\n"
@@ -452,7 +452,7 @@ async def tictac_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         cap += f"🌟 Congratulations! 🌟"
                 else:
                     cap = f"🎮 <b>Tic Tac Toe</b>\n\n"
-                    cap += f"<b>{html.escape(game['player_x_name'])} ❌</b> vs <b>Beluga 🤖 ⭕</b>\n\n"
+                    cap += f"<b>{html.escape(game['player_x_name'])} ❌</b> vs <b>{BOT_DISPLAY_NAME} ⭕</b>\n\n"
                     cap += f"<i>Turn: ❌ {html.escape(game['player_x_name'])}</i>"
                 
                 save_data()
@@ -521,7 +521,7 @@ async def core_msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if time_diff < AI_COOLDOWN_SECONDS:
                 return  # Silent cooldown, don't respond
         
-        # Check if message mentions bot name "beluga" or is reply to bot
+        # Check if message mentions bot name "MIKO" or is reply to bot
         should_respond = False
         user_message = ""
         
@@ -531,7 +531,7 @@ async def core_msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.message.reply_to_message and update.message.reply_to_message.from_user.id == context.bot.id:
             should_respond = True
             user_message = update.message.text.strip() if update.message.text else ""
-        # Check if message contains "beluga"
+        # Check if message contains "miko" (case-insensitive)
         elif BOT_NAME in message_text:
             should_respond = True
             # Extract message (everything in the text)
@@ -543,7 +543,7 @@ async def core_msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             thinking = await update.message.reply_text("🤔...")
             
-            sys = "You are Beluga, a friendly, witty, and helpful AI assistant. Use emojis naturally. Keep responses concise (2-4 sentences) and casual."
+            sys = f"You are {BOT_DISPLAY_NAME}, a friendly, witty, and helpful AI assistant. Use emojis naturally. Keep responses concise (2-4 sentences) and casual."
             resp = await get_ai_response(user_message, sys)
             
             if resp:
@@ -569,7 +569,7 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
 
 # --- Main ---
 def main():
-    logger.info("🚀 Starting Beluga Bot...")
+    logger.info("🚀 Starting MIKO Bot...")
     
     app = Application.builder().token(TOKEN).build()
     app.add_error_handler(error_handler)
@@ -583,9 +583,9 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_query_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, core_msg_handler))
     
-    logger.info("🔥 Beluga Bot Online!")
+    logger.info("🔥 MIKO Bot Online!")
     logger.info("✨ Commands: /kitty /tictac /gay /roast /chammar /aura /couple /monkey /brain")
-    logger.info("💬 AI responds when 'beluga' is mentioned or when users reply to bot messages")
+    logger.info("💬 AI responds when 'MIKO' is mentioned or when users reply to bot messages")
     logger.info(f"⏱️  AI cooldown: {AI_COOLDOWN_SECONDS} seconds")
     
     app.run_polling(allowed_updates=Update.ALL_TYPES)
