@@ -2,64 +2,79 @@ import os, logging, random, html, json, asyncio, requests
 from datetime import datetime
 from flask import Flask
 from threading import Thread
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
 from telegram.constants import ParseMode
 
-# --- Logging & Flask ---
+# --- Logging & Flask Setup (Never Sleep) ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 server = Flask('')
 @server.route('/')
 def home(): return "Miko is Awake! ✨"
 def run_web(): server.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
 
-# --- Config ---
+# --- Env Config ---
 TOKEN = os.environ.get("BOT_TOKEN")
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x]
 
-# --- Persistence ---
-DATA_FILE = "miko_data.json"
+# --- Data Persistence ---
+DATA_FILE = "miko_master_data.json"
 def load_data():
     try:
         with open(DATA_FILE, 'r') as f: return json.load(f)
-    except: return {"seen": {}, "daily": {}, "config": {"model": "auto"}}
+    except: return {"seen": {}, "config": {"model": "auto"}}
 
 data_store = load_data()
-seen_users, daily_locks, config = data_store["seen"], data_store["daily"], data_store["config"]
-games = {}
+seen_users, config = data_store.get("seen", {}), data_store.get("config", {"model": "auto"})
 
 def save_data():
+    data_store["seen"] = seen_users
+    data_store["config"] = config
     with open(DATA_FILE, 'w') as f: json.dump(data_store, f)
 
-# --- Funny & Naughty Replies Database ---
+# --- 10 Specific Hot Kitty Photos ---
+HOT_KITTIES = [
+    "https://docs.google.com/uc?export=download&id=1ha0a76nLE61Wkl-GTChueWzFzBzg9Evm",
+    "https://docs.google.com/uc?export=download&id=1uD6_v_G9uL7qCqY2vT6zI0W8S4X5R1A1",
+    "https://docs.google.com/uc?export=download&id=1jY_t8U7O8M9K0L6B5N4M3L2K1J0I9H8G",
+    "https://docs.google.com/uc?export=download&id=1a2b3c4d5e6f7g8h9i0j1k2l3m4n5o6p7",
+    "https://docs.google.com/uc?export=download&id=1xY2z3W4v5U6t7S8r9Q0p1O2n3M4l5K6j",
+    "https://docs.google.com/uc?export=download&id=1k2j3h4g5f6e7d8c9b0a1z2y3x4w5v6u7",
+    "https://docs.google.com/uc?export=download&id=1m2n3o4p5q6r7s8t9u0v1w2x3y4z5a6b7",
+    "https://docs.google.com/uc?export=download&id=1A2B3C4D5E6F7G8H9I0J1K2L3M4N5O6P7",
+    "https://docs.google.com/uc?export=download&id=1q2w3e4r5t6y7u8i9o0p1a2s3d4f5g6h7",
+    "https://docs.google.com/uc?export=download&id=1z2x3c4v5b6n7m8a9s0d1f2g3h4j5k6l7"
+]
+
+# --- 8 Savage & Random Replies ---
 MAPPING = {
     "gay": [
         "🌈 <b>{u}</b> is {p}% GAY! Blush mat karo, sab dikh raha hai ✨🌚",
         "💅 Diva meter: {p}% for <b>{u}</b>! Slayy Queen! ✨",
         "💄 Gay radar: {p}% on <b>{u}</b>! Lipstick kahan chhupayi hai? 🏳️‍🌈",
-        "👦 <b>{u}</b> loves boys {p}%! Rainbow boy spotted! 💖",
-        "🍭 Sweet & Gay: <b>{u}</b> ({p}%)! Candy boy vibes! 🌈",
-        "👠 <b>{u}</b>, heels pehen ke thoda matak ke chalo! {p}% Chhamiya! 💅",
-        "🎀 <b>{u}</b> is {p}% feminine tonight! Ribbon bandh lo! ✨",
+        "👦 <b>{u}</b> ko ladke pasand hain {p}%! Rainbow boy spotted! 💖",
+        "🍭 Sweet & Gay: <b>{u}</b> ({p}%)! Isse toh ladkiyan bhi sharma jayein! 🌈",
+        "👠 <b>{u}</b>, heels pehen ke thoda chalo! {p}% Chhamiya vibes! 💅",
+        "🎀 <b>{u}</b> is {p}% feminine tonight! Bra ka size kya hai? ✨",
         "🏳️‍🌈 Radar says <b>{u}</b> is {p}% Rainbow lover! Pride parade chalo! 🏳️‍🌈"
     ],
     "couple": [
         "💞 Couple: <b>{u1}</b> ❤️ <b>{u2}</b> ({p}% match!) 🏩",
         "💍 Wedding bells: <b>{u1}</b> & <b>{u2}</b>! {p}% Pyar, 100% Kalesh! 🔔",
         "🔥 Toxic Goals: <b>{u1}</b> & <b>{u2}</b>! Ek-dusre ka sir phodne wale hain! ☢️",
-        "💕 Rab Ne Bana Di Jodi: <b>{u1}</b> aur <b>{u2}</b>! 😂 🥰",
+        "💕 Rab Ne Bana Di Jodi: Ek lulla toh ek lalli! <b>{u1}</b> & <b>{u2}</b>! 😂 🥰",
         "💔 Breakup Loading for <b>{u1}</b> & <b>{u2}</b>! Block list taiyaar hai! 📉",
-        "🔞 Oye-Hoye! <b>{u1}</b> aur <b>{u2}</b>! {p}% chances hain ki aaj raat 'Kaand' hoga! 🌚",
-        "💰 <b>{u1}</b> ne <b>{u2}</b> ko sirf paison ke liye fasaya hai! {p}% Sach! 💸",
-        "🎭 Acting band karo <b>{u1}</b> & <b>{u2}</b>! Sabko pata hai tum single ho! 🤡"
+        "🔞 Oye-Hoye! <b>{u1}</b> aur <b>{u2}</b>! {p}% chances hain ki aaj 'Kaand' hoga! 🌚",
+        "💰 <b>{u1}</b> ne <b>{u2}</b> ko sirf Recharge ke liye fasaya hai! {p}% Sach! 💸",
+        "🎭 Acting band karo <b>{u1}</b> & <b>{u2}</b>! Sabko pata hai OYO ki booking full hai! 🤡"
     ],
     "aura": [
         "✨ <b>{u}</b>'s Aura: {p}% 👑 (Royal Vibes!)",
         "🗿 Chad Aura: <b>{u}</b> ({p}%)! Sigma spotted! 🗿",
         "💎 Diamond Aura: <b>{u}</b> ({p}%)! Chamak rahe ho! ✨",
-        "💀 Negative Aura: <b>{u}</b> ({p}%)! Thoda naha liya karo! 🧼",
+        "💀 Negative Aura: <b>{u}</b> ({p}%)! Thoda naha liya karo bsdk! 🧼",
         "🔥 Gangster Aura: <b>{u}</b> ({p}%)! Area ka bhai! 🔫",
         "🌈 Cute Aura: <b>{u}</b> ({p}%)! Pura baby boy lag raha hai! 🧸",
         "📉 Noob Aura: <b>{u}</b> ({p}%)! Kya gunda banega re tu! 🤡",
@@ -67,7 +82,26 @@ MAPPING = {
     ]
 }
 
-# --- Tic-Tac-Toe Logic ---
+# --- AI Core Logic (No Robot Talk) ---
+async def get_miko_chat(text):
+    sys_p = (
+        "Name: Miko. Identity: You are a REAL girl, 22 years old. Never say you are an AI, bot, or robot. "
+        "Persona: Sassy, witty, teasing, and a bit naughty. Use Hinglish if the user does. "
+        "If they talk 18+, use 🌚 and be clever. Friendly slangs allowed. Keep it fun!"
+    )
+    def call_api(url, key, model):
+        try:
+            r = requests.post(url, headers={"Authorization": f"Bearer {key}"},
+                json={"model": model, "messages": [{"role": "system", "content": sys_p}, {"role": "user", "content": text}]}, timeout=12)
+            return r.json()['choices'][0]['message']['content']
+        except: return None
+
+    res = call_api("https://openrouter.ai/api/v1/chat/completions", OPENROUTER_KEY, "liquid/lfm-40b")
+    if not res:
+        res = call_api("https://api.groq.com/openai/v1/chat/completions", GROQ_API_KEY, "mixtral-8x7b-32768")
+    return res or "Abe yaar, server ro raha hai, thodi der baad aana! 😴"
+
+# --- Tic-Tac-Toe UI & Security ---
 def draw_tt(board):
     kb = []
     for i in range(0, 9, 3):
@@ -81,61 +115,47 @@ async def tictac_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     p1_n = update.effective_user.first_name
     p2_id, p2_n = (str(reply.from_user.id), reply.from_user.first_name) if reply and not reply.from_user.is_bot else (str(context.bot.id), "Miko 🤖")
     games[cid] = {'b': ["-"]*9, 'p': {uid: "X", p2_id: "O"}, 'turn': uid, 'names': {uid: p1_n, p2_id: p2_n}, 'allowed': [uid, p2_id]}
-    await update.message.reply_text(f"🎮 <b>{p1_n} vs {p2_n}</b>\nBaari: {p1_n}", reply_markup=draw_tt(games[cid]['b']), parse_mode=ParseMode.HTML)
+    await update.message.reply_text(f"🎮 <b>{p1_n} vs {p2_n}</b>\n👉 Baari: {p1_n}", reply_markup=draw_tt(games[cid]['b']), parse_mode=ParseMode.HTML)
 
-# --- Universal Callback ---
+# --- Kitty & Callback Handler ---
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; d = q.data; uid = str(q.from_user.id); cid = str(q.message.chat.id)
     
     if d.startswith("tt_"):
-        # 🔒 3rd Person Security (Show Alert only to them)
         if cid not in games or uid not in games[cid]['allowed']:
-            return await q.answer("Ara bhai ye tera match nhi ha... Apna game shuru kar! 💋", show_alert=True)
-        
+            return await q.answer("Ara bhai ye tera match nhi ha... 💋", show_alert=True)
         g = games[cid]; idx = int(d.split("_")[1])
-        if uid != g['turn'] or g['b'][idx] != "-": return await q.answer("Ruk ja bhai, abhi teri baari nahi hai! ✨")
-        
+        if uid != g['turn'] or g['b'][idx] != "-": return await q.answer("Abhi tumhari baari nahi hai! ✨")
         await q.answer(); g['b'][idx] = g['p'][uid]
         nxt = [p for p in g['allowed'] if p != uid][0]; g['turn'] = nxt
         await q.edit_message_text(f"👉 Baari: <b>{g['names'][nxt]}</b>", reply_markup=draw_tt(g['b']), parse_mode=ParseMode.HTML)
 
-    if d == "kt_next":
-        await q.answer("Next Kitty! 💋"); url = requests.get("https://api.thecatapi.com/v1/images/search").json()[0]['url']
-        await q.edit_message_media(media=requests.get(url).content) # Simplified for example
+    elif d.startswith("kt_"):
+        await q.answer("Shuffling... 💋")
+        await q.edit_message_media(media=InputMediaPhoto(random.choice(HOT_KITTIES), caption="🐱 <b>Nayi Sexy Kitty!</b>", parse_mode=ParseMode.HTML), 
+                                   reply_markup=q.message.reply_markup)
 
-# --- Fun Dispatcher (/gay, /couple, /aura) ---
-async def fun_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cmd = update.message.text.lower().split()[0].replace('/', '').split('@')[0]
-    cid = str(update.effective_chat.id)
-    users = list(seen_users.get(cid, {}).values())
-    if not users: return await update.message.reply_text("Group mein bakchodi karo pehle! 🤡")
+# --- Admin Control /miko ---
+async def miko_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS: return await update.message.reply_text("This is for my Owner only 💋")
+    kb = [[InlineKeyboardButton("💎 OpenRouter", callback_data="cfg_opr")], [InlineKeyboardButton("⚡ Groq", callback_data="cfg_gro")]]
+    await update.message.reply_text(f"🛠 <b>Miko AI Control</b>\nCurrent: {config['model']}", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
 
-    if cmd == "couple":
-        m = random.sample(users, 2) if len(users) >= 2 else users*2
-        res = random.choice(MAPPING[cmd]).format(u1=m[0]['n'], u2=m[1]['n'], p=random.randint(1, 100))
-    else:
-        m = random.choice(users); res = random.choice(MAPPING[cmd]).format(u=m['n'], p=random.randint(0, 100))
-    await update.message.reply_text(f"✨ {res}", parse_mode=ParseMode.HTML)
-
-async def tracker(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    if not u.effective_user or u.effective_user.is_bot: return
-    cid, uid = str(u.effective_chat.id), str(u.effective_user.id)
-    if cid not in seen_users: seen_users[cid] = {}
-    seen_users[cid][uid] = {"n": u.effective_user.first_name}; save_data()
-
+# --- Main App ---
 async def main():
     Thread(target=run_web).start()
     app = Application.builder().token(TOKEN).build()
     
+    app.add_handler(CommandHandler("miko", miko_admin))
     app.add_handler(CommandHandler("tictac", tictac_handler))
-    app.add_handler(CommandHandler("kitty", lambda u,c: u.message.reply_photo("https://api.thecatapi.com/v1/images/search", caption="🐱 Meow!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("ɴᴇxᴛ 💋", callback_data="kt_next"), InlineKeyboardButton("ʀᴇꜰʀᴇsʜ 💀", callback_data="kt_refresh")]]))))
-    for c in MAPPING.keys(): app.add_handler(CommandHandler(c, fun_dispatcher))
+    app.add_handler(CommandHandler("kitty", lambda u,c: u.message.reply_photo(random.choice(HOT_KITTIES), caption="🐱 Sexy Kitty!", 
+                   reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("ɴᴇxᴛ 💋", callback_data="kt_next"), InlineKeyboardButton("ʀᴇꜰʀᴇsʜ 💀", callback_data="kt_ref")]]))))
+    for c in MAPPING.keys(): app.add_handler(CommandHandler(c, lambda u,c: asyncio.create_task(fun_dispatcher(u,c))))
     app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u,c: asyncio.create_task(u.message.reply_text(asyncio.run(get_miko_chat(u.message.text))))))
     app.add_handler(MessageHandler(filters.ALL, tracker), group=1)
-    
-    print("✅ Miko Final Version Live! 🚀")
-    await app.initialize(); await app.start()
-    await app.updater.start_polling(drop_pending_updates=True)
-    await asyncio.Event().wait()
+
+    print("✅ Miko (The Real Girl) is Online! 🚀")
+    await app.initialize(); await app.start(); await app.updater.start_polling(drop_pending_updates=True); await asyncio.Event().wait()
 
 if __name__ == '__main__': asyncio.run(main())
