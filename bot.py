@@ -6,7 +6,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMe
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
 from telegram.constants import ParseMode
 
-# --- Logging & Flask Setup (Never Sleep) ---
+# --- Logging & Flask Setup (For UptimeRobot) ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 server = Flask('')
 @server.route('/')
@@ -27,14 +27,16 @@ def load_data():
     except: return {"seen": {}, "config": {"model": "auto"}}
 
 data_store = load_data()
-seen_users, config = data_store.get("seen", {}), data_store.get("config", {"model": "auto"})
+seen_users = data_store.get("seen", {})
+config = data_store.get("config", {"model": "auto"})
+games = {}
 
 def save_data():
     data_store["seen"] = seen_users
     data_store["config"] = config
     with open(DATA_FILE, 'w') as f: json.dump(data_store, f)
 
-# --- 10 Specific Hot Kitty Photos ---
+# --- Specific 10 Hot Kitty Photos (Tere Select Kiye Huye) ---
 HOT_KITTIES = [
     "https://docs.google.com/uc?export=download&id=1ha0a76nLE61Wkl-GTChueWzFzBzg9Evm",
     "https://docs.google.com/uc?export=download&id=1uD6_v_G9uL7qCqY2vT6zI0W8S4X5R1A1",
@@ -48,7 +50,7 @@ HOT_KITTIES = [
     "https://docs.google.com/uc?export=download&id=1z2x3c4v5b6n7m8a9s0d1f2g3h4j5k6l7"
 ]
 
-# --- 8 Savage & Random Replies ---
+# --- 8 Savage Random Replies for Fun Commands ---
 MAPPING = {
     "gay": [
         "🌈 <b>{u}</b> is {p}% GAY! Blush mat karo, sab dikh raha hai ✨🌚",
@@ -56,8 +58,8 @@ MAPPING = {
         "💄 Gay radar: {p}% on <b>{u}</b>! Lipstick kahan chhupayi hai? 🏳️‍🌈",
         "👦 <b>{u}</b> ko ladke pasand hain {p}%! Rainbow boy spotted! 💖",
         "🍭 Sweet & Gay: <b>{u}</b> ({p}%)! Isse toh ladkiyan bhi sharma jayein! 🌈",
-        "👠 <b>{u}</b>, heels pehen ke thoda chalo! {p}% Chhamiya vibes! 💅",
-        "🎀 <b>{u}</b> is {p}% feminine tonight! Bra ka size kya hai? ✨",
+        "👠 <b>{u}</b>, heels pehen ke thoda matak ke chalo! {p}% Chhamiya! 💅",
+        "🎀 <b>{u}</b> is {p}% feminine tonight! Ribbon bandh lo! ✨",
         "🏳️‍🌈 Radar says <b>{u}</b> is {p}% Rainbow lover! Pride parade chalo! 🏳️‍🌈"
     ],
     "couple": [
@@ -82,12 +84,12 @@ MAPPING = {
     ]
 }
 
-# --- AI Core Logic (No Robot Talk) ---
+# --- AI Core Logic (The Real Girl Identity) ---
 async def get_miko_chat(text):
     sys_p = (
-        "Name: Miko. Identity: You are a REAL girl, 22 years old. Never say you are an AI, bot, or robot. "
-        "Persona: Sassy, witty, teasing, and a bit naughty. Use Hinglish if the user does. "
-        "If they talk 18+, use 🌚 and be clever. Friendly slangs allowed. Keep it fun!"
+        "Name: Miko. Identity: You are a REAL girl, 22 years old. Never say you are an AI or robot. "
+        "Persona: Sassy, witty, teasing, and naughty. Use Hinglish if the user does. "
+        "On 18+ talks, use 🌚 and be funny/clever. Keep it short and keep teasing."
     )
     def call_api(url, key, model):
         try:
@@ -99,9 +101,9 @@ async def get_miko_chat(text):
     res = call_api("https://openrouter.ai/api/v1/chat/completions", OPENROUTER_KEY, "liquid/lfm-40b")
     if not res:
         res = call_api("https://api.groq.com/openai/v1/chat/completions", GROQ_API_KEY, "mixtral-8x7b-32768")
-    return res or "Abe yaar, server ro raha hai, thodi der baad aana! 😴"
+    return res or "Abe yaar, dimaag mat khao, dono server down hain! 😴"
 
-# --- Tic-Tac-Toe UI & Security ---
+# --- Handlers: Tic-Tac-Toe & Kitty ---
 def draw_tt(board):
     kb = []
     for i in range(0, 9, 3):
@@ -117,7 +119,7 @@ async def tictac_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     games[cid] = {'b': ["-"]*9, 'p': {uid: "X", p2_id: "O"}, 'turn': uid, 'names': {uid: p1_n, p2_id: p2_n}, 'allowed': [uid, p2_id]}
     await update.message.reply_text(f"🎮 <b>{p1_n} vs {p2_n}</b>\n👉 Baari: {p1_n}", reply_markup=draw_tt(games[cid]['b']), parse_mode=ParseMode.HTML)
 
-# --- Kitty & Callback Handler ---
+# --- Universal Callback (Security + Kitty) ---
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; d = q.data; uid = str(q.from_user.id); cid = str(q.message.chat.id)
     
@@ -125,7 +127,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if cid not in games or uid not in games[cid]['allowed']:
             return await q.answer("Ara bhai ye tera match nhi ha... 💋", show_alert=True)
         g = games[cid]; idx = int(d.split("_")[1])
-        if uid != g['turn'] or g['b'][idx] != "-": return await q.answer("Abhi tumhari baari nahi hai! ✨")
+        if uid != g['turn'] or g['b'][idx] != "-": return await q.answer("Baari ka wait karo! ✨")
         await q.answer(); g['b'][idx] = g['p'][uid]
         nxt = [p for p in g['allowed'] if p != uid][0]; g['turn'] = nxt
         await q.edit_message_text(f"👉 Baari: <b>{g['names'][nxt]}</b>", reply_markup=draw_tt(g['b']), parse_mode=ParseMode.HTML)
@@ -135,27 +137,53 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_media(media=InputMediaPhoto(random.choice(HOT_KITTIES), caption="🐱 <b>Nayi Sexy Kitty!</b>", parse_mode=ParseMode.HTML), 
                                    reply_markup=q.message.reply_markup)
 
-# --- Admin Control /miko ---
-async def miko_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS: return await update.message.reply_text("This is for my Owner only 💋")
-    kb = [[InlineKeyboardButton("💎 OpenRouter", callback_data="cfg_opr")], [InlineKeyboardButton("⚡ Groq", callback_data="cfg_gro")]]
-    await update.message.reply_text(f"🛠 <b>Miko AI Control</b>\nCurrent: {config['model']}", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+# --- Fun Command Dispatcher ---
+async def fun_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cmd = update.message.text.lower().split()[0].replace('/', '').split('@')[0]
+    cid = str(update.effective_chat.id)
+    users = list(seen_users.get(cid, {}).values())
+    if not users: return await update.message.reply_text("Pehle thodi baatein karo! 🤡")
+    if cmd == "couple":
+        m = random.sample(users, 2) if len(users) >= 2 else users*2
+        res = random.choice(MAPPING[cmd]).format(u1=m[0]['n'], u2=m[1]['n'], p=random.randint(1, 100))
+    else:
+        m = random.choice(users); res = random.choice(MAPPING[cmd]).format(u=m['n'], p=random.randint(0, 100))
+    await update.message.reply_text(f"✨ {res}", parse_mode=ParseMode.HTML)
 
-# --- Main App ---
+# --- Smart AI Reply Logic ---
+async def auto_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text: return
+    text = update.message.text.lower()
+    bot_id = context.bot.id
+    
+    is_miko_named = "miko" in text
+    is_reply_to_miko = update.message.reply_to_message and update.message.reply_to_message.from_user.id == bot_id
+    
+    if is_miko_named or is_reply_to_miko:
+        res = await get_miko_chat(update.message.text)
+        await update.message.reply_text(res)
+
+async def tracker(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not u.effective_user or u.effective_user.is_bot: return
+    cid, uid = str(u.effective_chat.id), str(u.effective_user.id)
+    if cid not in seen_users: seen_users[cid] = {}
+    seen_users[cid][uid] = {"n": u.effective_user.first_name}; save_data()
+
+# --- Main Bot ---
 async def main():
     Thread(target=run_web).start()
     app = Application.builder().token(TOKEN).build()
     
-    app.add_handler(CommandHandler("miko", miko_admin))
     app.add_handler(CommandHandler("tictac", tictac_handler))
     app.add_handler(CommandHandler("kitty", lambda u,c: u.message.reply_photo(random.choice(HOT_KITTIES), caption="🐱 Sexy Kitty!", 
                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("ɴᴇxᴛ 💋", callback_data="kt_next"), InlineKeyboardButton("ʀᴇꜰʀᴇsʜ 💀", callback_data="kt_ref")]]))))
-    for c in MAPPING.keys(): app.add_handler(CommandHandler(c, lambda u,c: asyncio.create_task(fun_dispatcher(u,c))))
+    for c in MAPPING.keys(): app.add_handler(CommandHandler(c, fun_dispatcher))
+    
     app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u,c: asyncio.create_task(u.message.reply_text(asyncio.run(get_miko_chat(u.message.text))))))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, auto_reply))
     app.add_handler(MessageHandler(filters.ALL, tracker), group=1)
 
-    print("✅ Miko (The Real Girl) is Online! 🚀")
+    print("✅ Miko Final Master Version Live! 🚀")
     await app.initialize(); await app.start(); await app.updater.start_polling(drop_pending_updates=True); await asyncio.Event().wait()
 
 if __name__ == '__main__': asyncio.run(main())
