@@ -289,12 +289,10 @@ Do not include any markdown formatting like ```json or extra text outside the ra
     await status_msg.delete()
     
     try:
-        if "
-```json" in response:
+        if "```json" in response:
             response = response.split("```json")[1].split("```")[0].strip()
         elif "```" in response:
-            response = response.split("
-```")[1].split("```")[0].strip()
+            response = response.split("```")[1].split("```")[0].strip()
         
         data = json.loads(response.strip())
         await c.bot.send_poll(
@@ -370,8 +368,7 @@ async def start_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         "╔══════════════════════════════════════╗\n"
         "                🤖 BELUGA AI            \n"
         "╚══════════════════════════════════════╝\n"
-        "
-```\n"
+        "```\n"
         "💬 *Intelligent Telegram Chat Bot*\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "⚡ **Features:**\n"
