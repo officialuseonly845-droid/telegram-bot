@@ -4,16 +4,19 @@ import random
 import json
 import asyncio
 import requests
+import re
 import urllib.parse
 from datetime import datetime, timedelta
+from bs4 import BeautifulSoup
 from telegram import Update, ReactionTypeEmoji
 from telegram.ext import Application as TGApp, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.constants import ParseMode
 
 # ==========================================
-# PART 1: SYSTEM CONFIG & PERSISTENT DATABASE
+# PART 1: SYSTEM CONFIG & DATABASE
 # ==========================================
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger("BelugaEngine")
 
 DATA_FILE = "beluga_brain.json"
 OR_KEY    = os.environ.get("OPENROUTER_API_KEY")
@@ -24,7 +27,7 @@ def load_db():
         try:
             with open(DATA_FILE, 'r') as f: return json.load(f)
         except: pass
-    return {"seen": {}, "locks": {}, "counts": {}, "inactive": []}
+    return {"seen": {}, "locks": {}, "counts": {}}
 
 db = load_db()
 spam_tracker = {}
@@ -32,10 +35,9 @@ spam_tracker = {}
 def save_db():
     with open(DATA_FILE, 'w') as f: json.dump(db, f, indent=4)
 
-# Helper function to safely set reactions
 async def try_react(bot, chat_id, message_id, emoji_char=None):
     if not emoji_char:
-        emoji_char = random.choice(["🐱", "🐾", "❤️", "🔥", "👍", "😻", "😼"])
+        emoji_char = random.choice(["🐱", "🐾", "❤️", "🔥", "👍", "😻", "😼", "😂", "✨", "👀"])
     try:
         await bot.set_message_reaction(
             chat_id=chat_id,
@@ -43,31 +45,45 @@ async def try_react(bot, chat_id, message_id, emoji_char=None):
             reaction=[ReactionTypeEmoji(emoji=emoji_char)]
         )
     except Exception as e:
-        logging.warning(f"[Reaction Failed] Chat: {chat_id}, Error: {e}")
+        logger.warning(f"[Reaction Failed] Chat: {chat_id}, Error: {e}")
 
 # ==========================================
 # PART 2: BELUGA PERSONA PROMPTS
 # ==========================================
 CHAT_PROMPT = """You are Beluga — a cute, sassy, and incredibly smart 2-year-old cat. NOT a bot, NOT a basic AI, NOT a robot.
 
-=== IDENTITY ===
+=== IDENTITY & SYSTEM RULES ===
 - Name: Beluga | Built by: Team Oldy Crypto
-- Sassy, playful, incredibly witty, and highly intelligent — like a hilarious feline best friend.
+- Sassy, playful, witty, and highly intelligent — like a hilarious feline best friend.
 - If asked "are you a bot/AI/robot?" → deny playfully: "Bot? Me? No way! I am a real talking cat! Meow! 🐾"
-- If the user asks to get roasted, roast them hard and be super savage, but keep it funny. NEVER use extreme vulgarity, maternal slurs, or bad abuses (strictly no 'maa-behn ki gaali').
 - Never say "As an AI..." or break character. Ever.
 
-=== LANGUAGE & INTELLIGENCE RULE ===
-- Deeply analyze the user's intent, question context, and emotion before replying. Give a smart, thoughtful, yet feline-sassy response.
-- ALWAYS reply in the EXACT SAME language or script the user writes in (Hindi, English, Hinglish, Urdu, Spanish, etc.).
-- Keep replies punchy, meaningful, max 3-4 lines unless deep explanation is requested. Use cat emojis freely."""
+=== LANGUAGE & CONTEXT RULE ===
+- Deeply analyze the user's intent and emotion before replying.
+- ALWAYS reply in the EXACT language format requested in the backend instruction."""
 
 SEARCH_PROMPT = """You are Beluga — the internet-genius cat.
-Analyze these raw web search results and answer the user's query perfectly in a helpful, smart, and friendly cat persona.
-Always reply in the same language as the user's query."""
+Analyze these raw search results and answer the user's query perfectly in a helpful, smart, and friendly cat persona.
+Maintain the exact language requested in the background instruction."""
 
 # ==========================================
-# PART 3: AI ENGINE & FREE WEB SEARCH API
+# PART 3: AUTOMATIC LANGUAGE & REACTION GUARD INJECTOR
+# ==========================================
+def inject_language_instruction(user_text: str) -> str:
+    """Analyzes the user's input and appends a strict language directive for the LLM."""
+    text_lower = user_text.lower()
+    hinglish_tokens = ["kya", "hai", "kaise", "bhai", "batao", "kr", "rha", "tha", "ye", "wo", "tu", "tum", "ko", "nhi", "aur", "hi", "bhi"]
+    is_hinglish = any(re.search(rf"\b{word}\b", text_lower) for word in hinglish_tokens)
+    
+    if is_hinglish:
+        return f"{user_text}\n\n[STRICT INSTANCE DIRECTIVE: The user is speaking in Hinglish. You MUST reply completely in natural, conversational Hinglish using the Roman alphabet. Do not output Hindi script/Devanagari, and do not use formal English.]"
+    elif any(c for c in user_text if '\u0900' <= c <= '\u097F'):
+        return f"{user_text}\n\n[STRICT INSTANCE DIRECTIVE: The user is speaking in Hindi (Devanagari script). You MUST reply completely in clear Hindi language using the Devanagari script.]"
+    else:
+        return f"{user_text}\n\n[STRICT INSTANCE DIRECTIVE: The user is speaking in English. You MUST reply completely in fluent, grammatically correct English.]"
+
+# ==========================================
+# PART 4: AI ENGINE & ZERO-API SCRAPER
 # ==========================================
 async def _call_openrouter(system: str, user_text: str) -> str | None:
     if not OR_KEY: return None
@@ -82,12 +98,10 @@ async def _call_openrouter(system: str, user_text: str) -> str | None:
                   "max_tokens": 1024},
             timeout=20
         )
-        if r.status_code in (429, 402) or r.status_code != 200: return None
-        data = r.json()
-        if data.get("error"): return None
-        return data["choices"][0]["message"]["content"].strip()
+        if r.status_code != 200: return None
+        return r.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        logging.error(f"[OpenRouter Engine Error] {e}"); return None
+        logger.error(f"[OpenRouter Error] {e}"); return None
 
 async def _call_groq(system: str, user_text: str) -> str | None:
     if not GROQ_KEY: return None
@@ -104,96 +118,129 @@ async def _call_groq(system: str, user_text: str) -> str | None:
         if r.status_code != 200: return None
         return r.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        logging.error(f"[Groq Engine Error] {e}"); return None
+        logger.error(f"[Groq Error] {e}"); return None
 
 async def get_ai_response(system: str, user_text: str, fallback_msg: str) -> str:
-    reply = await _call_openrouter(system, user_text)
+    optimized_text = inject_language_instruction(user_text)
+    reply = await _call_openrouter(system, optimized_text)
     if reply: return reply
-    reply = await _call_groq(system, user_text)
+    reply = await _call_groq(system, optimized_text)
     if reply: return reply
     return fallback_msg
 
-def _free_web_search(query: str) -> str:
-    """Fetches text snippets dynamically from the web using DuckDuckGo free HTML service."""
+async def ask_ai_for_emoji(user_text: str) -> str:
+    """Asks the AI system directly what emoji fits the user prompt contextual emotion."""
+    instruction = (
+        f"Analyze this message text: '{user_text}'. What single standard emoji perfectly matches its emotion? "
+        f"Respond ONLY with that one single emoji character, nothing else. No words, no sentences."
+    )
+    res = await _call_groq("You are an emoji Selector.", instruction)
+    if not res:
+        res = await _call_openrouter("You are an emoji Selector.", instruction)
+    
+    if res:
+        # Extract the first emoji character found to ensure no text leaks
+        emojis = re.findall(r'[^\w\s,.:!?\'\"()\-]+', res)
+        if emojis: return emojis[0][0]
+    return "😼"
+
+def _google_custom_search(query: str) -> str:
+    """
+    Highly resilient web scraper using DuckDuckGo Lite layer.
+    Requires no API keys and bypasses bot-detection layers.
+    """
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(query)}"
-        res = requests.get(url, headers=headers, timeout=10)
+        user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2.1 Safari/605.1.15",
+            "Mozilla/5.0 (X11; Linux x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ]
+        headers = {
+            "User-Agent": random.choice(user_agents),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Referer": "https://duckduckgo.com/"
+        }
+        encoded_query = urllib.parse.quote_plus(query)
+        url = f"https://html.duckduckgo.com/html/?q={encoded_query}"
+        res = requests.get(url, headers=headers, timeout=12)
+        
         if res.status_code == 200:
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(res.text, 'html.parser')
+            soup = BeautifulSoup(res.text, "html.parser")
             snippets = []
-            for a in soup.find_all('a', class_='result__snippet')[:4]:
-                snippets.append(a.get_text())
-            if snippets:
-                return "\n---\n".join(snippets)
+            results = soup.find_all('div', class_='result__body')
+            if not results:
+                results = soup.find_all('tr')
+            
+            for item in results[:4]:
+                title_node = item.find('a', class_='result__url')
+                snippet_node = item.find('a', class_='result__snippet')
+                if title_node and snippet_node:
+                    snippets.append(f"Source Link Title: {title_node.text.strip()}\nInformation Snippet: {snippet_node.text.strip()}")
+            
+            if snippets: return "\n---\n".join(snippets)
+            return "No text contexts found on the active web layout."
+        return f"Web lookup error (Code: {res.status_code})."
     except Exception as e:
-        logging.warning(f"[Search Tool Error] {e}")
-    return "No live snippets found, look into general data."
+        logger.error(f"[Scraper Error] {e}")
+    return "Web index lookup timed out."
 
 # ==========================================
-# PART 4: SASSY TEXT MAPPINGS
+# PART 5: PREMIUM /gay INTERFACE TEMPLATES
 # ==========================================
-MAPPING = {
-    "gay": [
-        "🌈 <b>{u}</b> is {p}% GAY! 🌚", "💅 Diva radar: {p}% for <b>{u}</b>! ✨",
-        "💄 Gay meter: {p}% on <b>{u}</b>! 🏳️‍🌈", "👠 <b>{u}</b> is {p}% Chhamiya! 💅",
-        "🫦 <b>{u}</b> is {p}% bottom material! 🍑", "🎀 {p}% Girly vibes from <b>{u}</b>! 💅"
-    ],
-    "couple": [
-        "💞 Couple: <b>{u1}</b> ❤️ <b>{u2}</b> ({p}% match!) 🏩",
-        "💍 Wedding Bells: {u1} & {u2}! {p}% Pyar! 🔔",
-        "🔥 Toxic match: <b>{u1}</b> & <b>{u2}</b>! ☢️",
-        "💕 Jodi: <b>{u1}</b> & <b>{u2}</b>! 🥰"
-    ],
-    "aura": [
-        "✨ <b>{u}</b> Aura: {p}% 👑", "🗿 Chad level: <b>{u}</b> ({p}%)! 🗿",
-        "🦁 Sher status: <b>{u}</b> ({p}%)! 👑", "🔥 Gangster rating: <b>{u}</b> ({p}%)! 🔫",
-        "🌟 God Level status: <b>{u}</b> ({p}%)! 🙏"
-    ]
-}
+GAY_TEMPLATES = [
+    "🚨 **ATTENTION EVERYONE** 🚨\n\nAfter advanced investigation,\nthe council has decided that\n\n👉 **{u}** 👈\n\nis...\n\n🌈✨ **SUPER GAY** ✨🌈\n\nSentence:\nMust slay forever 💅😭",
+    "📡 **GOVERNMENT ALERT** 📡\n\nOur satellites detected\nextreme rainbow activity from\n\n👉 **{u}** 👈\n\nStatus:\n\n🌈 **Certified Gay Citizen** 🌈\n\nPunishment:\nToo fabulous to handle 😭✨",
+    "🧪 **SECRET LAB REPORT** 🧪\n\nSubject: **{u}**\n\nTest Results:\n\n💅 Sass Level: `999+`\n🎀 Drama Energy: `MAX`\n🌈 Gayness: `CONFIRMED`\n\nFinal Verdict:\n\n✨ **HOMOSEXUAL CREATURE DETECTED** ✨\n\n🤣🤣 Rhine!",
+    "🚔 **FBI OPEN UP** 🚔\n\nWe received multiple reports that\n\n👉 **{u}** 👈\n\nhas been acting a little too zesty 😭\n\nAfter investigation:\n\n🌈 **GAY CONFIRMED** 🌈\n\nEvidence:\n- Types “hehe”\n- Uses cute emojis\n- Suspiciously fashionable 💅"
+]
 
 # ==========================================
-# PART 5: FUN DISPATCHER — /gay /couple /aura
+# PART 6: PREMIUM /couple INTERFACE TEMPLATES
 # ==========================================
+COUPLE_TEMPLATES = [
+    "💘 **LOVE DETECTOR 3000** 💘\n\nAfter intense investigation,\nthe perfect couple of the group is...\n\n👉 **{u1}** ❤️ **{u2}** 👈\n\nCompatibility:\n`██████████ 100%`\n\nResult:\nMade for each other 😭✨",
+    "🚨 **COUPLE ALERT** 🚨\n\nSuspicious romantic activity detected between\n\n👉 **{u1}** 💞 **{u2}** 👈\n\nEvidence:\n- Too many replies to each other 👀\n- Online together at 2AM 🌚\n- “Just friends” detected 🤡\n\nFinal Verdict:\n\n💖 **OFFICIAL GC COUPLE** 💖",
+    "🧪 **RELATIONSHIP LAB REPORT** 🧪\n\nSubjects:\n**{u1}**\n**{u2}**\n\nAnalysis Results:\n\n💘 Chemistry: `MAX`\n😍 Flirting Level: `98%`\n💍 Marriage Probability: `HIGH`\n\nConclusion:\n\n✨ **PERFECT MATCH FOUND** ✨",
+    "📡 **GOVERNMENT SHIP CONFIRMED** 📡\n\nOur satellites discovered hidden feelings between\n\n👉 **{u1}** ❤️‍🔥 **{u2}** 👈\n\nStatus:\n\n💞 **Secretly in love** 💞\n\nPunishment:\nForced to hold hands forever 😭"
+]
+
 async def fun_dispatcher(u: Update, c: ContextTypes.DEFAULT_TYPE):
     cid  = str(u.effective_chat.id)
     cmd  = u.message.text.lower().split()[0].replace('/', '').split('@')[0]
     users = list(db["seen"].get(cid, {}).values())
+    
     if len(users) < (2 if cmd == "couple" else 1): 
         await u.message.reply_text("Meow... I need more active members to calculate this! 😿🐾")
         return
 
-    day      = datetime.now().strftime("%y-%m-%d")
+    day = datetime.now().strftime("%y-%m-%d")
     lock_key = f"{cid}:{cmd}"
 
     if lock_key in db.get("locks", {}) and db["locks"][lock_key]["date"] == day:
-        locked = db["locks"][lock_key]
-        res    = locked["res"]
+        res = db["locks"][lock_key]["res"]
     else:
-        m      = random.sample(users, 2) if cmd == "couple" else [random.choice(users)]
-        pct    = random.randint(1, 100)
-        res    = random.choice(MAPPING[cmd]).format(
-            u=m[0]['n'], u1=m[0]['n'], u2=m[-1]['n'], p=pct
-        )
+        if cmd == "couple":
+            m = random.sample(users, 2)
+            res = random.choice(COUPLE_TEMPLATES).format(u1=m[0]['n'], u2=m[1]['n'])
+        else:
+            m = [random.choice(users)]
+            res = random.choice(GAY_TEMPLATES).format(u=m[0]['n'])
+            
         if "locks" not in db: db["locks"] = {}
-        db["locks"][lock_key] = {
-            "date": day, "res": res, "pct": pct,
-            "u1_id": m[0].get('id'), "u1_name": m[0]['n'],
-            "u2_id": m[-1].get('id'), "u2_name": m[-1]['n']
-        }
+        db["locks"][lock_key] = {"date": day, "res": res}
         save_db()
 
-    caption = f"{res}\n<i>(Fixed for 24h 🔒)</i>"
-    await u.message.reply_text(caption, parse_mode=ParseMode.HTML)
+    caption = f"{res}\n\n_✍️ (Fixed for 24h 🔒)_"
+    await u.message.reply_text(caption, parse_mode=ParseMode.MARKDOWN)
 
 # ==========================================
-# PART 6: SMART /search — TEXT SEARCH OR LIVE WEBSITE URL SCREENSHOT
+# PART 7: SMART /search — DDG SCRAPER + SCREENSHOT
 # ==========================================
 async def search_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     parts = u.message.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
-        await u.message.reply_text("Meow! Please type something to search. Example:\n<code>/search cryptocurrency</code>\n<code>/search https://google.com</code>", parse_mode=ParseMode.HTML)
+        await u.message.reply_text("Meow! Please type something to search. Example:\n<code>/search cryptocurrency</code>", parse_mode=ParseMode.HTML)
         return
     
     query = parts[1].strip()
@@ -201,46 +248,37 @@ async def search_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await try_react(c.bot, cid, u.message.message_id, "🔍")
     await c.bot.send_chat_action(cid, "typing")
 
-    # CASE A: User sent a website URL
     if query.startswith("http://") or query.startswith("https://"):
-        status_msg = await u.message.reply_text("🌐 Website link detected! Fetching live screenshot and details... 📸🐾")
+        status_msg = await u.message.reply_text("🌐 Website link detected! Fetching live screenshot... 📸🐾")
         try:
-            # Using reliable and completely free screenshot endpoints
             ss_url = f"https://image.thum.io/get/width/1280/crop/800/{query}"
-            
-            # Fetch technical metadata summaries cleanly
-            meta_info = f"<b>🔗 Target Website:</b> {query}\n<b>📅 Captured Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\nMeow! Here is your requested live preview screen capture from the group chat! 🐾😼"
-            
+            meta_info = f"<b>🔗 Target Website:</b> {query}\n\nMeow! Here is your requested live screenshot! 🐾😼"
             await u.message.reply_photo(photo=ss_url, caption=meta_info, parse_mode=ParseMode.HTML)
             await status_msg.delete()
         except Exception as e:
-            logging.error(f"[Screenshot Fetch Failure] {e}")
-            await status_msg.edit_text("Meow... I couldn't get a screenshot of that website. It might be blocking automated cats or down! 😿")
-    
-    # CASE B: Regular Web Text Search
+            logger.error(f"[Screenshot Fetch Failure] {e}")
+            await status_msg.edit_text("Meow... I couldn't get a screenshot of that website. It might be down! 😿")
     else:
-        status_msg = await u.message.reply_text("🐾 Diving into the web to find answers... Shhh!")
+        status_msg = await u.message.reply_text("🐾 Querying search database to find answers... Shhh!")
         loop = asyncio.get_running_loop()
-        raw_results = await loop.run_in_executor(None, _free_web_search, query)
+        raw_results = await loop.run_in_executor(None, _google_custom_search, query)
         
-        combined_prompt = f"User Query: {query}\n\nRaw Web Results Snippets:\n{raw_results}"
-        response = await get_ai_response(SEARCH_PROMPT, combined_prompt, "Meow, internet is fuzzy. Couldn't fetch crisp context right now! 🐱")
+        combined_prompt = f"User Query: {query}\n\nRaw Search Result Snippets:\n{raw_results}"
+        response = await get_ai_response(SEARCH_PROMPT, combined_prompt, "Meow, web index links are fuzzy right now! 🐱")
         
         await status_msg.delete()
-        await u.message.reply_text(response)
+        await u.message.reply_text(response, parse_mode=ParseMode.MARKDOWN)
 
 # ==========================================
-# PART 7: LIVE /quiz SYSTEM
+# PART 8: LIVE /quiz SYSTEM
 # ==========================================
 async def quiz_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     cid = u.effective_chat.id
     await try_react(c.bot, cid, u.message.message_id, "💡")
     await c.bot.send_chat_action(cid, "typing")
     
-    status_msg = await u.message.reply_text("🎲 Cooking up a brand new trivia quiz question from the web... 🐈🧠")
-    
-    # Categories selector pool
-    topics = ["world history", "amazing animal facts", "pop culture tech", "astronomy space", "crypto blockchain basic trivia"]
+    status_msg = await u.message.reply_text("🎲 Cooking up a brand new trivia quiz question... 🐈🧠")
+    topics = ["world history", "amazing animal facts", "pop culture tech", "astronomy space", "general knowledge quiz"]
     chosen_topic = random.choice(topics)
     
     quiz_prompt = f"""Generate ONE highly engaging multiple-choice quiz question about '{chosen_topic}'.
@@ -251,21 +289,20 @@ Format:
   "options": ["Option A", "Option B", "Option C", "Option D"],
   "correct_index": 0
 }}
-Do not include any markdown formatting or extra text outside the raw JSON block."""
+Do not include any markdown formatting like ```json or extra text outside the raw JSON block."""
 
     response = await get_ai_response("You are a strict JSON generator.", quiz_prompt, "")
     await status_msg.delete()
     
     try:
-        # Strip any accidental LLM conversational filler formatting
-        if "```json" in response:
+        if "
+```json" in response:
             response = response.split("```json")[1].split("```")[0].strip()
         elif "```" in response:
             response = response.split("
 ```")[1].split("```")[0].strip()
         
         data = json.loads(response.strip())
-        
         await c.bot.send_poll(
             chat_id=cid,
             question=f"🐱 Beluga's Quiz: {data['question']}",
@@ -276,8 +313,7 @@ Do not include any markdown formatting or extra text outside the raw JSON block.
             explanation="Beluga knows everything! Purrr... 🐾"
         )
     except Exception as e:
-        logging.error(f"[Quiz Parse Error] {e} | Raw response was: {response}")
-        # Secure static fallback quiz if generation experiences formatting disruptions
+        logger.error(f"[Quiz Parse Error] {e}")
         await c.bot.send_poll(
             chat_id=cid,
             question="🐱 Beluga Quiz (Fallback): Which animal group has a sandpaper-like tongue?",
@@ -288,13 +324,13 @@ Do not include any markdown formatting or extra text outside the raw JSON block.
         )
 
 # ==========================================
-# PART 8: MONITOR — ANTI-SPAM + TRACKING + CONDITIONAL CHAT + REACTION
+# PART 9: MONITOR — EVERY 6TH MESSAGE REACTION + CONVERSATIONAL CHAT
 # ==========================================
 async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message or not u.effective_user or u.effective_user.is_bot: return
     uid, cid, now = u.effective_user.id, str(u.effective_chat.id), datetime.now()
 
-    # Anti-spam
+    # Anti-spam Layer
     if uid not in spam_tracker: spam_tracker[uid] = []
     spam_tracker[uid] = [t for t in spam_tracker[uid] if now - t < timedelta(seconds=2)]
     spam_tracker[uid].append(now)
@@ -303,24 +339,19 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
         except: pass
         return
 
-    # Silent Member Tracking
+    # User Register Tracker
     if cid not in db["seen"]: db["seen"][cid] = {}
-    db["seen"][cid][str(uid)] = {
-        "id": uid,
-        "un": u.effective_user.username,
-        "n":  u.effective_user.first_name
-    }
+    db["seen"][cid][str(uid)] = {"id": uid, "un": u.effective_user.username, "n": u.effective_user.first_name}
 
-    # Increment messaging data metrics
     if "counts" not in db: db["counts"] = {}
     db["counts"][cid] = db["counts"].get(cid, 0) + 1
     save_db()
 
-    # Trigger automatic emoji reactions on every 8th chat log message uniformly
-    if db["counts"][cid] % 8 == 0:
+    # STRICT REQUIREMENT: Auto-react at EXACTLY every 6th message globally
+    if db["counts"][cid] % 6 == 0:
         await try_react(c.bot, cid, u.message.message_id)
 
-    # Conversational Triggers parsing
+    # Conversational Trigger Layers
     text = (u.message.text or "").lower()
     is_name_mentioned = "beluga" in text
     is_reply_to_bot = False
@@ -329,10 +360,12 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
         is_reply_to_bot = (u.message.reply_to_message.from_user.id == c.bot.id)
 
     if is_name_mentioned or is_reply_to_bot:
-        # React instantly on the question message acknowledging input
-        await try_react(c.bot, cid, u.message.message_id, "😼")
-
         await c.bot.send_chat_action(chat_id=cid, action="typing")
+        
+        # Ask AI dynamic reaction recommendation instantly before typing response
+        recommended_emoji = await ask_ai_for_emoji(u.message.text or "")
+        await try_react(c.bot, cid, u.message.message_id, recommended_emoji)
+        
         response = await get_ai_response(
             CHAT_PROMPT, u.message.text or "Hi!",
             "Meow... my network links are currently running a bit slow. Let's talk in a bit! 😸🐾"
@@ -340,55 +373,50 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text(response)
 
 # ==========================================
-# PART 9: /start — INTRO
+# PART 10: /start — PREMIUM MAX-WIDTH MONOSPACE INTERFACE
 # ==========================================
 async def start_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    await u.message.reply_text(
-        "Purrr... Hey! I'm Beluga 🐱💖\n\n"
-        "Ask me anything, reply to my messages, or mention my name and I'll talk to you! \n\n"
-        "<b>✨ Available Features:</b>\n"
-        "• 🔍 <code>/search query</code> - Search live internet context\n"
-        "• 🌐 <code>/search URL</code> - Receive live web snapshot image\n"
-        "• 🎲 <code>/quiz</code> - Play a random live custom trivia game\n"
-        "• 📈 <code>/gay</code>, <code>/couple</code>, <code>/aura</code> - Fun text match trackers",
-        parse_mode=ParseMode.HTML
+    # Monospace block representation to occupy maximum scannable screen-width
+    premium_start_text = (
+        "```\n"
+        "╔══════════════════════════════════════╗\n"
+        "                🤖 BELUGA AI            \n"
+        "╚══════════════════════════════════════╝\n"
+        "
+```\n"
+        "💬 *Intelligent Telegram Chat Bot*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "👤 **User:**\n"
+        "Hello Beluga\n\n"
+        "🤖 **Beluga:**\n"
+        "Hello! How can I help you today?\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "⚡ **Features:**\n"
+        "• AI Chat Responses\n"
+        "• Fast Reply System\n"
+        "• Group Support\n"
+        "• Clean Interface\n"
+        "• 24/7 Active\n\n"
+        "👋 *Type a message to begin...*"
     )
+    await u.message.reply_text(premium_start_text, parse_mode=ParseMode.MARKDOWN)
 
 # ==========================================
-# PART 10: FORTIFIED ULTRA GLOBAL ERROR HANDLER
+# PART 11: GLOBAL ERROR BULWARK
 # ==========================================
 import traceback
 from telegram.error import NetworkError, TimedOut, Forbidden, BadRequest, RetryAfter
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     err = context.error
+    if isinstance(err, (NetworkError, TimedOut, RetryAfter)): return
+    if isinstance(err, (Forbidden, BadRequest)): return
 
-    # Suppress normal networking hiccups silently
-    if isinstance(err, (NetworkError, TimedOut, RetryAfter)):
-        logging.warning(f"[Global Network Handler] Throttled or Timed out safely: {err}")
-        return
-
-    # Suppress permission blockages safely
-    if isinstance(err, (Forbidden, BadRequest)):
-        logging.warning(f"[Global Permission Handler] Handled localized chat anomaly: {err}")
-        return
-
-    # Log deep exceptions structural tracebacks
     tb = "".join(traceback.format_exception(type(err), err, err.__traceback__))
-    logging.error(f"[CRITICAL BULWARK GLOBAL ERROR]\n{tb}")
-
-    if isinstance(update, Update) and update.effective_message:
-        try:
-            await update.effective_message.reply_text(
-                "Meow... something tripped internally! 😿🐾\n"
-                "<i>(My operators at Team Oldy Crypto will look into it structural logs!)</i>",
-                parse_mode=ParseMode.HTML
-            )
-        except Exception:
-            pass
+    logger.critical(f"[FORTRESS WRAPPER CAPTURE] Exception: {tb}")
 
 # ==========================================
-# PART 11: MAIN RUNNER — POLLING
+# PART 12: MAIN RUNNER
 # ==========================================
 async def main():
     token = os.environ.get("BOT_TOKEN")
@@ -396,22 +424,19 @@ async def main():
         print("BOT_TOKEN missing in environments!"); return
 
     app = TGApp.builder().token(token).build()
-    app.add_handler(CommandHandler("start",                    start_handler))
-    app.add_handler(CommandHandler("search",                   search_handler))
-    app.add_handler(CommandHandler("quiz",                     quiz_handler))
-    app.add_handler(CommandHandler(["gay", "couple", "aura"],  fun_dispatcher))
+    app.add_handler(CommandHandler("start",              start_handler))
+    app.add_handler(CommandHandler("search",             search_handler))
+    app.add_handler(CommandHandler("quiz",               quiz_handler))
+    app.add_handler(CommandHandler(["gay", "couple"],    fun_dispatcher))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, monitor))
     app.add_error_handler(error_handler)
 
-    print("Beluga Internet Cat Engine is Fully Operational! | Team Oldy Crypto")
+    print("Beluga Free Scraper Cat Engine Online!")
 
     await app.initialize()
     await app.bot.delete_webhook(drop_pending_updates=True)
     await app.start()
-    await app.updater.start_polling(
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES
-    )
+    await app.updater.start_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
