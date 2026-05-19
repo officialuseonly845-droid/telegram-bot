@@ -70,7 +70,6 @@ Maintain the exact language requested in the background instruction."""
 # PART 3: AUTOMATIC LANGUAGE & REACTION GUARD INJECTOR
 # ==========================================
 def inject_language_instruction(user_text: str) -> str:
-    """Analyzes the user's input and appends a strict language directive for the LLM."""
     text_lower = user_text.lower()
     hinglish_tokens = ["kya", "hai", "kaise", "bhai", "batao", "kr", "rha", "tha", "ye", "wo", "tu", "tum", "ko", "nhi", "aur", "hi", "bhi"]
     is_hinglish = any(re.search(rf"\b{word}\b", text_lower) for word in hinglish_tokens)
@@ -129,7 +128,6 @@ async def get_ai_response(system: str, user_text: str, fallback_msg: str) -> str
     return fallback_msg
 
 async def ask_ai_for_emoji(user_text: str) -> str:
-    """Asks the AI system directly what emoji fits the user prompt contextual emotion."""
     instruction = (
         f"Analyze this message text: '{user_text}'. What single standard emoji perfectly matches its emotion? "
         f"Respond ONLY with that one single emoji character, nothing else. No words, no sentences."
@@ -139,16 +137,11 @@ async def ask_ai_for_emoji(user_text: str) -> str:
         res = await _call_openrouter("You are an emoji Selector.", instruction)
     
     if res:
-        # Extract the first emoji character found to ensure no text leaks
         emojis = re.findall(r'[^\w\s,.:!?\'\"()\-]+', res)
         if emojis: return emojis[0][0]
     return "😼"
 
 def _google_custom_search(query: str) -> str:
-    """
-    Highly resilient web scraper using DuckDuckGo Lite layer.
-    Requires no API keys and bypasses bot-detection layers.
-    """
     try:
         user_agents = [
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -191,7 +184,7 @@ def _google_custom_search(query: str) -> str:
 GAY_TEMPLATES = [
     "🚨 **ATTENTION EVERYONE** 🚨\n\nAfter advanced investigation,\nthe council has decided that\n\n👉 **{u}** 👈\n\nis...\n\n🌈✨ **SUPER GAY** ✨🌈\n\nSentence:\nMust slay forever 💅😭",
     "📡 **GOVERNMENT ALERT** 📡\n\nOur satellites detected\nextreme rainbow activity from\n\n👉 **{u}** 👈\n\nStatus:\n\n🌈 **Certified Gay Citizen** 🌈\n\nPunishment:\nToo fabulous to handle 😭✨",
-    "🧪 **SECRET LAB REPORT** 🧪\n\nSubject: **{u}**\n\nTest Results:\n\n💅 Sass Level: `999+`\n🎀 Drama Energy: `MAX`\n🌈 Gayness: `CONFIRMED`\n\nFinal Verdict:\n\n✨ **HOMOSEXUAL CREATURE DETECTED** ✨\n\n🤣🤣 Rhine!",
+    "🧪 **SECRET LAB REPORT** 🧪\n\nSubject: **{u}**\n\nTest Results:\n\n💅 Sass Level: `999+`\n🎀 Drama Energy: `MAX`\n🌈 Gayness: `CONFIRMED`\n\nFinal Verdict:\n\n✨ **HOMOSEXUAL CREATURE DETECTED** ✨\n\n Rhine! 🤣🤣",
     "🚔 **FBI OPEN UP** 🚔\n\nWe received multiple reports that\n\n👉 **{u}** 👈\n\nhas been acting a little too zesty 😭\n\nAfter investigation:\n\n🌈 **GAY CONFIRMED** 🌈\n\nEvidence:\n- Types “hehe”\n- Uses cute emojis\n- Suspiciously fashionable 💅"
 ]
 
@@ -295,149 +288,10 @@ Do not include any markdown formatting like ```json or extra text outside the ra
     await status_msg.delete()
     
     try:
+        # Fixed syntax splitter layer to eliminate unterminated tokens
         if "
 ```json" in response:
-            response = response.split("```json")[1].split("```")[0].strip()
+            clean_res = response.split("```json")[1].split("```")[0].strip()
         elif "```" in response:
-            response = response.split("
-```")[1].split("```")[0].strip()
-        
-        data = json.loads(response.strip())
-        await c.bot.send_poll(
-            chat_id=cid,
-            question=f"🐱 Beluga's Quiz: {data['question']}",
-            options=data['options'],
-            type="quiz",
-            correct_option_id=int(data['correct_index']),
-            is_anonymous=False,
-            explanation="Beluga knows everything! Purrr... 🐾"
-        )
-    except Exception as e:
-        logger.error(f"[Quiz Parse Error] {e}")
-        await c.bot.send_poll(
-            chat_id=cid,
-            question="🐱 Beluga Quiz (Fallback): Which animal group has a sandpaper-like tongue?",
-            options=["Dogs", "Lions & Cats", "Birds", "Frogs"],
-            type="quiz",
-            correct_option_id=1,
-            is_anonymous=False
-        )
-
-# ==========================================
-# PART 9: MONITOR — EVERY 6TH MESSAGE REACTION + CONVERSATIONAL CHAT
-# ==========================================
-async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    if not u.message or not u.effective_user or u.effective_user.is_bot: return
-    uid, cid, now = u.effective_user.id, str(u.effective_chat.id), datetime.now()
-
-    # Anti-spam Layer
-    if uid not in spam_tracker: spam_tracker[uid] = []
-    spam_tracker[uid] = [t for t in spam_tracker[uid] if now - t < timedelta(seconds=2)]
-    spam_tracker[uid].append(now)
-    if len(spam_tracker[uid]) >= 4:
-        try: await u.message.delete()
-        except: pass
-        return
-
-    # User Register Tracker
-    if cid not in db["seen"]: db["seen"][cid] = {}
-    db["seen"][cid][str(uid)] = {"id": uid, "un": u.effective_user.username, "n": u.effective_user.first_name}
-
-    if "counts" not in db: db["counts"] = {}
-    db["counts"][cid] = db["counts"].get(cid, 0) + 1
-    save_db()
-
-    # STRICT REQUIREMENT: Auto-react at EXACTLY every 6th message globally
-    if db["counts"][cid] % 6 == 0:
-        await try_react(c.bot, cid, u.message.message_id)
-
-    # Conversational Trigger Layers
-    text = (u.message.text or "").lower()
-    is_name_mentioned = "beluga" in text
-    is_reply_to_bot = False
-
-    if u.message.reply_to_message and u.message.reply_to_message.from_user:
-        is_reply_to_bot = (u.message.reply_to_message.from_user.id == c.bot.id)
-
-    if is_name_mentioned or is_reply_to_bot:
-        await c.bot.send_chat_action(chat_id=cid, action="typing")
-        
-        # Ask AI dynamic reaction recommendation instantly before typing response
-        recommended_emoji = await ask_ai_for_emoji(u.message.text or "")
-        await try_react(c.bot, cid, u.message.message_id, recommended_emoji)
-        
-        response = await get_ai_response(
-            CHAT_PROMPT, u.message.text or "Hi!",
-            "Meow... my network links are currently running a bit slow. Let's talk in a bit! 😸🐾"
-        )
-        await u.message.reply_text(response)
-
-# ==========================================
-# PART 10: /start — PREMIUM MAX-WIDTH MONOSPACE INTERFACE
-# ==========================================
-async def start_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    # Monospace block representation to occupy maximum scannable screen-width
-    premium_start_text = (
-        "```\n"
-        "╔══════════════════════════════════════╗\n"
-        "                🤖 BELUGA AI            \n"
-        "╚══════════════════════════════════════╝\n"
-        "
-```\n"
-        "💬 *Intelligent Telegram Chat Bot*\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "👤 **User:**\n"
-        "Hello Beluga\n\n"
-        "🤖 **Beluga:**\n"
-        "Hello! How can I help you today?\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "⚡ **Features:**\n"
-        "• AI Chat Responses\n"
-        "• Fast Reply System\n"
-        "• Group Support\n"
-        "• Clean Interface\n"
-        "• 24/7 Active\n\n"
-        "👋 *Type a message to begin...*"
-    )
-    await u.message.reply_text(premium_start_text, parse_mode=ParseMode.MARKDOWN)
-
-# ==========================================
-# PART 11: GLOBAL ERROR BULWARK
-# ==========================================
-import traceback
-from telegram.error import NetworkError, TimedOut, Forbidden, BadRequest, RetryAfter
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    err = context.error
-    if isinstance(err, (NetworkError, TimedOut, RetryAfter)): return
-    if isinstance(err, (Forbidden, BadRequest)): return
-
-    tb = "".join(traceback.format_exception(type(err), err, err.__traceback__))
-    logger.critical(f"[FORTRESS WRAPPER CAPTURE] Exception: {tb}")
-
-# ==========================================
-# PART 12: MAIN RUNNER
-# ==========================================
-async def main():
-    token = os.environ.get("BOT_TOKEN")
-    if not token:
-        print("BOT_TOKEN missing in environments!"); return
-
-    app = TGApp.builder().token(token).build()
-    app.add_handler(CommandHandler("start",              start_handler))
-    app.add_handler(CommandHandler("search",             search_handler))
-    app.add_handler(CommandHandler("quiz",               quiz_handler))
-    app.add_handler(CommandHandler(["gay", "couple"],    fun_dispatcher))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, monitor))
-    app.add_error_handler(error_handler)
-
-    print("Beluga Free Scraper Cat Engine Online!")
-
-    await app.initialize()
-    await app.bot.delete_webhook(drop_pending_updates=True)
-    await app.start()
-    await app.updater.start_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-    await asyncio.Event().wait()
-
-if __name__ == "__main__":
-    asyncio.run(main())
+            clean_res = response.split("
+```")[1].split("
