@@ -507,7 +507,7 @@ async def search_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         parts = u.message.text.split(maxsplit=1)
         if len(parts) < 2 or not parts[1].strip():
             await u.message.reply_text(
-                "🐱 **Usage:**\n`/search metaverse` → Wikipedia\n`/search x.com` → Screenshot",
+                "Keep under 150 characters.",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
@@ -588,7 +588,8 @@ Format ONLY as JSON:
         await status_msg.delete()
         
         try:
-            json_str = response.replace("```json", "").replace("```", "").strip()
+            json_str = response.replace("```json", "").replace("
+```", "").strip()
             data = json.loads(json_str)
             
             await c.bot.send_poll(
@@ -708,111 +709,3 @@ async def start_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
 ╔══════════════════════════════════════╗
           🐱 BELUGA AI BOT 🐱          
 ╚══════════════════════════════════════╝
-```
-
-💬 **Smart Telegram Chat Bot**
-
-⚡ **Features:**
-• AI Chat (mention 'beluga')
-• `/search` (Wikipedia + screenshots)
-• `/quiz` (Live trivia)
-• `/gay` & `/couple` (Fun commands)
-• 24/7 Active
-
-👋 *Start chatting now!*"""
-        if u.message:
-            await u.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-            bot_status["message_count"] += 1
-    except Exception as e:
-        logger.error(f"[Start] {e}", exc_info=True)
-
-# ==========================================
-# PART 13: ERROR HANDLER
-# ==========================================
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    """Handle errors"""
-    err = context.error
-    
-    if isinstance(err, (NetworkError, TimedOut, RetryAfter)):
-        logger.debug(f"[Network] {type(err).__name__}")
-        return
-    
-    if isinstance(err, (Forbidden, BadRequest)):
-        logger.debug(f"[Permission] {type(err).__name__}")
-        return
-    
-    if isinstance(err, InvalidToken):
-        logger.critical("❌ INVALID BOT TOKEN!")
-        bot_status["running"] = False
-        return
-    
-    try:
-        tb = "".join(traceback.format_exception(type(err), err, err.__traceback__))
-        logger.error(f"[ERROR]\n{tb}")
-        bot_status["error_count"] += 1
-    except:
-        logger.error(f"[ERROR] {err}")
-
-# ==========================================
-# PART 14: MAIN - FIXED EVENT LOOP
-# ==========================================
-async def run_bot(app):
-    """Run Telegram bot polling"""
-    try:
-        bot_status["running"] = True
-        logger.info("✅ Bot polling started")
-        
-        await app.run_polling(
-            drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES
-        )
-    except Exception as e:
-        logger.error(f"[Bot Error] {e}", exc_info=True)
-        bot_status["running"] = False
-
-async def main():
-    """Main function with proper event loop handling"""
-    logger.info("=" * 60)
-    logger.info("🐱 BELUGA BOT STARTING")
-    logger.info("=" * 60)
-    
-    http_runner = None
-    
-    try:
-        # Start HTTP server
-        http_runner = await start_http_server(HTTP_PORT)
-        
-        # Build Telegram bot
-        app = TGApp.builder().token(BOT_TOKEN).build()
-        
-        # Add handlers
-        app.add_handler(CommandHandler("start", start_handler))
-        app.add_handler(CommandHandler("search", search_handler))
-        app.add_handler(CommandHandler("quiz", quiz_handler))
-        app.add_handler(CommandHandler(["gay", "couple"], fun_dispatcher))
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, monitor))
-        app.add_error_handler(error_handler)
-        
-        logger.info("✅ Handlers registered")
-        logger.info("🔄 Starting polling (HTTP server running parallel)...")
-        
-        # Run polling (this blocks until stopped)
-        await run_bot(app)
-    
-    except KeyboardInterrupt:
-        logger.info("🛑 Bot stopped by user")
-        bot_status["running"] = False
-    except InvalidToken:
-        logger.critical("❌ FATAL: Invalid token")
-        bot_status["running"] = False
-        sys.exit(1)
-    except Exception as e:
-        logger.critical(f"❌ FATAL: {e}", exc_info=True)
-        bot_status["running"] = False
-        sys.exit(1)
-    finally:
-        if http_runner:
-            await http_runner.cleanup()
-
-if __name__ == "__main__":
-    asyncio.run(main())
