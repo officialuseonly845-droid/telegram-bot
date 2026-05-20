@@ -588,8 +588,9 @@ Format ONLY as JSON:
         await status_msg.delete()
         
         try:
-            json_str = response.replace("```json", "").replace("
-```", "").strip()
+            # BUG FIX: Using single quotes here to prevent unterminated string literal errors
+            json_str = response.replace('```json', '').replace('
+```', '').strip()
             data = json.loads(json_str)
             
             await c.bot.send_poll(
