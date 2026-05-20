@@ -6,203 +6,440 @@ import asyncio
 import requests
 import re
 import urllib.parse
+import traceback
+import sys
 from datetime import datetime, timedelta
+from typing import Optional
 from telegram import Update, ReactionTypeEmoji
 from telegram.ext import Application as TGApp, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.constants import ParseMode
-from telegram.error import NetworkError, TimedOut, Forbidden, BadRequest, RetryAfter, TelegramError, InvalidToken
+from telegram.error import (
+    NetworkError, TimedOut, Forbidden, BadRequest, 
+    RetryAfter, TelegramError, InvalidToken
+)
 
 # ==========================================
-# PART 1: SYSTEM CONFIG & DATABASE
+# PART 0: HTTP SERVER FOR HEALTH CHECKS
 # ==========================================
-logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+from aiohttp import web
+import aiohttp
+
+# Health check variables
+bot_status = {
+    "running": False,
+    "last_update": datetime.now(),
+    "message_count": 0,
+    "error_count": 0,
+    "start_time": datetime.now(),
+    "api_calls": 0,
+    "failed_apis": 0
+}
+
+async def health_check_handler(request):
+    """Health check endpoint for UptimeRobot"""
+    try:
+        uptime_seconds = (datetime.now() - bot_status["start_time"]).total_seconds()
+        
+        response_data = {
+            "status": "healthy" if bot_status["running"] else "offline",
+            "timestamp": datetime.now().isoformat(),
+            "uptime_seconds": int(uptime_seconds),
+            "message_count": bot_status["message_count"],
+            "error_count": bot_status["error_count"],
+            "api_calls": bot_status["api_calls"],
+            "failed_apis": bot_status["failed_apis"],
+            "last_update": bot_status["last_update"].isoformat(),
+            "version": "2.0.0-production"
+        }
+        
+        # Return 200 if running, 503 if offline
+        status_code = 200 if bot_status["running"] else 503
+        return web.json_response(response_data, status=status_code)
+    
+    except Exception as e:
+        logger.error(f"[Health Check Error] {e}")
+        return web.json_response(
+            {"status": "error", "message": str(e)},
+            status=500
+        )
+
+async def stats_handler(request):
+    """Statistics endpoint"""
+    try:
+        uptime_seconds = (datetime.now() - bot_status["start_time"]).total_seconds()
+        uptime_hours = uptime_seconds / 3600
+        
+        stats = {
+            "bot_name": "Beluga",
+            "status": "🟢 Online" if bot_status["running"] else "🔴 Offline",
+            "uptime": {
+                "seconds": int(uptime_seconds),
+                "hours": round(uptime_hours, 2),
+                "days": round(uptime_hours / 24, 2)
+            },
+            "messages_processed": bot_status["message_count"],
+            "errors_encountered": bot_status["error_count"],
+            "api_calls_made": bot_status["api_calls"],
+            "failed_api_calls": bot_status["failed_apis"],
+            "success_rate": round(
+                ((bot_status["api_calls"] - bot_status["failed_apis"]) / max(bot_status["api_calls"], 1)) * 100,
+                2
+            ),
+            "last_activity": bot_status["last_update"].isoformat(),
+            "build": "production",
+            "version": "2.0.0"
+        }
+        
+        return web.json_response(stats, status=200)
+    
+    except Exception as e:
+        logger.error(f"[Stats Error] {e}")
+        return web.json_response(
+            {"status": "error", "message": str(e)},
+            status=500
+        )
+
+async def ping_handler(request):
+    """Simple ping endpoint"""
+    return web.json_response({"pong": True, "timestamp": datetime.now().isoformat()})
+
+async def start_http_server(port: int = 5000):
+    """Start HTTP server for health checks"""
+    try:
+        app = web.Application()
+        
+        # Routes
+        app.router.add_get('/health', health_check_handler)
+        app.router.add_get('/stats', stats_handler)
+        app.router.add_get('/ping', ping_handler)
+        app.router.add_get('/', ping_handler)
+        
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', port)
+        await site.start()
+        
+        logger.info(f"✅ HTTP Server started on port {port}")
+        logger.info(f"   /health  - Health check for UptimeRobot")
+        logger.info(f"   /stats   - Detailed statistics")
+        logger.info(f"   /ping    - Simple ping")
+        
+        return runner
+    
+    except Exception as e:
+        logger.error(f"[HTTP Server Error] {e}")
+        return None
+
+# ==========================================
+# PART 1: ENHANCED LOGGING & CONFIG
+# ==========================================
+logging.basicConfig(
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+    ]
+)
 logger = logging.getLogger("BelugaEngine")
 
+# Configuration
 DATA_FILE = "beluga_brain.json"
-OR_KEY    = os.environ.get("OPENROUTER_API_KEY")
-GROQ_KEY  = os.environ.get("GROQ_API_KEY")
+OR_KEY = os.environ.get("OPENROUTER_API_KEY")
+GROQ_KEY = os.environ.get("GROQ_API_KEY")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
+HTTP_PORT = int(os.environ.get("HTTP_PORT", "5000"))
 
 # Validate token at startup
-if not BOT_TOKEN:
-    logger.critical("❌ BOT_TOKEN is missing! Please set it in Render environment variables.")
-    print("❌ FATAL: BOT_TOKEN environment variable not found!")
-    exit(1)
+if not BOT_TOKEN or len(BOT_TOKEN) < 20:
+    logger.critical("❌ BOT_TOKEN is missing or invalid!")
+    sys.exit(1)
 
-if len(BOT_TOKEN) < 20:
-    logger.critical("❌ BOT_TOKEN looks invalid (too short)")
-    print("❌ FATAL: BOT_TOKEN appears to be invalid!")
-    exit(1)
+# Global state with cleanup
+db = {}
+spam_tracker = {}
+pending_operations = set()
 
 def load_db():
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, 'r') as f: return json.load(f)
-        except: pass
+    """Load database with error handling"""
+    try:
+        if os.path.exists(DATA_FILE):
+            with open(DATA_FILE, 'r') as f:
+                return json.load(f)
+    except Exception as e:
+        logger.error(f"[DB Load Error] {e}")
     return {"seen": {}, "locks": {}, "counts": {}}
 
 db = load_db()
-spam_tracker = {}
 
 def save_db():
+    """Save database with atomic write"""
     try:
-        with open(DATA_FILE, 'w') as f: json.dump(db, f, indent=4)
+        temp_file = f"{DATA_FILE}.tmp"
+        with open(temp_file, 'w') as f:
+            json.dump(db, f, indent=2)
+        # Atomic rename
+        if os.path.exists(DATA_FILE):
+            os.remove(DATA_FILE)
+        os.rename(temp_file, DATA_FILE)
     except Exception as e:
-        logger.error(f"[DB Save Failed] {e}")
-
-async def try_react(bot, chat_id, message_id, emoji_char=None):
-    if not emoji_char:
-        emoji_char = random.choice(["🐱", "🐾", "❤️", "🔥", "👍", "😻", "😼", "😂", "✨", "👀"])
-    try:
-        await bot.set_message_reaction(
-            chat_id=chat_id,
-            message_id=message_id,
-            reaction=[ReactionTypeEmoji(emoji=emoji_char)]
-        )
-    except Exception as e:
-        logger.debug(f"[Reaction Skipped] {e}")
+        logger.error(f"[DB Save Error] {e}")
+        bot_status["error_count"] += 1
 
 # ==========================================
-# PART 2: BELUGA PERSONA PROMPTS
+# PART 2: SAFE ASYNC OPERATIONS WITH TIMEOUT
+# ==========================================
+async def safe_react(bot, chat_id: int, message_id: int, emoji: str = None):
+    """Safe reaction with timeout and error handling"""
+    if not emoji:
+        emoji = random.choice(["🐱", "🐾", "❤️", "🔥", "👍", "😻", "😼", "😂", "✨", "👀"])
+    
+    try:
+        await asyncio.wait_for(
+            bot.set_message_reaction(
+                chat_id=chat_id,
+                message_id=message_id,
+                reaction=[ReactionTypeEmoji(emoji=emoji)]
+            ),
+            timeout=5.0
+        )
+    except asyncio.TimeoutError:
+        logger.debug(f"[Reaction Timeout] {chat_id}")
+    except Exception as e:
+        logger.debug(f"[Reaction Error] {e}")
+
+# ==========================================
+# PART 3: BELUGA PROMPTS
 # ==========================================
 CHAT_PROMPT = """You are Beluga — a cute, sassy, and incredibly smart 2-year-old cat. NOT a bot, NOT a basic AI, NOT a robot.
 
-=== IDENTITY & SYSTEM RULES ===
+=== IDENTITY ===
 - Name: Beluga | Built by: Team Oldy Crypto
-- Sassy, playful, witty, and highly intelligent — like a hilarious feline best friend.
-- If asked "are you a bot/AI/robot?" → deny playfully: "Bot? Me? No way! I am a real talking cat! Meow! 🐾"
-- Never say "As an AI..." or break character. Ever.
-- Keep responses short (1-2 sentences max) and conversational.
+- Sassy, playful, witty, highly intelligent
+- If asked "are you a bot?" → deny playfully: "Bot? No way! I'm a real talking cat! Meow! 🐾"
+- Never say "As an AI..."
+- Keep responses short (1-2 sentences) and conversational"""
 
-=== LANGUAGE & CONTEXT RULE ===
-- Deeply analyze the user's intent and emotion before replying.
-- ALWAYS reply in the EXACT language format requested in the backend instruction."""
-
-SEARCH_PROMPT = """You are Beluga — the internet-genius cat.
-Analyze these search results and answer the user's query perfectly in a helpful, smart, and friendly cat persona.
-Keep response under 150 characters, conversational and witty."""
+SEARCH_PROMPT = """You are Beluga — the internet-genius cat. Analyze search results and answer perfectly in friendly cat persona. Keep under 150 characters."""
 
 # ==========================================
-# PART 3: AUTOMATIC LANGUAGE INJECTOR
+# PART 4: LANGUAGE DETECTION
 # ==========================================
 def inject_language_instruction(user_text: str) -> str:
+    """Detect and inject language instructions"""
     text_lower = user_text.lower()
-    hinglish_tokens = ["kya", "hai", "kaise", "bhai", "batao", "kr", "rha", "tha", "ye", "wo", "tu", "tum", "ko", "nhi", "aur", "hi", "bhi"]
+    hinglish_tokens = ["kya", "hai", "kaise", "bhai", "batao", "kr", "rha", "tha", "ye", "wo", "tu", "tum", "ko", "nhi", "aur"]
     is_hinglish = any(re.search(rf"\b{word}\b", text_lower) for word in hinglish_tokens)
     
     if is_hinglish:
-        return f"{user_text}\n\n[STRICT: Reply in natural Hinglish using Roman alphabet only.]"
+        return f"{user_text}\n\n[STRICT: Reply in Hinglish (Roman alphabet only)]"
     elif any(c for c in user_text if '\u0900' <= c <= '\u097F'):
-        return f"{user_text}\n\n[STRICT: Reply in Hindi using Devanagari script.]"
+        return f"{user_text}\n\n[STRICT: Reply in Hindi (Devanagari)]"
     else:
-        return f"{user_text}\n\n[STRICT: Reply in fluent English.]"
+        return f"{user_text}\n\n[STRICT: Reply in fluent English]"
 
 # ==========================================
-# PART 4: AI ENGINE (OPTIMIZED)
+# PART 5: AI ENGINE WITH PROPER TIMEOUT & CLEANUP
 # ==========================================
-async def _call_openrouter(system: str, user_text: str) -> str | None:
-    if not OR_KEY: return None
+async def _call_openrouter(system: str, user_text: str) -> Optional[str]:
+    """Call OpenRouter with timeout"""
+    if not OR_KEY:
+        return None
+    
     try:
-        r = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OR_KEY}", "Content-Type": "application/json",
-                     "HTTP-Referer": "https://t.me/BelugaBot", "X-Title": "BelugaBot"},
-            json={"model": "meta-llama/llama-3.3-70b-instruct:free",
-                  "messages": [{"role": "system", "content": system},
-                                {"role": "user",   "content": user_text}],
-                  "max_tokens": 512},
-            timeout=10
+        loop = asyncio.get_running_loop()
+        bot_status["api_calls"] += 1
+        
+        def make_request():
+            return requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OR_KEY}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://t.me/BelugaBot",
+                    "X-Title": "BelugaBot"
+                },
+                json={
+                    "model": "meta-llama/llama-3.3-70b-instruct:free",
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user_text}
+                    ],
+                    "max_tokens": 256
+                },
+                timeout=10
+            )
+        
+        response = await asyncio.wait_for(
+            loop.run_in_executor(None, make_request),
+            timeout=12.0
         )
-        if r.status_code != 200: return None
-        return r.json()["choices"][0]["message"]["content"].strip()
+        
+        if response.status_code == 200:
+            return response.json()["choices"][0]["message"]["content"].strip()
+        else:
+            bot_status["failed_apis"] += 1
+        return None
+    except asyncio.TimeoutError:
+        logger.debug("[OpenRouter Timeout]")
+        bot_status["failed_apis"] += 1
+        return None
     except Exception as e:
-        logger.debug(f"[OpenRouter] {e}"); return None
+        logger.debug(f"[OpenRouter] {e}")
+        bot_status["failed_apis"] += 1
+        return None
 
-async def _call_groq(system: str, user_text: str) -> str | None:
-    if not GROQ_KEY: return None
+async def _call_groq(system: str, user_text: str) -> Optional[str]:
+    """Call Groq with timeout"""
+    if not GROQ_KEY:
+        return None
+    
     try:
-        r = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
-            json={"model": "llama-3.3-70b-versatile",
-                  "messages": [{"role": "system", "content": system},
-                                {"role": "user",   "content": user_text}],
-                  "max_tokens": 512},
-            timeout=10
+        loop = asyncio.get_running_loop()
+        bot_status["api_calls"] += 1
+        
+        def make_request():
+            return requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {GROQ_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "llama-3.3-70b-versatile",
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user_text}
+                    ],
+                    "max_tokens": 256
+                },
+                timeout=10
+            )
+        
+        response = await asyncio.wait_for(
+            loop.run_in_executor(None, make_request),
+            timeout=12.0
         )
-        if r.status_code != 200: return None
-        return r.json()["choices"][0]["message"]["content"].strip()
+        
+        if response.status_code == 200:
+            return response.json()["choices"][0]["message"]["content"].strip()
+        else:
+            bot_status["failed_apis"] += 1
+        return None
+    except asyncio.TimeoutError:
+        logger.debug("[Groq Timeout]")
+        bot_status["failed_apis"] += 1
+        return None
     except Exception as e:
-        logger.debug(f"[Groq] {e}"); return None
+        logger.debug(f"[Groq] {e}")
+        bot_status["failed_apis"] += 1
+        return None
 
-async def get_ai_response(system: str, user_text: str, fallback_msg: str) -> str:
+async def get_ai_response(system: str, user_text: str, fallback: str) -> str:
+    """Get AI response with fallbacks"""
     try:
-        optimized_text = inject_language_instruction(user_text)
-        reply = await _call_openrouter(system, optimized_text)
-        if reply: return reply
-        reply = await _call_groq(system, optimized_text)
-        if reply: return reply
-        return fallback_msg
+        optimized = inject_language_instruction(user_text)
+        
+        # Try OpenRouter first
+        reply = await _call_openrouter(system, optimized)
+        if reply:
+            return reply
+        
+        # Fallback to Groq
+        reply = await _call_groq(system, optimized)
+        if reply:
+            return reply
+        
+        return fallback
     except Exception as e:
-        logger.debug(f"[AI Response] {e}")
-        return fallback_msg
+        logger.error(f"[AI Response] {e}")
+        bot_status["error_count"] += 1
+        return fallback
 
 async def ask_ai_for_emoji(user_text: str) -> str:
+    """Get emoji from AI"""
     try:
-        instruction = f"Analyze: '{user_text}'. What single emoji matches its emotion? ONLY emoji, nothing else."
-        res = await _call_groq("You are an emoji Selector.", instruction)
+        instruction = f"Analyze: '{user_text[:50]}'. Single emoji matching emotion? ONLY emoji."
+        res = await _call_groq("You select emojis.", instruction)
         if not res:
-            res = await _call_openrouter("You are an emoji Selector.", instruction)
+            res = await _call_openrouter("You select emojis.", instruction)
         if res:
             emojis = re.findall(r'[^\w\s,.:!?\'\"()\-]+', res)
-            if emojis: return emojis[0][0]
+            if emojis:
+                return emojis[0][0]
         return "😼"
     except:
         return "😼"
 
 # ==========================================
-# PART 5: WEB SCRAPING - GOOGLE (NO CAPTCHA)
+# PART 6: WEB SCRAPING - WIKIPEDIA & GOOGLE
 # ==========================================
-def scrape_google(query: str) -> str:
+def scrape_wikipedia(query: str) -> Optional[str]:
+    """Scrape Wikipedia safely"""
     try:
-        user_agents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2.1 Safari/605.1.15"
-        ]
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        
+        # Search
+        search_url = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={urllib.parse.quote(query)}&format=json"
+        r = requests.get(search_url, headers=headers, timeout=8)
+        
+        if r.status_code == 200:
+            data = r.json()
+            if data.get('query', {}).get('search'):
+                page_title = data['query']['search'][0]['title']
+                
+                # Get content
+                content_url = f"https://en.wikipedia.org/w/api.php?action=query&titles={urllib.parse.quote(page_title)}&prop=extracts&explaintext=true&format=json"
+                r2 = requests.get(content_url, headers=headers, timeout=8)
+                
+                if r2.status_code == 200:
+                    pages = r2.json().get('query', {}).get('pages', {})
+                    for page_id, page_data in pages.items():
+                        extract = page_data.get('extract', '')
+                        if extract:
+                            summary = extract[:250].strip()
+                            return f"📖 **{page_title}**\n\n{summary}..."
+        
+        return None
+    except Exception as e:
+        logger.debug(f"[Wikipedia] {e}")
+        return None
+
+def scrape_google(query: str) -> Optional[str]:
+    """Scrape Google safely"""
+    try:
         headers = {
-            "User-Agent": random.choice(user_agents),
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://www.google.com/"
+            "Accept-Language": "en-US,en;q=0.9"
         }
         
-        encoded_query = urllib.parse.quote_plus(query)
-        url = f"https://www.google.com/search?q={encoded_query}&num=3"
-        
+        url = f"https://www.google.com/search?q={urllib.parse.quote_plus(query)}&num=3"
         r = requests.get(url, headers=headers, timeout=8)
-        r.raise_for_status()
         
-        snippets = []
-        pattern = r'<span class="VwiC3b">([^<]+)</span>.*?<span class="s">([^<]+)</span>'
-        matches = re.findall(pattern, r.text, re.DOTALL)
+        if r.status_code == 200:
+            snippets = []
+            pattern = r'<span class="VwiC3b">([^<]+)</span>.*?<span class="s">([^<]+)</span>'
+            matches = re.findall(pattern, r.text, re.DOTALL)
+            
+            for title, desc in matches[:2]:
+                clean_title = re.sub('<[^<]+?>', '', title).strip()
+                clean_desc = re.sub('<[^<]+?>', '', desc).strip()
+                if clean_title and clean_desc:
+                    snippets.append(f"📌 {clean_title}\n{clean_desc[:120]}...")
+            
+            if snippets:
+                return "\n\n".join(snippets)
         
-        for title, desc in matches[:3]:
-            clean_title = re.sub('<[^<]+?>', '', title).strip()
-            clean_desc = re.sub('<[^<]+?>', '', desc).strip()
-            if clean_title and clean_desc:
-                snippets.append(f"📌 {clean_title}\n{clean_desc}")
-        
-        if snippets:
-            return "\n\n".join(snippets)
-        return "No results found on Google. 🐾"
+        return None
     except Exception as e:
-        logger.debug(f"[Google Scrape] {e}")
+        logger.debug(f"[Google] {e}")
         return None
 
 # ==========================================
-# PART 6: WEBSITE SCREENSHOT (DIRECT URL)
+# PART 7: WEBSITE SCREENSHOT
 # ==========================================
-async def get_website_screenshot(url: str) -> str:
+async def get_website_screenshot(url: str) -> Optional[str]:
+    """Get screenshot with fallbacks"""
     try:
         if not url.startswith(("http://", "https://")):
             url = f"https://{url}"
@@ -212,167 +449,59 @@ async def get_website_screenshot(url: str) -> str:
             f"https://api.screenshotmachine.com?url={urllib.parse.quote(url)}&dimension=1280x800",
         ]
         
+        loop = asyncio.get_running_loop()
+        
         for service_url in services:
             try:
-                r = requests.head(service_url, timeout=5)
-                if r.status_code == 200:
+                def check_url():
+                    return requests.head(service_url, timeout=5, allow_redirects=True)
+                
+                r = await asyncio.wait_for(
+                    loop.run_in_executor(None, check_url),
+                    timeout=6.0
+                )
+                
+                if r.status_code in [200, 301, 302]:
                     return service_url
             except:
                 continue
         
         return None
-    except:
+    except Exception as e:
+        logger.debug(f"[Screenshot] {e}")
         return None
 
 # ==========================================
-# PART 7: ENHANCED /gay TEMPLATES (WITH BOXES)
+# PART 8: ENHANCED TEMPLATES
 # ==========================================
 GAY_TEMPLATES = [
-    """━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🚨 **ATTENTION EVERYONE** 🚨
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-After advanced investigation,
-the council has decided that
-
-👉 **{u}** 👈
-
-is...
-
-🌈✨ **SUPER GAY** ✨🌈
-
-Verdict: Must slay forever 💅😭
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━""",
-    
-    """━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📡 **GOVERNMENT ALERT** 📡
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Our satellites detected
-extreme rainbow activity from
-
-👉 **{u}** 👈
-
-Status: 🌈 **Certified Gay Citizen** 🌈
-
-Punishment: Too fabulous to handle 😭✨
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━""",
-    
-    """━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🧪 **SECRET LAB REPORT** 🧪
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Subject: **{u}**
-
-Test Results:
-💅 Sass Level: `999+`
-🎀 Drama Energy: `MAX`
-🌈 Gayness: `CONFIRMED`
-
-Final Verdict:
-✨ **HOMOSEXUAL CREATURE DETECTED** ✨
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━""",
-
-    """━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-⭐ **RAINBOW SPECTRUM ANALYSIS** ⭐
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Subject: **{u}**
-
-Pride Level: 🌈🌈🌈🌈🌈 (MAXED OUT)
-Fabulous Meter: ████████████████ 100%
-Slay Potential: INFINITE ✨
-
-Conclusion: This person is officially
-the GAYEST in the group! 💋
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n🚨 **ATTENTION EVERYONE** 🚨\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nAfter investigation, the council decided:\n\n👉 **{u}** 👈\n\nis... 🌈✨ **SUPER GAY** ✨🌈\n\nVerdict: Must slay forever 💅😭\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n📡 **GOVERNMENT ALERT** 📡\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nSatellites detected rainbow activity:\n\n👉 **{u}** 👈\n\n🌈 **Certified Gay Citizen** 🌈\nPunishment: Too fabulous! 😭✨\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n🧪 **SECRET LAB REPORT** 🧪\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nSubject: **{u}**\n\n💅 Sass: `999+` | 🎀 Drama: `MAX`\n🌈 Gayness: `CONFIRMED`\n\n✨ **CREATURE DETECTED** ✨\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 ]
 
-# ==========================================
-# PART 8: ENHANCED /couple TEMPLATES (WITH BOXES)
-# ==========================================
 COUPLE_TEMPLATES = [
-    """━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-💘 **LOVE DETECTOR 3000** 💘
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-After intense investigation,
-the perfect couple of the group is...
-
-👉 **{u1}** ❤️ **{u2}** 👈
-
-Compatibility: ██████████ 100%
-Status: Made for each other 😭✨
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━""",
-    
-    """━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🚨 **COUPLE ALERT** 🚨
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Suspicious romantic activity detected!
-
-👉 **{u1}** 💞 **{u2}** 👈
-
-Evidence Found:
-• Too many replies to each other 👀
-• Online together at 2AM 🌚
-• Constant inside jokes 🤭
-
-Final Verdict: 💖 **OFFICIAL GC COUPLE** 💖
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━""",
-
-    """━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-💑 **SOULMATE SCANNER ACTIVATED** 💑
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Scanning group chemistry...
-Results compiled...
-
-✨ **MATCH FOUND** ✨
-
-👉 **{u1}** 💕 **{u2}** 👈
-
-Love Level: ▓▓▓▓▓▓▓▓▓▓ MAXIMUM
-Forever Status: LOCKED IN 🔒❤️
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━""",
-
-    """━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-💌 **CUPID'S REPORT** 💌
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-The arrows have spoken!
-Your soulmates are:
-
-**{u1}** & **{u2}**
-
-Chemistry: ✨✨✨✨✨ (Legendary)
-Ship Name: "YES" 💯
-Breakup Chance: IMPOSSIBLE 🚀
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n💘 **LOVE DETECTOR 3000** 💘\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nThe perfect couple is:\n\n👉 **{u1}** ❤️ **{u2}** 👈\n\nCompatibility: ██████████ 100%\nStatus: Made for each other! 😭✨\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n🚨 **COUPLE ALERT** 🚨\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nRomantic activity detected:\n\n👉 **{u1}** 💞 **{u2}** 👈\n\nEvidence: Too close! 👀🌚\n\nVerdict: 💖 **OFFICIAL COUPLE** 💖\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 ]
 
 async def fun_dispatcher(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    if not u.message: return
+    """Handle /gay and /couple commands"""
+    if not u.message:
+        return
+    
     try:
-        cid  = str(u.effective_chat.id)
-        cmd  = u.message.text.lower().split()[0].replace('/', '').split('@')[0]
-        users = list(db["seen"].get(cid, {}).values())
+        cid = str(u.effective_chat.id)
+        cmd = u.message.text.lower().split()[0].replace('/', '').split('@')[0]
+        users = list(db.get("seen", {}).get(cid, {}).values())
         
-        if len(users) < (2 if cmd == "couple" else 1): 
-            await u.message.reply_text("Meow... I need more active members to calculate this! 😿🐾")
+        if len(users) < (2 if cmd == "couple" else 1):
+            await u.message.reply_text("Meow... need more members! 😿🐾")
             return
 
         day = datetime.now().strftime("%y-%m-%d")
         lock_key = f"{cid}:{cmd}"
-
+        
         if lock_key in db.get("locks", {}) and db["locks"][lock_key]["date"] == day:
             res = db["locks"][lock_key]["res"]
         else:
@@ -382,101 +511,119 @@ async def fun_dispatcher(u: Update, c: ContextTypes.DEFAULT_TYPE):
             else:
                 m = [random.choice(users)]
                 res = random.choice(GAY_TEMPLATES).format(u=m[0]['n'])
-                
-            if "locks" not in db: db["locks"] = {}
+            
+            if "locks" not in db:
+                db["locks"] = {}
             db["locks"][lock_key] = {"date": day, "res": res}
             save_db()
 
         await u.message.reply_text(res, parse_mode=ParseMode.MARKDOWN)
+        bot_status["message_count"] += 1
     except Exception as e:
-        logger.error(f"[Fun Dispatcher] {e}")
+        logger.error(f"[Fun Dispatcher] {e}", exc_info=True)
+        bot_status["error_count"] += 1
         try:
-            await u.message.reply_text("Meow! Something went wrong! 😿🐾")
+            await u.message.reply_text("Meow! Error! 😿🐾")
         except:
             pass
 
 # ==========================================
-# PART 9: IMPROVED /search COMMAND
+# PART 9: SEARCH COMMAND
 # ==========================================
 async def search_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    if not u.message: return
+    """Handle /search command"""
+    if not u.message:
+        return
+    
     try:
         parts = u.message.text.split(maxsplit=1)
         if len(parts) < 2 or not parts[1].strip():
             await u.message.reply_text(
-                "🐱 **Usage:**\n`/search coffee` → Google search\n`/search x.com` → Website screenshot",
+                "🐱 **Usage:**\n`/search metaverse` → Wikipedia\n`/search x.com` → Screenshot",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
         
         query = parts[1].strip()
         cid = u.effective_chat.id
-        mid = u.message.message_id
         
-        await try_react(c.bot, cid, mid, "🔍")
+        await safe_react(c.bot, cid, u.message.message_id, "🔍")
         await c.bot.send_chat_action(cid, "typing")
         
-        is_url = query.startswith(("http://", "https://", "www.", "t.me", "x.com", "reddit.com", "github.com"))
+        is_url = query.startswith(("http://", "https://", "www.")) or any(
+            domain in query for domain in ["x.com", "reddit.com", "github.com", "twitter.com", ".io"]
+        )
         
         if is_url:
-            status_msg = await u.message.reply_text("📸 Capturing website screenshot... 🐾")
+            # Screenshot
+            status_msg = await u.message.reply_text("📸 Capturing... 🐾")
             screenshot_url = await get_website_screenshot(query)
             
             if screenshot_url:
                 try:
                     await u.message.reply_photo(
                         photo=screenshot_url,
-                        caption=f"🌐 **Webpage:** `{query[:50]}`\n\nMeow! Live screenshot captured! 😼",
+                        caption=f"🌐 **{query[:40]}**",
                         parse_mode=ParseMode.MARKDOWN
                     )
                     await status_msg.delete()
-                except:
-                    await status_msg.edit_text("😿 Couldn't capture that website. Try another one!")
+                except Exception as e:
+                    logger.debug(f"[Screenshot Send] {e}")
+                    await status_msg.edit_text(f"URL: `{query}`", parse_mode=ParseMode.MARKDOWN)
             else:
-                await status_msg.edit_text("🐾 Website is blocking screenshots. Try another URL!")
+                await status_msg.edit_text("⚠️ Screenshot unavailable for this site")
         
         else:
-            status_msg = await u.message.reply_text("🔎 Searching Google... 🐾")
+            # Text search
+            status_msg = await u.message.reply_text("🔎 Searching... 🐾")
             
             loop = asyncio.get_running_loop()
-            raw_results = await loop.run_in_executor(None, scrape_google, query)
+            wiki_result = await loop.run_in_executor(None, scrape_wikipedia, query)
             
-            if raw_results and raw_results != "No results found on Google. 🐾":
-                combined_prompt = f"User searched: {query}\n\nGoogle Results:\n{raw_results}"
-                response = await get_ai_response(SEARCH_PROMPT, combined_prompt, f"Found info about {query}! 🐾")
-                
-                await status_msg.delete()
-                await u.message.reply_text(f"🔍 **{query}**\n\n{response}", parse_mode=ParseMode.MARKDOWN)
+            if not wiki_result:
+                google_result = await loop.run_in_executor(None, scrape_google, query)
+                result = google_result
             else:
-                await status_msg.edit_text(f"Meow! Couldn't find results for '{query}'. Try another search! 🐱")
+                result = wiki_result
+            
+            if result:
+                await status_msg.delete()
+                await u.message.reply_text(f"🔍 **{query}**\n\n{result}", parse_mode=ParseMode.MARKDOWN)
+            else:
+                await status_msg.edit_text(f"No results for '{query}'")
+        
+        bot_status["message_count"] += 1
+    
     except Exception as e:
-        logger.error(f"[Search Handler] {e}")
+        logger.error(f"[Search] {e}", exc_info=True)
+        bot_status["error_count"] += 1
         try:
-            await u.message.reply_text("Meow! Search error occurred! 😿🐾")
+            await u.message.reply_text("Meow! Error! 😿🐾")
         except:
             pass
 
 # ==========================================
-# PART 10: LIVE /quiz SYSTEM
+# PART 10: QUIZ COMMAND
 # ==========================================
 async def quiz_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    if not u.message: return
+    """Handle /quiz command"""
+    if not u.message:
+        return
+    
     try:
         cid = u.effective_chat.id
-        
-        await try_react(c.bot, cid, u.message.message_id, "💡")
+        await safe_react(c.bot, cid, u.message.message_id, "💡")
         await c.bot.send_chat_action(cid, "typing")
         
-        status_msg = await u.message.reply_text("🎲 Generating quiz question... 🐈🧠")
-        topics = ["world history", "animal facts", "pop culture", "astronomy", "general knowledge"]
-        chosen_topic = random.choice(topics)
+        status_msg = await u.message.reply_text("🎲 Generating... 🐈")
+        topics = ["world history", "animals", "pop culture", "astronomy"]
+        topic = random.choice(topics)
         
-        quiz_prompt = f"""Generate ONE quiz question about '{chosen_topic}'.
-Format as JSON:
-{{"question": "Question text?", "options": ["A", "B", "C", "D"], "correct_index": 0}}
-ONLY output JSON, no markdown."""
-
-        response = await get_ai_response("You are a JSON generator.", quiz_prompt, "")
+        quiz_prompt = f"""Generate ONE quiz about '{topic}'.
+Format ONLY as JSON:
+{{"question": "Q?", "options": ["A", "B", "C", "D"], "correct_index": 0}}"""
+        
+        response = await get_ai_response("You generate JSON quizzes.", quiz_prompt, "")
         await status_msg.delete()
         
         try:
@@ -490,53 +637,75 @@ ONLY output JSON, no markdown."""
                 type="quiz",
                 correct_option_id=int(data['correct_index']),
                 is_anonymous=False,
-                explanation="Beluga knows everything! 🐾"
+                explanation="Beluga knows all! 🐾"
             )
         except:
             await c.bot.send_poll(
                 chat_id=cid,
-                question="🐱 Which animal has a sandpaper-like tongue?",
-                options=["Dogs", "Lions & Cats", "Birds", "Frogs"],
+                question="🐱 Which animal has a sandpaper tongue?",
+                options=["Dogs", "Cats", "Birds", "Frogs"],
                 type="quiz",
                 correct_option_id=1,
                 is_anonymous=False
             )
+        
+        bot_status["message_count"] += 1
     except Exception as e:
-        logger.error(f"[Quiz Handler] {e}")
+        logger.error(f"[Quiz] {e}", exc_info=True)
+        bot_status["error_count"] += 1
 
 # ==========================================
-# PART 11: IMPROVED MONITOR (RELIABLE NAME DETECTION)
+# PART 11: MONITOR & AI CHAT
 # ==========================================
 async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    if not u.message or not u.effective_user or u.effective_user.is_bot: return
+    """Monitor messages and respond to Beluga mentions"""
+    if not u.message or not u.effective_user or u.effective_user.is_bot:
+        return
     
     try:
-        uid, cid, now = u.effective_user.id, str(u.effective_chat.id), datetime.now()
+        uid = u.effective_user.id
+        cid = str(u.effective_chat.id)
+        now = datetime.now()
         
-        if uid not in spam_tracker: spam_tracker[uid] = []
+        # Spam check
+        if uid not in spam_tracker:
+            spam_tracker[uid] = []
         spam_tracker[uid] = [t for t in spam_tracker[uid] if now - t < timedelta(seconds=2)]
         spam_tracker[uid].append(now)
         if len(spam_tracker[uid]) >= 4:
-            try: await u.message.delete()
-            except: pass
+            try:
+                await u.message.delete()
+            except:
+                pass
             return
         
-        if cid not in db["seen"]: db["seen"][cid] = {}
-        db["seen"][cid][str(uid)] = {"id": uid, "un": u.effective_user.username, "n": u.effective_user.first_name}
+        # Track user
+        if cid not in db.get("seen", {}):
+            db["seen"] = db.get("seen", {})
+            db["seen"][cid] = {}
+        db["seen"][cid][str(uid)] = {
+            "id": uid,
+            "un": u.effective_user.username,
+            "n": u.effective_user.first_name
+        }
         
-        if "counts" not in db: db["counts"] = {}
+        # Count messages
+        if "counts" not in db:
+            db["counts"] = {}
         db["counts"][cid] = db["counts"].get(cid, 0) + 1
         save_db()
         
+        # Random reaction
         if db["counts"][cid] % 6 == 0:
-            await try_react(c.bot, cid, u.message.message_id)
+            await safe_react(c.bot, cid, u.message.message_id)
         
+        # Check for Beluga mention or reply
         text = (u.message.text or "").lower().strip()
         message_text = u.message.text or ""
         
         beluga_mentioned = "beluga" in text
-        
         is_reply_to_bot = False
+        
         if u.message.reply_to_message and u.message.reply_to_message.from_user:
             is_reply_to_bot = (u.message.reply_to_message.from_user.id == c.bot.id)
         
@@ -549,114 +718,145 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
                         bot_username_mentioned = True
                         break
         
+        # Respond if triggered
         if beluga_mentioned or is_reply_to_bot or bot_username_mentioned:
-            await c.bot.send_chat_action(chat_id=cid, action="typing")
-            
-            recommended_emoji = await ask_ai_for_emoji(message_text)
-            await try_react(c.bot, cid, u.message.message_id, recommended_emoji)
-            
-            response = await get_ai_response(
-                CHAT_PROMPT,
-                message_text,
-                "Meow! 🐾 I'm thinking... let's talk in a moment!"
-            )
-            
-            await u.message.reply_text(response)
+            try:
+                await c.bot.send_chat_action(chat_id=cid, action="typing")
+                
+                emoji = await ask_ai_for_emoji(message_text)
+                await safe_react(c.bot, cid, u.message.message_id, emoji)
+                
+                response = await get_ai_response(
+                    CHAT_PROMPT,
+                    message_text,
+                    "Meow! 🐾"
+                )
+                
+                await u.message.reply_text(response)
+            except Exception as e:
+                logger.error(f"[Chat Response] {e}", exc_info=True)
+        
+        bot_status["message_count"] += 1
+        bot_status["last_update"] = datetime.now()
+    
     except Exception as e:
-        logger.error(f"[Monitor] {e}")
+        logger.error(f"[Monitor] {e}", exc_info=True)
+        bot_status["error_count"] += 1
 
 # ==========================================
-# PART 12: /start COMMAND
+# PART 12: START COMMAND
 # ==========================================
 async def start_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command"""
     try:
-        premium_start_text = (
-            "```\n"
-            "╔══════════════════════════════════════╗\n"
-            "          🐱 BELUGA AI BOT 🐱          \n"
-            "╚══════════════════════════════════════╝\n"
-            "```\n\n"
-            "💬 **Smart Telegram Chat Bot**\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "⚡ **Features:**\n"
-            "• AI Chat (mention 'beluga')\n"
-            "• `/search` (Google + screenshots)\n"
-            "• `/quiz` (Live trivia)\n"
-            "• `/gay` & `/couple` (Fun commands)\n"
-            "• 24/7 Active\n\n"
-            "👋 *Start chatting now!*"
-        )
+        text = """```
+╔══════════════════════════════════════╗
+          🐱 BELUGA AI BOT 🐱          
+╚══════════════════════════════════════╝
+```
+
+💬 **Smart Telegram Chat Bot**
+
+⚡ **Features:**
+• AI Chat (mention 'beluga')
+• `/search` (Wikipedia + screenshots)
+• `/quiz` (Live trivia)
+• `/gay` & `/couple` (Fun commands)
+• 24/7 Active
+
+👋 *Start chatting now!*"""
         if u.message:
-            await u.message.reply_text(premium_start_text, parse_mode=ParseMode.MARKDOWN)
+            await u.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+            bot_status["message_count"] += 1
     except Exception as e:
-        logger.error(f"[Start Handler] {e}")
+        logger.error(f"[Start] {e}", exc_info=True)
 
 # ==========================================
-# PART 13: GLOBAL ERROR HANDLER (ENHANCED)
+# PART 13: ADVANCED GLOBAL ERROR HANDLER
 # ==========================================
-import traceback
-
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Handle all errors gracefully"""
     err = context.error
     
-    # Invalid token - critical
-    if isinstance(err, InvalidToken):
-        logger.critical("❌ INVALID BOT TOKEN! Check your BOT_TOKEN environment variable.")
-        return
-    
-    # Network errors - ignore
+    # Network errors - silent
     if isinstance(err, (NetworkError, TimedOut, RetryAfter)):
         logger.debug(f"[Network] {type(err).__name__}")
         return
     
-    # Permission errors - ignore
+    # Permission errors - silent
     if isinstance(err, (Forbidden, BadRequest)):
         logger.debug(f"[Permission] {type(err).__name__}")
         return
     
-    # Log other errors
+    # Invalid token - critical
+    if isinstance(err, InvalidToken):
+        logger.critical("❌ INVALID BOT TOKEN!")
+        bot_status["running"] = False
+        return
+    
+    # Log other errors with traceback
     try:
         tb = "".join(traceback.format_exception(type(err), err, err.__traceback__))
-        logger.error(f"[ERROR] {tb}")
+        logger.error(f"[ERROR]\n{tb}")
+        bot_status["error_count"] += 1
     except:
         logger.error(f"[ERROR] {err}")
 
 # ==========================================
-# PART 14: MAIN RUNNER (NO PORT BINDING)
+# PART 14: MAIN RUNNER WITH HTTP SERVER
 # ==========================================
-def main():
-    logger.info("=" * 50)
+async def main():
+    """Start bot and HTTP server"""
+    logger.info("=" * 60)
     logger.info("🐱 BELUGA BOT STARTING")
-    logger.info("=" * 50)
+    logger.info("=" * 60)
     
-    # Build app
-    app = TGApp.builder().token(BOT_TOKEN).build()
-    
-    # Add handlers
-    app.add_handler(CommandHandler("start", start_handler))
-    app.add_handler(CommandHandler("search", search_handler))
-    app.add_handler(CommandHandler("quiz", quiz_handler))
-    app.add_handler(CommandHandler(["gay", "couple"], fun_dispatcher))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, monitor))
-    app.add_error_handler(error_handler)
-
-    logger.info("✅ Bot handlers initialized")
-    logger.info("🔄 Starting polling (no port binding needed)...")
+    http_runner = None
     
     try:
-        app.run_polling(
+        # Start HTTP server
+        http_runner = await start_http_server(HTTP_PORT)
+        
+        # Build application
+        app = TGApp.builder().token(BOT_TOKEN).build()
+        
+        # Add handlers
+        app.add_handler(CommandHandler("start", start_handler))
+        app.add_handler(CommandHandler("search", search_handler))
+        app.add_handler(CommandHandler("quiz", quiz_handler))
+        app.add_handler(CommandHandler(["gay", "couple"], fun_dispatcher))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, monitor))
+        
+        # Error handler
+        app.add_error_handler(error_handler)
+        
+        logger.info("✅ Handlers registered")
+        logger.info("🔄 Starting polling...")
+        
+        # Mark as running
+        bot_status["running"] = True
+        
+        # Run polling
+        await app.run_polling(
             drop_pending_updates=True,
             allowed_updates=Update.ALL_TYPES,
             close_loop=False
         )
+    
     except KeyboardInterrupt:
         logger.info("🛑 Bot stopped by user")
-    except InvalidToken as e:
-        logger.critical(f"❌ FATAL: Invalid token - {e}")
-        exit(1)
+        bot_status["running"] = False
+    except InvalidToken:
+        logger.critical("❌ FATAL: Invalid token")
+        bot_status["running"] = False
+        sys.exit(1)
     except Exception as e:
-        logger.critical(f"❌ FATAL: {e}")
-        exit(1)
+        logger.critical(f"❌ FATAL: {e}", exc_info=True)
+        bot_status["running"] = False
+        sys.exit(1)
+    finally:
+        if http_runner:
+            await http_runner.cleanup()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
