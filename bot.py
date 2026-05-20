@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from telegram import Update, ReactionTypeEmoji
 from telegram.ext import Application as TGApp, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.constants import ParseMode
-from telegram.error import NetworkError, TimedOut, Forbidden, BadRequest, RetryAfter, TelegramError
+from telegram.error import NetworkError, TimedOut, Forbidden, BadRequest, RetryAfter, TelegramError, InvalidToken
 
 # ==========================================
 # PART 1: SYSTEM CONFIG & DATABASE
@@ -21,6 +21,18 @@ logger = logging.getLogger("BelugaEngine")
 DATA_FILE = "beluga_brain.json"
 OR_KEY    = os.environ.get("OPENROUTER_API_KEY")
 GROQ_KEY  = os.environ.get("GROQ_API_KEY")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+
+# Validate token at startup
+if not BOT_TOKEN:
+    logger.critical("❌ BOT_TOKEN is missing! Please set it in Render environment variables.")
+    print("❌ FATAL: BOT_TOKEN environment variable not found!")
+    exit(1)
+
+if len(BOT_TOKEN) < 20:
+    logger.critical("❌ BOT_TOKEN looks invalid (too short)")
+    print("❌ FATAL: BOT_TOKEN appears to be invalid!")
+    exit(1)
 
 def load_db():
     if os.path.exists(DATA_FILE):
@@ -48,7 +60,7 @@ async def try_react(bot, chat_id, message_id, emoji_char=None):
             reaction=[ReactionTypeEmoji(emoji=emoji_char)]
         )
     except Exception as e:
-        logger.debug(f"[Reaction Skipped] Chat: {chat_id}, Error: {e}")
+        logger.debug(f"[Reaction Skipped] {e}")
 
 # ==========================================
 # PART 2: BELUGA PERSONA PROMPTS
@@ -99,12 +111,12 @@ async def _call_openrouter(system: str, user_text: str) -> str | None:
                   "messages": [{"role": "system", "content": system},
                                 {"role": "user",   "content": user_text}],
                   "max_tokens": 512},
-            timeout=12
+            timeout=10
         )
         if r.status_code != 200: return None
         return r.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        logger.error(f"[OpenRouter Error] {e}"); return None
+        logger.debug(f"[OpenRouter] {e}"); return None
 
 async def _call_groq(system: str, user_text: str) -> str | None:
     if not GROQ_KEY: return None
@@ -116,12 +128,12 @@ async def _call_groq(system: str, user_text: str) -> str | None:
                   "messages": [{"role": "system", "content": system},
                                 {"role": "user",   "content": user_text}],
                   "max_tokens": 512},
-            timeout=12
+            timeout=10
         )
         if r.status_code != 200: return None
         return r.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        logger.error(f"[Groq Error] {e}"); return None
+        logger.debug(f"[Groq] {e}"); return None
 
 async def get_ai_response(system: str, user_text: str, fallback_msg: str) -> str:
     try:
@@ -132,7 +144,7 @@ async def get_ai_response(system: str, user_text: str, fallback_msg: str) -> str
         if reply: return reply
         return fallback_msg
     except Exception as e:
-        logger.error(f"[AI Response Error] {e}")
+        logger.debug(f"[AI Response] {e}")
         return fallback_msg
 
 async def ask_ai_for_emoji(user_text: str) -> str:
@@ -145,8 +157,7 @@ async def ask_ai_for_emoji(user_text: str) -> str:
             emojis = re.findall(r'[^\w\s,.:!?\'\"()\-]+', res)
             if emojis: return emojis[0][0]
         return "😼"
-    except Exception as e:
-        logger.error(f"[Emoji Error] {e}")
+    except:
         return "😼"
 
 # ==========================================
@@ -185,7 +196,7 @@ def scrape_google(query: str) -> str:
             return "\n\n".join(snippets)
         return "No results found on Google. 🐾"
     except Exception as e:
-        logger.error(f"[Google Scrape Error] {e}")
+        logger.debug(f"[Google Scrape] {e}")
         return None
 
 # ==========================================
@@ -210,8 +221,7 @@ async def get_website_screenshot(url: str) -> str:
                 continue
         
         return None
-    except Exception as e:
-        logger.error(f"[Screenshot Error] {e}")
+    except:
         return None
 
 # ==========================================
@@ -379,8 +389,11 @@ async def fun_dispatcher(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
         await u.message.reply_text(res, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
-        logger.error(f"[Fun Dispatcher Error] {e}")
-        await u.message.reply_text("Meow! Something went wrong! 😿🐾")
+        logger.error(f"[Fun Dispatcher] {e}")
+        try:
+            await u.message.reply_text("Meow! Something went wrong! 😿🐾")
+        except:
+            pass
 
 # ==========================================
 # PART 9: IMPROVED /search COMMAND
@@ -403,11 +416,9 @@ async def search_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await try_react(c.bot, cid, mid, "🔍")
         await c.bot.send_chat_action(cid, "typing")
         
-        # Check if it's a URL
         is_url = query.startswith(("http://", "https://", "www.", "t.me", "x.com", "reddit.com", "github.com"))
         
         if is_url:
-            # Website screenshot mode
             status_msg = await u.message.reply_text("📸 Capturing website screenshot... 🐾")
             screenshot_url = await get_website_screenshot(query)
             
@@ -419,14 +430,12 @@ async def search_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
                         parse_mode=ParseMode.MARKDOWN
                     )
                     await status_msg.delete()
-                except Exception as e:
-                    logger.error(f"[Screenshot Send Error] {e}")
+                except:
                     await status_msg.edit_text("😿 Couldn't capture that website. Try another one!")
             else:
                 await status_msg.edit_text("🐾 Website is blocking screenshots. Try another URL!")
         
         else:
-            # Google search mode
             status_msg = await u.message.reply_text("🔎 Searching Google... 🐾")
             
             loop = asyncio.get_running_loop()
@@ -441,7 +450,7 @@ async def search_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             else:
                 await status_msg.edit_text(f"Meow! Couldn't find results for '{query}'. Try another search! 🐱")
     except Exception as e:
-        logger.error(f"[Search Handler Error] {e}")
+        logger.error(f"[Search Handler] {e}")
         try:
             await u.message.reply_text("Meow! Search error occurred! 😿🐾")
         except:
@@ -483,8 +492,7 @@ ONLY output JSON, no markdown."""
                 is_anonymous=False,
                 explanation="Beluga knows everything! 🐾"
             )
-        except Exception as e:
-            logger.error(f"[Quiz Parse Error] {e}")
+        except:
             await c.bot.send_poll(
                 chat_id=cid,
                 question="🐱 Which animal has a sandpaper-like tongue?",
@@ -494,7 +502,7 @@ ONLY output JSON, no markdown."""
                 is_anonymous=False
             )
     except Exception as e:
-        logger.error(f"[Quiz Handler Error] {e}")
+        logger.error(f"[Quiz Handler] {e}")
 
 # ==========================================
 # PART 11: IMPROVED MONITOR (RELIABLE NAME DETECTION)
@@ -505,7 +513,6 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
     try:
         uid, cid, now = u.effective_user.id, str(u.effective_chat.id), datetime.now()
         
-        # Spam check
         if uid not in spam_tracker: spam_tracker[uid] = []
         spam_tracker[uid] = [t for t in spam_tracker[uid] if now - t < timedelta(seconds=2)]
         spam_tracker[uid].append(now)
@@ -514,32 +521,25 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
             except: pass
             return
         
-        # Track active users
         if cid not in db["seen"]: db["seen"][cid] = {}
         db["seen"][cid][str(uid)] = {"id": uid, "un": u.effective_user.username, "n": u.effective_user.first_name}
         
-        # Update message count
         if "counts" not in db: db["counts"] = {}
         db["counts"][cid] = db["counts"].get(cid, 0) + 1
         save_db()
         
-        # Every 6th message reaction
         if db["counts"][cid] % 6 == 0:
             await try_react(c.bot, cid, u.message.message_id)
         
-        # ========== IMPROVED NAME DETECTION & REPLY HANDLING ==========
         text = (u.message.text or "").lower().strip()
         message_text = u.message.text or ""
         
-        # CHECK 1: Beluga name mentioned anywhere in message
         beluga_mentioned = "beluga" in text
         
-        # CHECK 2: Reply to bot's message
         is_reply_to_bot = False
         if u.message.reply_to_message and u.message.reply_to_message.from_user:
             is_reply_to_bot = (u.message.reply_to_message.from_user.id == c.bot.id)
         
-        # CHECK 3: @belugabot mention
         bot_username_mentioned = False
         if u.message.entities:
             for entity in u.message.entities:
@@ -549,15 +549,12 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
                         bot_username_mentioned = True
                         break
         
-        # RESPOND if ANY condition is true
         if beluga_mentioned or is_reply_to_bot or bot_username_mentioned:
             await c.bot.send_chat_action(chat_id=cid, action="typing")
             
-            # Get emoji reaction
             recommended_emoji = await ask_ai_for_emoji(message_text)
             await try_react(c.bot, cid, u.message.message_id, recommended_emoji)
             
-            # Generate response
             response = await get_ai_response(
                 CHAT_PROMPT,
                 message_text,
@@ -566,7 +563,7 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
             
             await u.message.reply_text(response)
     except Exception as e:
-        logger.error(f"[Monitor Error] {e}")
+        logger.error(f"[Monitor] {e}")
 
 # ==========================================
 # PART 12: /start COMMAND
@@ -592,7 +589,7 @@ async def start_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         if u.message:
             await u.message.reply_text(premium_start_text, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
-        logger.error(f"[Start Handler Error] {e}")
+        logger.error(f"[Start Handler] {e}")
 
 # ==========================================
 # PART 13: GLOBAL ERROR HANDLER (ENHANCED)
@@ -602,14 +599,19 @@ import traceback
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     err = context.error
     
-    # Ignore network-related errors
-    if isinstance(err, (NetworkError, TimedOut, RetryAfter)):
-        logger.warning(f"[Network Error - Ignored] {type(err).__name__}")
+    # Invalid token - critical
+    if isinstance(err, InvalidToken):
+        logger.critical("❌ INVALID BOT TOKEN! Check your BOT_TOKEN environment variable.")
         return
     
-    # Ignore permission errors
+    # Network errors - ignore
+    if isinstance(err, (NetworkError, TimedOut, RetryAfter)):
+        logger.debug(f"[Network] {type(err).__name__}")
+        return
+    
+    # Permission errors - ignore
     if isinstance(err, (Forbidden, BadRequest)):
-        logger.warning(f"[Permission Error - Ignored] {type(err).__name__}")
+        logger.debug(f"[Permission] {type(err).__name__}")
         return
     
     # Log other errors
@@ -620,36 +622,41 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"[ERROR] {err}")
 
 # ==========================================
-# PART 14: MAIN RUNNER
+# PART 14: MAIN RUNNER (NO PORT BINDING)
 # ==========================================
 def main():
-    token = os.environ.get("BOT_TOKEN")
-    if not token:
-        print("❌ BOT_TOKEN missing! Set it in environment variables.")
-        return
-
-    app = TGApp.builder().token(token).build()
+    logger.info("=" * 50)
+    logger.info("🐱 BELUGA BOT STARTING")
+    logger.info("=" * 50)
     
-    # Command handlers
+    # Build app
+    app = TGApp.builder().token(BOT_TOKEN).build()
+    
+    # Add handlers
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("search", search_handler))
     app.add_handler(CommandHandler("quiz", quiz_handler))
     app.add_handler(CommandHandler(["gay", "couple"], fun_dispatcher))
-    
-    # Message handler (includes all monitoring + AI chat)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, monitor))
-    
-    # Error handler
     app.add_error_handler(error_handler)
 
-    print("✅ Beluga Bot Online! Polling started...")
+    logger.info("✅ Bot handlers initialized")
+    logger.info("🔄 Starting polling (no port binding needed)...")
+    
     try:
-        app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+        app.run_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,
+            close_loop=False
+        )
     except KeyboardInterrupt:
-        print("🛑 Bot stopped by user")
+        logger.info("🛑 Bot stopped by user")
+    except InvalidToken as e:
+        logger.critical(f"❌ FATAL: Invalid token - {e}")
+        exit(1)
     except Exception as e:
-        logger.error(f"[FATAL] {e}")
-        print(f"❌ Fatal error: {e}")
+        logger.critical(f"❌ FATAL: {e}")
+        exit(1)
 
 if __name__ == "__main__":
     main()
