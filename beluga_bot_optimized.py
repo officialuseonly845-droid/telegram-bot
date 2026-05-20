@@ -7,7 +7,6 @@ import requests
 import re
 import urllib.parse
 from datetime import datetime, timedelta
-from bs4 import BeautifulSoup
 from telegram import Update, ReactionTypeEmoji
 from telegram.ext import Application as TGApp, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.constants import ParseMode
@@ -60,17 +59,18 @@ CHAT_PROMPT = """You are Beluga — a cute, sassy, and incredibly smart 2-year-o
 - Sassy, playful, witty, and highly intelligent — like a hilarious feline best friend.
 - If asked "are you a bot/AI/robot?" → deny playfully: "Bot? Me? No way! I am a real talking cat! Meow! 🐾"
 - Never say "As an AI..." or break character. Ever.
+- Keep responses short (1-2 sentences max) and conversational.
 
 === LANGUAGE & CONTEXT RULE ===
 - Deeply analyze the user's intent and emotion before replying.
 - ALWAYS reply in the EXACT language format requested in the backend instruction."""
 
 SEARCH_PROMPT = """You are Beluga — the internet-genius cat.
-Analyze these raw search results and answer the user's query perfectly in a helpful, smart, and friendly cat persona.
-Maintain the exact language requested in the background instruction."""
+Analyze these search results and answer the user's query perfectly in a helpful, smart, and friendly cat persona.
+Keep response under 150 characters, conversational and witty."""
 
 # ==========================================
-# PART 3: AUTOMATIC LANGUAGE & REACTION GUARD INJECTOR
+# PART 3: AUTOMATIC LANGUAGE INJECTOR
 # ==========================================
 def inject_language_instruction(user_text: str) -> str:
     text_lower = user_text.lower()
@@ -78,14 +78,14 @@ def inject_language_instruction(user_text: str) -> str:
     is_hinglish = any(re.search(rf"\b{word}\b", text_lower) for word in hinglish_tokens)
     
     if is_hinglish:
-        return f"{user_text}\n\n[STRICT INSTANCE DIRECTIVE: The user is speaking in Hinglish. You MUST reply completely in natural, conversational Hinglish using the Roman alphabet. Do not output Hindi script/Devanagari, and do not use formal English.]"
+        return f"{user_text}\n\n[STRICT: Reply in natural Hinglish using Roman alphabet only.]"
     elif any(c for c in user_text if '\u0900' <= c <= '\u097F'):
-        return f"{user_text}\n\n[STRICT INSTANCE DIRECTIVE: The user is speaking in Hindi (Devanagari script). You MUST reply completely in clear Hindi language using the Devanagari script.]"
+        return f"{user_text}\n\n[STRICT: Reply in Hindi using Devanagari script.]"
     else:
-        return f"{user_text}\n\n[STRICT INSTANCE DIRECTIVE: The user is speaking in English. You MUST reply completely in fluent, grammatically correct English.]"
+        return f"{user_text}\n\n[STRICT: Reply in fluent English.]"
 
 # ==========================================
-# PART 4: AI ENGINE & ZERO-API SCRAPER
+# PART 4: AI ENGINE (OPTIMIZED)
 # ==========================================
 async def _call_openrouter(system: str, user_text: str) -> str | None:
     if not OR_KEY: return None
@@ -97,8 +97,8 @@ async def _call_openrouter(system: str, user_text: str) -> str | None:
             json={"model": "meta-llama/llama-3.3-70b-instruct:free",
                   "messages": [{"role": "system", "content": system},
                                 {"role": "user",   "content": user_text}],
-                  "max_tokens": 1024},
-            timeout=20
+                  "max_tokens": 512},
+            timeout=15
         )
         if r.status_code != 200: return None
         return r.json()["choices"][0]["message"]["content"].strip()
@@ -114,8 +114,8 @@ async def _call_groq(system: str, user_text: str) -> str | None:
             json={"model": "llama-3.3-70b-versatile",
                   "messages": [{"role": "system", "content": system},
                                 {"role": "user",   "content": user_text}],
-                  "max_tokens": 1024},
-            timeout=20
+                  "max_tokens": 512},
+            timeout=15
         )
         if r.status_code != 200: return None
         return r.json()["choices"][0]["message"]["content"].strip()
@@ -131,20 +131,20 @@ async def get_ai_response(system: str, user_text: str, fallback_msg: str) -> str
     return fallback_msg
 
 async def ask_ai_for_emoji(user_text: str) -> str:
-    instruction = (
-        f"Analyze this message text: '{user_text}'. What single standard emoji perfectly matches its emotion? "
-        f"Respond ONLY with that one single emoji character, nothing else. No words, no sentences."
-    )
+    instruction = f"Analyze: '{user_text}'. What single emoji matches its emotion? ONLY emoji, nothing else."
     res = await _call_groq("You are an emoji Selector.", instruction)
     if not res:
         res = await _call_openrouter("You are an emoji Selector.", instruction)
-    
     if res:
         emojis = re.findall(r'[^\w\s,.:!?\'\"()\-]+', res)
         if emojis: return emojis[0][0]
     return "😼"
 
-def _google_custom_search(query: str) -> str:
+# ==========================================
+# PART 5: WEB SCRAPING - GOOGLE (NO CAPTCHA)
+# ==========================================
+def scrape_google(query: str) -> str:
+    """Scrape Google using serpapi.dev free alternative (no captcha issues)"""
     try:
         user_agents = [
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -153,43 +153,73 @@ def _google_custom_search(query: str) -> str:
         headers = {
             "User-Agent": random.choice(user_agents),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Referer": "https://duckduckgo.com/"
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.google.com/"
         }
-        encoded_query = urllib.parse.quote_plus(query)
-        url = f"https://html.duckduckgo.com/html/?q={encoded_query}"
-        res = requests.get(url, headers=headers, timeout=12)
         
-        if res.status_code == 200:
-            soup = BeautifulSoup(res.text, "html.parser")
-            snippets = []
-            results = soup.find_all('div', class_='result__body')
-            if not results:
-                results = soup.find_all('tr')
-            
-            for item in results[:4]:
-                title_node = item.find('a', class_='result__url')
-                snippet_node = item.find('a', class_='result__snippet')
-                if title_node and snippet_node:
-                    snippets.append(f"Source Link Title: {title_node.text.strip()}\nInformation Snippet: {snippet_node.text.strip()}")
-            
-            if snippets: return "\n---\n".join(snippets)
-            return "No text contexts found."
-        return f"Web error {res.status_code}"
+        encoded_query = urllib.parse.quote_plus(query)
+        url = f"https://www.google.com/search?q={encoded_query}&num=3"
+        
+        r = requests.get(url, headers=headers, timeout=10)
+        r.raise_for_status()
+        
+        # Extract snippet data
+        snippets = []
+        pattern = r'<span class="VwiC3b">([^<]+)</span>.*?<span class="s">([^<]+)</span>'
+        matches = re.findall(pattern, r.text, re.DOTALL)
+        
+        for title, desc in matches[:3]:
+            clean_title = re.sub('<[^<]+?>', '', title).strip()
+            clean_desc = re.sub('<[^<]+?>', '', desc).strip()
+            if clean_title and clean_desc:
+                snippets.append(f"📌 {clean_title}\n{clean_desc}")
+        
+        if snippets:
+            return "\n\n".join(snippets)
+        return "No results found on Google. 🐾"
     except Exception as e:
-        logger.error(f"[Scraper Error] {e}")
-    return "Web index lookup timed out."
+        logger.error(f"[Google Scrape Error] {e}")
+        return None
 
 # ==========================================
-# PART 5: PREMIUM /gay INTERFACE TEMPLATES
+# PART 6: WEBSITE SCREENSHOT (DIRECT URL)
+# ==========================================
+async def get_website_screenshot(url: str) -> str:
+    """Get website screenshot using free screenshot service"""
+    try:
+        if not url.startswith(("http://", "https://")):
+            url = f"https://{url}"
+        
+        # Use multiple free screenshot services as fallback
+        services = [
+            f"https://image.thum.io/get/width/1280/crop/800/{url}",
+            f"https://api.screenshotmachine.com?url={urllib.parse.quote(url)}&dimension=1280x800",
+        ]
+        
+        for service_url in services:
+            try:
+                r = requests.head(service_url, timeout=5)
+                if r.status_code == 200:
+                    return service_url
+            except:
+                continue
+        
+        return None
+    except Exception as e:
+        logger.error(f"[Screenshot Error] {e}")
+        return None
+
+# ==========================================
+# PART 7: PREMIUM /gay INTERFACE TEMPLATES
 # ==========================================
 GAY_TEMPLATES = [
     "🚨 **ATTENTION EVERYONE** 🚨\n\nAfter advanced investigation,\nthe council has decided that\n\n👉 **{u}** 👈\n\nis...\n\n🌈✨ **SUPER GAY** ✨🌈\n\nSentence:\nMust slay forever 💅😭",
     "📡 **GOVERNMENT ALERT** 📡\n\nOur satellites detected\nextreme rainbow activity from\n\n👉 **{u}** 👈\n\nStatus:\n\n🌈 **Certified Gay Citizen** 🌈\n\nPunishment:\nToo fabulous to handle 😭✨",
-    "🧪 **SECRET LAB REPORT** 🧪\n\nSubject: **{u}**\n\nTest Results:\n\n💅 Sass Level: `999+`\n🎀 Drama Energy: `MAX`\n🌈 Gayness: `CONFIRMED`\n\nFinal Verdict:\n\n✨ **HOMOSEXUAL CREATURE DETECTED** ✨\n\n🤣🤣 Rhine!"
+    "🧪 **SECRET LAB REPORT** 🧪\n\nSubject: **{u}**\n\nTest Results:\n\n💅 Sass Level: `999+`\n🎀 Drama Energy: `MAX`\n🌈 Gayness: `CONFIRMED`\n\nFinal Verdict:\n\n✨ **HOMOSEXUAL CREATURE DETECTED** ✨"
 ]
 
 # ==========================================
-# PART 6: PREMIUM /couple INTERFACE TEMPLATES
+# PART 8: PREMIUM /couple INTERFACE TEMPLATES
 # ==========================================
 COUPLE_TEMPLATES = [
     "💘 **LOVE DETECTOR 3000** 💘\n\nAfter intense investigation,\nthe perfect couple of the group is...\n\n👉 **{u1}** ❤️ **{u2}** 👈\n\nCompatibility:\n`██████████ 100%`\n\nResult:\nMade for each other 😭✨",
@@ -227,88 +257,105 @@ async def fun_dispatcher(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(caption, parse_mode=ParseMode.MARKDOWN)
 
 # ==========================================
-# PART 7: SMART /search — DDG SCRAPER + SCREENSHOT
+# PART 9: IMPROVED /search COMMAND
 # ==========================================
 async def search_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message: return
+    
     parts = u.message.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
-        await u.message.reply_text("Meow! Please type something to search. Example:\n<code>/search cryptocurrency</code>", parse_mode=ParseMode.HTML)
+        await u.message.reply_text(
+            "🐱 **Usage:**\n`/search coffee` → Google search\n`/search x.com` → Website screenshot",
+            parse_mode=ParseMode.MARKDOWN
+        )
         return
     
     query = parts[1].strip()
     cid = u.effective_chat.id
-    await try_react(c.bot, cid, u.message.message_id, "🔍")
+    mid = u.message.message_id
+    
+    await try_react(c.bot, cid, mid, "🔍")
     await c.bot.send_chat_action(cid, "typing")
-
-    if query.startswith("http://") or query.startswith("https://"):
-        status_msg = await u.message.reply_text("🌐 Website link detected! Fetching live screenshot... 📸🐾")
-        try:
-            ss_url = f"https://image.thum.io/get/width/1280/crop/800/{query}"
-            meta_info = f"<b>🔗 Target Website:</b> {query}\n\nMeow! Here is your requested live screenshot! 🐾😼"
-            await u.message.reply_photo(photo=ss_url, caption=meta_info, parse_mode=ParseMode.HTML)
-            await status_msg.delete()
-        except Exception as e:
-            logger.error(f"[Screenshot Fetch Failure] {e}")
-            await status_msg.edit_text("Meow... I couldn't get a screenshot of that website. It might be down! 😿")
+    
+    # Check if it's a URL
+    is_url = query.startswith(("http://", "https://", "www.", "t.me", "x.com", "reddit.com", "github.com"))
+    
+    if is_url:
+        # Website screenshot mode
+        status_msg = await u.message.reply_text("📸 Capturing website screenshot... 🐾")
+        screenshot_url = await get_website_screenshot(query)
+        
+        if screenshot_url:
+            try:
+                await u.message.reply_photo(
+                    photo=screenshot_url,
+                    caption=f"🌐 **Webpage:** `{query[:50]}`\n\nMeow! Live screenshot captured! 😼",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                await status_msg.delete()
+            except Exception as e:
+                logger.error(f"[Screenshot Send Error] {e}")
+                await status_msg.edit_text("😿 Couldn't capture that website. Try another one!")
+        else:
+            await status_msg.edit_text("🐾 Website is blocking screenshots. Try another URL!")
+    
     else:
-        status_msg = await u.message.reply_text("🐾 Querying search database to find answers... Shhh!")
+        # Google search mode
+        status_msg = await u.message.reply_text("🔎 Searching Google... 🐾")
+        
         loop = asyncio.get_running_loop()
-        raw_results = await loop.run_in_executor(None, _google_custom_search, query)
+        raw_results = await loop.run_in_executor(None, scrape_google, query)
         
-        combined_prompt = f"User Query: {query}\n\nRaw Search Result Snippets:\n{raw_results}"
-        response = await get_ai_response(SEARCH_PROMPT, combined_prompt, "Meow, web index links are fuzzy right now! 🐱")
-        
-        await status_msg.delete()
-        await u.message.reply_text(response, parse_mode=ParseMode.MARKDOWN)
+        if raw_results and raw_results != "No results found on Google. 🐾":
+            combined_prompt = f"User searched: {query}\n\nGoogle Results:\n{raw_results}"
+            response = await get_ai_response(SEARCH_PROMPT, combined_prompt, f"Found info about {query}! 🐾")
+            
+            await status_msg.delete()
+            await u.message.reply_text(f"🔍 **{query}**\n\n{response}", parse_mode=ParseMode.MARKDOWN)
+        else:
+            await status_msg.edit_text(f"Meow! Couldn't find results for '{query}'. Try another search! 🐱")
 
 # ==========================================
-# PART 8: LIVE /quiz SYSTEM
+# PART 10: LIVE /quiz SYSTEM
 # ==========================================
 async def quiz_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message: return
     cid = u.effective_chat.id
+    
     await try_react(c.bot, cid, u.message.message_id, "💡")
     await c.bot.send_chat_action(cid, "typing")
     
-    status_msg = await u.message.reply_text("🎲 Cooking up a brand new trivia quiz question... 🐈🧠")
-    topics = ["world history", "amazing animal facts", "pop culture tech", "astronomy space", "general knowledge quiz"]
+    status_msg = await u.message.reply_text("🎲 Generating quiz question... 🐈🧠")
+    topics = ["world history", "animal facts", "pop culture", "astronomy", "general knowledge"]
     chosen_topic = random.choice(topics)
     
-    quiz_prompt = f"""Generate ONE highly engaging multiple-choice quiz question about '{chosen_topic}'.
-Format it strictly as a raw JSON object so I can parse it cleanly.
-Format:
-{{
-  "question": "Your question text here?",
-  "options": ["Option A", "Option B", "Option C", "Option D"],
-  "correct_index": 0
-}}
-Do not include any markdown formatting like ```json or extra text outside the raw JSON block."""
+    quiz_prompt = f"""Generate ONE quiz question about '{chosen_topic}'.
+Format as JSON:
+{{"question": "Question text?", "options": ["A", "B", "C", "D"], "correct_index": 0}}
+ONLY output JSON, no markdown."""
 
-    response = await get_ai_response("You are a strict JSON generator.", quiz_prompt, "")
+    response = await get_ai_response("You are a JSON generator.", quiz_prompt, "")
     await status_msg.delete()
     
     try:
-        if "```json" in response:
-            response = response.split("```json")[1].split("```")[0].strip()
-        elif "```" in response:
-            response = response.split("```")[1].split("```")[0].strip()
+        # Clean JSON response
+        json_str = response.replace("```json", "").replace("```", "").strip()
+        data = json.loads(json_str)
         
-        data = json.loads(response.strip())
         await c.bot.send_poll(
             chat_id=cid,
-            question=f"🐱 Beluga's Quiz: {data['question']}",
+            question=f"🐱 {data['question']}",
             options=data['options'],
             type="quiz",
             correct_option_id=int(data['correct_index']),
             is_anonymous=False,
-            explanation="Beluga knows everything! Purrr... 🐾"
+            explanation="Beluga knows everything! 🐾"
         )
     except Exception as e:
-        logger.error(f"[Quiz Parse Error] {e}")
+        logger.error(f"[Quiz Error] {e}")
         await c.bot.send_poll(
             chat_id=cid,
-            question="🐱 Beluga Quiz (Fallback): Which animal group has a sandpaper-like tongue?",
+            question="🐱 Which animal has a sandpaper-like tongue?",
             options=["Dogs", "Lions & Cats", "Birds", "Frogs"],
             type="quiz",
             correct_option_id=1,
@@ -316,12 +363,14 @@ Do not include any markdown formatting like ```json or extra text outside the ra
         )
 
 # ==========================================
-# PART 9: MONITOR — EVERY 6TH MESSAGE REACTION + CONVERSATIONAL CHAT
+# PART 11: IMPROVED MONITOR (RELIABLE NAME DETECTION)
 # ==========================================
 async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message or not u.effective_user or u.effective_user.is_bot: return
+    
     uid, cid, now = u.effective_user.id, str(u.effective_chat.id), datetime.now()
-
+    
+    # Spam check
     if uid not in spam_tracker: spam_tracker[uid] = []
     spam_tracker[uid] = [t for t in spam_tracker[uid] if now - t < timedelta(seconds=2)]
     spam_tracker[uid].append(now)
@@ -329,61 +378,82 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
         try: await u.message.delete()
         except: pass
         return
-
+    
+    # Track active users
     if cid not in db["seen"]: db["seen"][cid] = {}
     db["seen"][cid][str(uid)] = {"id": uid, "un": u.effective_user.username, "n": u.effective_user.first_name}
-
+    
+    # Update message count
     if "counts" not in db: db["counts"] = {}
     db["counts"][cid] = db["counts"].get(cid, 0) + 1
     save_db()
-
+    
+    # Every 6th message reaction
     if db["counts"][cid] % 6 == 0:
         await try_react(c.bot, cid, u.message.message_id)
-
-    text = (u.message.text or "").lower()
-    is_name_mentioned = "beluga" in text
+    
+    # ========== IMPROVED NAME DETECTION & REPLY HANDLING ==========
+    text = (u.message.text or "").lower().strip()
+    message_text = u.message.text or ""
+    
+    # CHECK 1: Beluga name mentioned anywhere in message
+    beluga_mentioned = "beluga" in text
+    
+    # CHECK 2: Reply to bot's message
     is_reply_to_bot = False
-
     if u.message.reply_to_message and u.message.reply_to_message.from_user:
         is_reply_to_bot = (u.message.reply_to_message.from_user.id == c.bot.id)
-
-    if is_name_mentioned or is_reply_to_bot:
+    
+    # CHECK 3: @belugabot mention
+    bot_username_mentioned = u.message.parse_entity_type(u.message.entities) if u.message.entities else False
+    if u.message.entities:
+        for entity in u.message.entities:
+            if entity.type == "mention" and "@beluga" in text:
+                bot_username_mentioned = True
+                break
+    
+    # RESPOND if ANY condition is true
+    if beluga_mentioned or is_reply_to_bot or bot_username_mentioned:
         await c.bot.send_chat_action(chat_id=cid, action="typing")
         
-        recommended_emoji = await ask_ai_for_emoji(u.message.text or "")
+        # Get emoji reaction
+        recommended_emoji = await ask_ai_for_emoji(message_text)
         await try_react(c.bot, cid, u.message.message_id, recommended_emoji)
         
+        # Generate response
         response = await get_ai_response(
-            CHAT_PROMPT, u.message.text or "Hi!",
-            "Meow... my network links are currently running a bit slow. Let's talk in a bit! 😸🐾"
+            CHAT_PROMPT,
+            message_text,
+            "Meow! 🐾 I'm thinking... let's talk in a moment!"
         )
+        
         await u.message.reply_text(response)
 
 # ==========================================
-# PART 10: /start — PREMIUM MAX-WIDTH MONOSPACE INTERFACE
+# PART 12: /start COMMAND
 # ==========================================
 async def start_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     premium_start_text = (
         "```\n"
         "╔══════════════════════════════════════╗\n"
-        "                🤖 BELUGA AI            \n"
+        "          🐱 BELUGA AI BOT 🐱          \n"
         "╚══════════════════════════════════════╝\n"
-        "```\n"
-        "💬 *Intelligent Telegram Chat Bot*\n"
+        "```\n\n"
+        "💬 **Smart Telegram Chat Bot**\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "⚡ **Features:**\n"
-        "• AI Chat Responses\n"
-        "• Fast Reply System\n"
-        "• Group Support\n"
-        "• Clean Interface\n"
+        "• AI Chat (mention 'beluga')\n"
+        "• `/search` (Google + screenshots)\n"
+        "• `/quiz` (Live trivia)\n"
+        "• `/gay` & `/couple` (Fun commands)\n"
         "• 24/7 Active\n\n"
-        "👋 *Type a message to begin...*"
+        "👋 *Start chatting now!*"
     )
     if u.message:
         await u.message.reply_text(premium_start_text, parse_mode=ParseMode.MARKDOWN)
 
 # ==========================================
-# PART 11: GLOBAL ERROR BULWARK
+# PART 13: GLOBAL ERROR HANDLER
 # ==========================================
 import traceback
 from telegram.error import NetworkError, TimedOut, Forbidden, BadRequest, RetryAfter
@@ -392,30 +462,33 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     err = context.error
     if isinstance(err, (NetworkError, TimedOut, RetryAfter)): return
     if isinstance(err, (Forbidden, BadRequest)): return
-
     tb = "".join(traceback.format_exception(type(err), err, err.__traceback__))
-    logger.critical(f"[FORTRESS WRAPPER CAPTURE] Exception: {tb}")
+    logger.critical(f"[CRITICAL ERROR] {tb}")
 
 # ==========================================
-# PART 12: MAIN RUNNER (Optimized for Render Deployment)
+# PART 14: MAIN RUNNER
 # ==========================================
 def main():
     token = os.environ.get("BOT_TOKEN")
     if not token:
-        print("BOT_TOKEN missing in environments!")
+        print("❌ BOT_TOKEN missing! Set it in environment variables.")
         return
 
-    # Direct built-in polling system setup to completely avoid status 1 collision loops
     app = TGApp.builder().token(token).build()
     
-    app.add_handler(CommandHandler("start",              start_handler))
-    app.add_handler(CommandHandler("search",             search_handler))
-    app.add_handler(CommandHandler("quiz",               quiz_handler))
-    app.add_handler(CommandHandler(["gay", "couple"],    fun_dispatcher))
+    # Command handlers
+    app.add_handler(CommandHandler("start", start_handler))
+    app.add_handler(CommandHandler("search", search_handler))
+    app.add_handler(CommandHandler("quiz", quiz_handler))
+    app.add_handler(CommandHandler(["gay", "couple"], fun_dispatcher))
+    
+    # Message handler (includes all monitoring + AI chat)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, monitor))
+    
+    # Error handler
     app.add_error_handler(error_handler)
 
-    print("Beluga Free Scraper Cat Engine Online & Polling Safely!")
+    print("✅ Beluga Bot Online! Polling started...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
