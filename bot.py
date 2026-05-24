@@ -1,13 +1,3 @@
-# ═══════════════════════════════════════════════════════════════
-#  BELUGA BOT  v5.0.0
-#  Features: /search /quiz /lb /pump /dump /gay /couple
-#            /tictac (PvP + vs Bot)
-#            /rock   (PvP + vs Bot)
-#            Auto media download (YT/Instagram/X)
-#            GitHub Gist persistence
-#            Always-200 health server
-# ═══════════════════════════════════════════════════════════════
-
 import os, logging, random, json, asyncio, requests, re
 import urllib.parse, traceback, sys, hashlib, time, tempfile, shutil
 from datetime import datetime, timedelta
@@ -47,7 +37,6 @@ OR_KEY       = os.environ.get("OPENROUTER_API_KEY", "")
 GROQ_KEY     = os.environ.get("GROQ_API_KEY", "")
 BOT_TOKEN    = os.environ.get("BOT_TOKEN", "")
 HTTP_PORT    = int(os.environ.get("PORT", "10000"))
-OWNER_ID     = int(os.environ.get("OWNER_ID", "0"))
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_GIST  = os.environ.get("GITHUB_GIST_ID", "")
 
@@ -70,12 +59,12 @@ spam_tracker:  dict[int, list]             = {}
 db:            dict                        = {}
 
 # Game state dicts
-ttt_games: dict[str, dict] = {}   # message_id → game state
-rps_games: dict[str, dict] = {}   # message_id → game state
-# Track which users are in active games (uid → game_key)
+ttt_games: dict[str, dict] = {}
 user_in_game: dict[str, str] = {}
+game_timers: dict[str, dict] = {}  # Track timers for games
 
-GAME_TIMEOUT = 300  # 5 minutes
+GAME_TIMEOUT = 300
+TIMER_DURATION = 60  # 1 minute timer for games
 
 # ══════════════════════════════════════════
 #  DATABASE
@@ -159,7 +148,7 @@ def update_score(cid: str, uid: str, name: str, delta: int) -> int:
     return e["score"]
 
 # ══════════════════════════════════════════
-#  HTTP SERVER — always 200
+#  HTTP SERVER
 # ══════════════════════════════════════════
 async def _health(req):
     up = int((datetime.now() - bot_status["start_time"]).total_seconds())
@@ -167,7 +156,7 @@ async def _health(req):
         "status": "healthy", "uptime_seconds": up,
         "running": bot_status["running"],
         "messages": bot_status["message_count"],
-        "version": "5.0.0",
+        "version": "5.1.0",
     }, status=200)
 
 async def _ping(req):
@@ -217,9 +206,6 @@ def clean_html(t: str) -> str:
 
 def q_hash(q: str) -> str:
     return hashlib.md5(q.lower().strip().encode()).hexdigest()[:12]
-
-def is_owner(uid: int) -> bool:
-    return OWNER_ID != 0 and uid == OWNER_ID
 
 def now_ts() -> float:
     return time.time()
@@ -322,7 +308,7 @@ async def ai_emoji(text: str) -> str:
 # ══════════════════════════════════════════
 #  WIKIPEDIA + GOOGLE + AI SEARCH
 # ══════════════════════════════════════════
-WIKI_UA = {"User-Agent": "BelugaBot/5.0"}
+WIKI_UA = {"User-Agent": "BelugaBot/5.1"}
 G_HDR = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept-Language": "en-US,en;q=0.9",
@@ -440,101 +426,7 @@ async def ai_summarise(query: str, wiki: dict, goog: dict) -> str:
         "", max_tok=450)
 
 # ══════════════════════════════════════════
-#  MEDIA DOWNLOADER (YT / Instagram / X)
-# ══════════════════════════════════════════
-_MEDIA_RE = re.compile(
-    r"https?://(?:www\.)?"
-    r"(?:(?:twitter\.com|x\.com)/\S+/status/\d+"
-    r"|(?:instagram\.com)/(?:p|reel|tv)/[A-Za-z0-9_-]+"
-    r"|(?:youtu\.be|youtube\.com/(?:watch|shorts))\S+)",
-    re.IGNORECASE
-)
-_dl_tracker: dict[str, list] = {}
-
-def _dl_rate_ok(cid: str) -> bool:
-    now = time.time()
-    _dl_tracker.setdefault(cid, [])
-    _dl_tracker[cid] = [t for t in _dl_tracker[cid] if now - t < 60]
-    if len(_dl_tracker[cid]) >= 3: return False
-    _dl_tracker[cid].append(now)
-    return True
-
-def _ydl_download(url: str, outdir: str) -> dict:
-    result = {"ok": False, "path": None, "type": "video", "title": "", "error": ""}
-    try:
-        import yt_dlp
-        ydl_opts = {
-            "format": "bestvideo[ext=mp4][filesize<50M]+bestaudio[ext=m4a]/best[ext=mp4][filesize<50M]/best[filesize<50M]",
-            "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
-            "quiet": True, "no_warnings": True, "noplaylist": True,
-            "max_filesize": 50*1024*1024, "socket_timeout": 20,
-            "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            if not info: result["error"] = "No info"; return result
-            result["title"] = (info.get("title", "") or "")[:80]
-            downloaded = ydl.prepare_filename(info)
-            for ext in [".mp4",".webm",".mkv",".mov",".jpg",".jpeg",".png",".gif"]:
-                c = os.path.splitext(downloaded)[0] + ext
-                if os.path.exists(c): downloaded = c; break
-            if not os.path.exists(downloaded):
-                files = os.listdir(outdir)
-                if files: downloaded = os.path.join(outdir, files[0])
-                else: result["error"] = "File not found"; return result
-            sz = os.path.getsize(downloaded)
-            if sz == 0: result["error"] = "Empty file"; return result
-            if sz > 50*1024*1024: result["error"] = "Too large"; return result
-            ext_l = os.path.splitext(downloaded)[1].lower()
-            result.update({"ok": True, "path": downloaded,
-                           "type": "image" if ext_l in (".jpg",".jpeg",".png",".gif") else "video"})
-    except Exception as e:
-        err = str(e)
-        if any(x in err.lower() for x in ["private","login","age","unavailable","removed","403","404"]):
-            result["error"] = "unavailable"
-        else:
-            result["error"] = err[:120]
-    return result
-
-async def download_and_send(u: Update, c: ContextTypes.DEFAULT_TYPE, url: str):
-    cid = u.effective_chat.id
-    if not _dl_rate_ok(str(cid)): return
-    await c.bot.send_chat_action(cid, "upload_video")
-    ul = url.lower()
-    if "youtu" in ul:   platform, pemoji = "YouTube",    "▶️"
-    elif "instagram" in ul: platform, pemoji = "Instagram", "📸"
-    else:               platform, pemoji = "X (Twitter)", "🐦"
-    tmpdir = tempfile.mkdtemp(prefix="beluga_dl_")
-    try:
-        loop = asyncio.get_running_loop()
-        result = await asyncio.wait_for(
-            loop.run_in_executor(None, _ydl_download, url, tmpdir), timeout=60.0)
-        if not result["ok"]:
-            if result["error"] == "unavailable":
-                await safe_react(c.bot, cid, u.message.message_id, "🔒")
-            return
-        caption = f"{pemoji} *{platform}*"
-        if result["title"] and result["title"].lower() not in ("","video","media"):
-            caption += f"\n_{result['title'][:100]}_"
-        await c.bot.send_chat_action(cid,
-            "upload_photo" if result["type"] == "image" else "upload_video")
-        with open(result["path"], "rb") as f:
-            if result["type"] == "image":
-                await u.message.reply_photo(photo=f, caption=caption, parse_mode=ParseMode.MARKDOWN)
-            else:
-                await u.message.reply_video(video=f, caption=caption,
-                    parse_mode=ParseMode.MARKDOWN, supports_streaming=True)
-        bot_status["message_count"] += 1
-    except asyncio.TimeoutError:
-        logger.debug(f"[DL] Timeout {url}")
-    except Exception as e:
-        logger.error(f"[DL] {e}")
-        bot_status["error_count"] += 1
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-# ══════════════════════════════════════════
-#  SCREENSHOT
+#  /search
 # ══════════════════════════════════════════
 async def screenshot(url: str) -> Optional[str]:
     if not url.startswith(("http://","https://")): url = "https://" + url
@@ -549,9 +441,6 @@ async def screenshot(url: str) -> Optional[str]:
         except Exception: continue
     return None
 
-# ══════════════════════════════════════════
-#  /search
-# ══════════════════════════════════════════
 async def search_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message: return
     try:
@@ -759,40 +648,6 @@ async def lb_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         logger.error(f"[lb] {e}", exc_info=True)
 
 # ══════════════════════════════════════════
-#  /pump  /dump
-# ══════════════════════════════════════════
-async def pump_dump_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    if not u.message: return
-    try:
-        if not is_owner(u.effective_user.id if u.effective_user else 0):
-            await u.message.reply_text("🚫 Owner-only command."); return
-        if not u.message.reply_to_message or not u.message.reply_to_message.from_user:
-            await u.message.reply_text("⚠️ Reply to a user's message.\nExample: reply + `/pump 80000`",
-                parse_mode=ParseMode.MARKDOWN); return
-        parts = u.message.text.split()
-        if len(parts) < 2 or not parts[1].isdigit():
-            await u.message.reply_text("⚠️ Usage: `/pump 80000` or `/dump 80000`",
-                parse_mode=ParseMode.MARKDOWN); return
-        amount  = int(parts[1])
-        cmd     = parts[0].lstrip("/").lower().split("@")[0]
-        delta   = +amount if cmd == "pump" else -amount
-        target  = u.message.reply_to_message.from_user
-        cid     = str(u.effective_chat.id)
-        new_sc  = update_score(cid, str(target.id), (target.first_name or "User")[:30], delta)
-        await async_github_save()
-        emoji   = "🚀" if cmd == "pump" else "📉"
-        sign    = "+" if delta > 0 else ""
-        await u.message.reply_text(
-            f"{emoji} *{'PUMP' if cmd=='pump' else 'DUMP'}*\n\n"
-            f"👤 *{target.first_name}*\n"
-            f"{'📈' if delta>0 else '📉'} {sign}{amount:,} pts\n"
-            f"💰 New Total: *{new_sc:,} pts*",
-            parse_mode=ParseMode.MARKDOWN)
-        bot_status["message_count"] += 1
-    except Exception as e:
-        logger.error(f"[pump_dump] {e}", exc_info=True)
-
-# ══════════════════════════════════════════
 #  GAME PROTECTION HELPERS
 # ══════════════════════════════════════════
 def game_key(msg_id: int, cid: int) -> str:
@@ -807,35 +662,99 @@ def release_player(uid: str):
 def player_busy(uid: str) -> bool:
     gkey = user_in_game.get(uid)
     if not gkey: return False
-    # Check if the game still exists
     if gkey in ttt_games: return True
-    if gkey in rps_games: return True
-    # Game gone — clean up stale reference
     release_player(uid)
     return False
 
 async def cleanup_expired_games():
-    """Called periodically to remove timed-out games."""
     now = time.time()
     for gkey in list(ttt_games.keys()):
         g = ttt_games[gkey]
         if now - g.get("created", now) > GAME_TIMEOUT:
             for uid in [str(g.get("x_id","")), str(g.get("o_id",""))]:
                 release_player(uid)
+            if gkey in game_timers:
+                del game_timers[gkey]
             del ttt_games[gkey]
-    for gkey in list(rps_games.keys()):
-        g = rps_games[gkey]
-        if now - g.get("created", now) > GAME_TIMEOUT:
-            for uid in [str(g.get("p1_id","")), str(g.get("p2_id",""))]:
-                release_player(uid)
-            del rps_games[gkey]
+
+# ══════════════════════════════════════════
+#  TIMER MANAGEMENT
+# ══════════════════════════════════════════
+async def update_game_timer(c: ContextTypes.DEFAULT_TYPE, gkey: str):
+    """Update timer every 3 seconds"""
+    try:
+        g = ttt_games.get(gkey)
+        timer_data = game_timers.get(gkey)
+        
+        if not g or not timer_data:
+            return
+        
+        cid = g["chat_id"]
+        msg_id = int(gkey.split(":")[1])
+        
+        # Reduce by 3 seconds
+        timer_data["remaining"] -= 3
+        
+        if timer_data["remaining"] <= 0:
+            # Timer expired
+            g["status"] = "timeout"
+            winner_name = g["x_name"] if g["turn"] == "O" else g["o_name"]
+            g["winner_name"] = winner_name
+            
+            text = ttt_build_text(g)
+            kbd = ttt_build_keyboard(g["board"], disabled=True)
+            
+            try:
+                await c.bot.edit_message_text(
+                    text=text,
+                    chat_id=cid,
+                    message_id=msg_id,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=kbd
+                )
+            except Exception:
+                pass
+            
+            # Update leaderboard if applicable
+            cid_s = str(cid)
+            if not g["vs_bot"]:
+                new_sc = update_score(cid_s, str(g["x_id"] if g["turn"] == "O" else g["o_id"]), winner_name, +20)
+                await async_github_save()
+            
+            release_player(str(g["x_id"]))
+            release_player(str(g["o_id"]))
+            if gkey in game_timers:
+                del game_timers[gkey]
+            del ttt_games[gkey]
+        else:
+            # Update timer display
+            text = ttt_build_text(g)
+            kbd = ttt_build_keyboard(g["board"])
+            
+            try:
+                await c.bot.edit_message_text(
+                    text=text,
+                    chat_id=cid,
+                    message_id=msg_id,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=kbd
+                )
+            except Exception:
+                pass
+            
+            # Schedule next update in 3 seconds
+            await asyncio.sleep(3)
+            await update_game_timer(c, gkey)
+    
+    except Exception as e:
+        logger.debug(f"[Timer] {e}")
 
 # ══════════════════════════════════════════
 #  TIC TAC TOE
 # ══════════════════════════════════════════
 TTT_EMPTY = "⬜"
-TTT_X     = "🔴❌"
-TTT_O     = "🔵⭕"
+TTT_X     = "❌"
+TTT_O     = "⭕"
 
 WINS = [(0,1,2),(3,4,5),(6,7,8),(0,3,6),(1,4,7),(2,5,8),(0,4,8),(2,4,6)]
 
@@ -849,31 +768,24 @@ def ttt_is_draw(board: list) -> bool:
     return all(c != TTT_EMPTY for c in board) and not ttt_check_winner(board)
 
 def ttt_bot_move(board: list) -> int:
-    """Smart bot: win > block > center > corners > random"""
-    # Try to win
     for i in range(9):
         if board[i] == TTT_EMPTY:
             board[i] = TTT_O
             if ttt_check_winner(board): board[i] = TTT_EMPTY; return i
             board[i] = TTT_EMPTY
-    # Block player
     for i in range(9):
         if board[i] == TTT_EMPTY:
             board[i] = TTT_X
             if ttt_check_winner(board): board[i] = TTT_EMPTY; return i
             board[i] = TTT_EMPTY
-    # Center
     if board[4] == TTT_EMPTY: return 4
-    # Corners
     for i in [0,2,6,8]:
         if board[i] == TTT_EMPTY: return i
-    # Any empty
     for i in range(9):
         if board[i] == TTT_EMPTY: return i
     return -1
 
 def ttt_build_keyboard(board: list, disabled: bool = False) -> InlineKeyboardMarkup:
-    syms = ["1","2","3","4","5","6","7","8","9"]
     rows = []
     for row in range(3):
         r = []
@@ -889,20 +801,25 @@ def ttt_build_keyboard(board: list, disabled: bool = False) -> InlineKeyboardMar
 def ttt_build_text(g: dict) -> str:
     x_name = g["x_name"]
     o_name = g["o_name"]
-    turn   = g["turn"]   # "X" or "O"
+    turn   = g["turn"]
     status = g.get("status","playing")
+    timer_data = game_timers.get(f"{g['chat_id']}:{g.get('msg_id','')}", {})
+    remaining = timer_data.get("remaining", TIMER_DURATION)
+    timer_str = f"{remaining//60:02d}:{remaining%60:02d}"
 
     if status == "playing":
         cur_name   = x_name if turn == "X" else o_name
         cur_symbol = TTT_X  if turn == "X" else TTT_O
-        status_line = f"🎯 *Turn:* {cur_name}  {cur_symbol}"
+        status_line = f"🎯 {cur_name}'s Turn\n⏱ {timer_str}"
+    elif status == "timeout":
+        winner_name = g.get("winner_name","")
+        status_line = f"⏰ Time Expired!\n\n🏆 {winner_name} Wins by Timeout!"
     elif status == "draw":
-        status_line = "🤝 *Match Draw!*"
+        status_line = "🤝 Match Draw!"
     else:
         winner_name = g.get("winner_name","")
-        status_line = f"🏆 *{winner_name} Wins!*  🎁 +20 pts"
+        status_line = f"🏆 {winner_name} Wins! +20 pts"
 
-    # Board display
     board = g["board"]
     rows  = []
     for row in range(3):
@@ -912,7 +829,7 @@ def ttt_build_text(g: dict) -> str:
     return (
         f"🎮 *TIC TAC TOE*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"❌ *{x_name}*   🆚   ⭕ *{o_name}*\n"
+        f"❌ {x_name}  🆚  ⭕ {o_name}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"{board_str}\n\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -925,14 +842,12 @@ async def tictac_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await cleanup_expired_games()
         user_a    = u.effective_user
         cid       = u.effective_chat.id
-        cid_s     = str(cid)
         uid_a     = str(user_a.id)
         name_a    = (user_a.first_name or "Player")[:20]
         vs_bot    = True
         user_b_id = None
         name_b    = "🤖 Beluga Bot"
 
-        # PvP if reply
         if u.message.reply_to_message and u.message.reply_to_message.from_user:
             rb = u.message.reply_to_message.from_user
             if not rb.is_bot:
@@ -960,6 +875,7 @@ async def tictac_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             "status":    "playing",
             "created":   time.time(),
             "chat_id":   cid,
+            "msg_id":    None,
         }
 
         kbd  = ttt_build_keyboard(board)
@@ -967,11 +883,19 @@ async def tictac_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         msg  = await u.message.reply_text(text, parse_mode=ParseMode.MARKDOWN,
                                           reply_markup=kbd)
 
+        g["msg_id"] = msg.message_id
         gkey = game_key(msg.message_id, cid)
         ttt_games[gkey] = g
+        
+        # Initialize timer
+        game_timers[gkey] = {"remaining": TIMER_DURATION}
+        
         register_player(uid_a, gkey)
         if not vs_bot:
             register_player(str(user_b_id), gkey)
+        
+        # Start timer task
+        asyncio.create_task(update_game_timer(c, gkey))
 
         bot_status["message_count"] += 1
 
@@ -983,7 +907,7 @@ async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not q: return
     try:
         await q.answer()
-        data   = q.data   # "ttt:move:4" or "ttt:noop:4"
+        data   = q.data
         parts  = data.split(":")
         if len(parts) != 3 or parts[0] != "ttt": return
         action = parts[1]
@@ -995,10 +919,9 @@ async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         g      = ttt_games.get(gkey)
 
         if not g:
-            await q.answer("⏰ Game expired or not found.", show_alert=True); return
+            await q.answer("⏰ Game expired.", show_alert=True); return
 
         uid    = str(q.from_user.id)
-        # Access check
         valid_x = uid == str(g["x_id"])
         valid_o = (uid == str(g["o_id"])) or (g["vs_bot"] and valid_x)
 
@@ -1006,23 +929,21 @@ async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("Game already ended!", show_alert=True); return
 
         if action == "noop":
-            await q.answer("Cell already taken!", show_alert=True); return
+            await q.answer("Cell taken!", show_alert=True); return
 
-        # Turn check
         if g["turn"] == "X" and not valid_x:
             if uid not in [str(g["x_id"]), str(g["o_id"])]:
-                await q.answer("❌ You are not part of this game!", show_alert=True)
+                await q.answer("❌ Not in game!", show_alert=True)
             else:
                 await q.answer("Not your turn!", show_alert=True)
             return
         if g["turn"] == "O" and not g["vs_bot"] and uid != str(g["o_id"]):
             if uid not in [str(g["x_id"]), str(g["o_id"])]:
-                await q.answer("❌ You are not part of this game!", show_alert=True)
+                await q.answer("❌ Not in game!", show_alert=True)
             else:
                 await q.answer("Not your turn!", show_alert=True)
             return
 
-        # Make move
         board = g["board"]
         board[idx] = TTT_X if g["turn"] == "X" else TTT_O
         winner_sym = ttt_check_winner(board)
@@ -1039,9 +960,10 @@ async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = ttt_build_text(g)
             kbd  = ttt_build_keyboard(board, disabled=True)
             await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kbd)
-            # Cleanup
             release_player(str(g["x_id"]))
             release_player(str(g["o_id"]))
+            if gkey in game_timers:
+                del game_timers[gkey]
             del ttt_games[gkey]
             return
 
@@ -1052,13 +974,13 @@ async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kbd)
             release_player(str(g["x_id"]))
             release_player(str(g["o_id"]))
+            if gkey in game_timers:
+                del game_timers[gkey]
             del ttt_games[gkey]
             return
 
-        # Switch turn
         g["turn"] = "O" if g["turn"] == "X" else "X"
 
-        # Bot move
         if g["vs_bot"] and g["turn"] == "O":
             bot_idx = ttt_bot_move(board)
             if bot_idx >= 0:
@@ -1071,6 +993,8 @@ async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     kbd  = ttt_build_keyboard(board, disabled=True)
                     await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kbd)
                     release_player(str(g["x_id"]))
+                    if gkey in game_timers:
+                        del game_timers[gkey]
                     del ttt_games[gkey]
                     return
                 if ttt_is_draw(board):
@@ -1079,6 +1003,8 @@ async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     kbd  = ttt_build_keyboard(board, disabled=True)
                     await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kbd)
                     release_player(str(g["x_id"]))
+                    if gkey in game_timers:
+                        del game_timers[gkey]
                     del ttt_games[gkey]
                     return
                 g["turn"] = "X"
@@ -1091,223 +1017,7 @@ async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"[ttt_callback] {e}", exc_info=True)
 
 # ══════════════════════════════════════════
-#  ROCK PAPER SCISSORS
-# ══════════════════════════════════════════
-RPS_CHOICES = {
-    "rock":     "🪨 Rock",
-    "paper":    "📄 Paper",
-    "scissors": "✂️ Scissors",
-}
-RPS_WINS = {  # key beats value
-    "rock":     "scissors",
-    "scissors": "paper",
-    "paper":    "rock",
-}
-RPS_BTN_LABELS = [
-    ("🟥🪨 Rock",     "rock"),
-    ("🟦📄 Paper",    "paper"),
-    ("🟨✂️ Scissors", "scissors"),
-]
-
-def rps_keyboard(gkey: str) -> InlineKeyboardMarkup:
-    rows = [[
-        InlineKeyboardButton(label, callback_data=f"rps:{gkey_part}:{choice}")
-        for label, choice in RPS_BTN_LABELS
-    ]]
-    # Split into 3 separate rows for better mobile UX
-    rows = [[InlineKeyboardButton(label, callback_data=f"rps:{gkey_part}:{choice}")]
-            for label, choice in RPS_BTN_LABELS]
-    # use short key in callback to avoid 64-byte limit
-    rows = [[InlineKeyboardButton(label, callback_data=f"rps:pick:{choice}")]
-            for label, choice in RPS_BTN_LABELS]
-    return InlineKeyboardMarkup(rows)
-
-def rps_build_text(g: dict) -> str:
-    p1   = g["p1_name"]
-    p2   = g["p2_name"]
-    p1ch = g.get("p1_choice")
-    p2ch = g.get("p2_choice")
-    vs_bot = g["vs_bot"]
-    status = g.get("status","waiting")
-
-    p1_line = f"✅ *{p1}* — Choice locked 🔒" if p1ch else f"⌛ *{p1}* — Choosing..."
-    p2_line = f"✅ *{p2}* — Choice locked 🔒" if p2ch else f"⌛ *{p2}* — Choosing..."
-
-    if status == "waiting":
-        result_block = "⏳ *Waiting for both players...*"
-    elif status == "done":
-        ch1 = RPS_CHOICES.get(p1ch,"?")
-        ch2 = RPS_CHOICES.get(p2ch,"?")
-        winner = g.get("winner","draw")
-        if winner == "draw":
-            result_block = (
-                f"🪨📄✂️ *RESULT*\n\n"
-                f"👤 *{p1}*: {ch1}\n"
-                f"👤 *{p2}*: {ch2}\n"
-                f"━━━━━━━━━━━━━━━\n"
-                f"🤝 *Draw!*"
-            )
-        else:
-            wn = g.get("winner_name","?")
-            result_block = (
-                f"🪨📄✂️ *RESULT*\n\n"
-                f"👤 *{p1}*: {ch1}\n"
-                f"👤 *{p2}*: {ch2}\n"
-                f"━━━━━━━━━━━━━━━\n"
-                f"👑 *{wn} Wins!*  🎁 +20 pts"
-            )
-    else:
-        result_block = "⏳ Waiting..."
-
-    if status == "done":
-        return f"🎮 *ROCK • PAPER • SCISSORS*\n━━━━━━━━━━━━━━━━━━━━\n{result_block}"
-
-    return (
-        f"🎮 *ROCK • PAPER • SCISSORS*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚔️  *{p1}*   🆚   *{p2}*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"{p1_line}\n"
-        f"{p2_line}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"{result_block}"
-    )
-
-async def rock_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    if not u.message: return
-    try:
-        await cleanup_expired_games()
-        user_a  = u.effective_user
-        cid     = u.effective_chat.id
-        uid_a   = str(user_a.id)
-        name_a  = (user_a.first_name or "Player")[:20]
-        vs_bot  = True
-        uid_b   = None
-        name_b  = "🤖 Beluga Bot"
-
-        if u.message.reply_to_message and u.message.reply_to_message.from_user:
-            rb = u.message.reply_to_message.from_user
-            if not rb.is_bot:
-                vs_bot = False
-                uid_b  = str(rb.id)
-                name_b = (rb.first_name or "Player2")[:20]
-                if player_busy(uid_b):
-                    await u.message.reply_text("⚠️ That player is already in a game!"); return
-
-        if player_busy(uid_a):
-            await u.message.reply_text("⚠️ You're already in a game!"); return
-
-        g = {
-            "p1_id":    user_a.id,
-            "p1_name":  name_a,
-            "p2_id":    int(uid_b) if uid_b else -1,
-            "p2_name":  name_b,
-            "p1_choice": None,
-            "p2_choice": None,
-            "vs_bot":   vs_bot,
-            "status":   "waiting",
-            "created":  time.time(),
-            "chat_id":  cid,
-        }
-        text = rps_build_text(g)
-        # For RPS we embed the message_id in callback after sending
-        msg = await u.message.reply_text(text, parse_mode=ParseMode.MARKDOWN,
-                                         reply_markup=rps_keyboard("tmp"))
-        gkey = game_key(msg.message_id, cid)
-        rps_games[gkey] = g
-        register_player(uid_a, gkey)
-        if not vs_bot and uid_b:
-            register_player(uid_b, gkey)
-        # Re-send keyboard with real gkey embedded
-        try:
-            await msg.edit_reply_markup(rps_keyboard(gkey))
-        except Exception:
-            pass
-        bot_status["message_count"] += 1
-
-    except Exception as e:
-        logger.error(f"[rock] {e}", exc_info=True)
-
-async def rps_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if not q: return
-    try:
-        await q.answer()
-        data  = q.data   # "rps:pick:rock"  or  "rps:{gkey}:{choice}"
-        parts = data.split(":")
-        if len(parts) < 3 or parts[0] != "rps": return
-
-        action = parts[1]
-        choice = parts[2]
-
-        cid  = q.message.chat_id
-        mid  = q.message.message_id
-        gkey = game_key(mid, cid)
-        g    = rps_games.get(gkey)
-
-        if not g:
-            await q.answer("⏰ Game expired.", show_alert=True); return
-        if g["status"] == "done":
-            await q.answer("Game already ended!", show_alert=True); return
-
-        uid    = str(q.from_user.id)
-        is_p1  = uid == str(g["p1_id"])
-        is_p2  = (uid == str(g["p2_id"])) or (g["vs_bot"] and is_p1)
-
-        if not is_p1 and not is_p2:
-            await q.answer("❌ You are not part of this game!", show_alert=True); return
-
-        if is_p1 and not g["vs_bot"]:
-            if g["p1_choice"]:
-                await q.answer("You already chose!", show_alert=True); return
-            g["p1_choice"] = choice
-            await q.answer("✅ Choice locked!")
-        elif is_p1 and g["vs_bot"]:
-            if g["p1_choice"]:
-                await q.answer("You already chose!", show_alert=True); return
-            g["p1_choice"] = choice
-            # Bot picks random
-            g["p2_choice"] = random.choice(list(RPS_WINS.keys()))
-            await q.answer("✅ Choice locked!")
-        elif not is_p1 and is_p2:
-            if g["p2_choice"]:
-                await q.answer("You already chose!", show_alert=True); return
-            g["p2_choice"] = choice
-            await q.answer("✅ Choice locked!")
-
-        # Both chosen?
-        if g["p1_choice"] and g["p2_choice"]:
-            c1, c2 = g["p1_choice"], g["p2_choice"]
-            if c1 == c2:
-                g["winner"]      = "draw"
-                g["winner_name"] = ""
-            elif RPS_WINS.get(c1) == c2:
-                g["winner"]      = "p1"
-                g["winner_name"] = g["p1_name"]
-                new_sc = update_score(str(cid), str(g["p1_id"]), g["p1_name"], +20)
-                asyncio.create_task(async_github_save())
-            else:
-                g["winner"]      = "p2"
-                g["winner_name"] = g["p2_name"]
-                if not g["vs_bot"]:
-                    new_sc = update_score(str(cid), str(g["p2_id"]), g["p2_name"], +20)
-                    asyncio.create_task(async_github_save())
-            g["status"] = "done"
-            text = rps_build_text(g)
-            await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
-            release_player(str(g["p1_id"]))
-            release_player(str(g["p2_id"]))
-            del rps_games[gkey]
-        else:
-            text = rps_build_text(g)
-            await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN,
-                                      reply_markup=rps_keyboard(gkey))
-
-    except Exception as e:
-        logger.error(f"[rps_callback] {e}", exc_info=True)
-
-# ══════════════════════════════════════════
-#  FUN COMMANDS  /gay  /couple
+#  FUN COMMANDS
 # ══════════════════════════════════════════
 GAY_T = [
     "━━━━━━━━━━━━━━━━━━━━━━━━━━\n🚨 *ATTENTION* 🚨\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nAfter deep investigation:\n👉 *{u}* 👈\nis 🌈✨ *SUPER GAY* ✨🌈\nMust slay forever 💅😭\n━━━━━━━━━━━━━━━━━━━━━━━━━━",
@@ -1350,28 +1060,55 @@ async def fun_dispatcher(u: Update, c: ContextTypes.DEFAULT_TYPE):
 async def start_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message: return
     try:
-        ocmds = "\n• `/pump` `/dump` — Owner: adjust points" if OWNER_ID else ""
         text = (
-            "```\n╔══════════════════════════════════╗\n"
-            "        🐱  BELUGA AI BOT  🐱      \n"
-            "╚══════════════════════════════════╝\n```\n\n"
-            "💬 *Smart Telegram Chat Bot v5*\n\n"
-            "⚡ *Commands:*\n"
-            "• `/search <topic>` — AI-powered smart summary\n"
-            "• `/search <url>` — Website screenshot\n"
-            "• `/quiz` — Random trivia  |  `/quiz crypto` — Topic\n"
-            "• `/tictac` — Tic Tac Toe (reply user = PvP, else vs Bot)\n"
-            "• `/rock` — Rock Paper Scissors (same)\n"
-            "• `/lb` — Quiz leaderboard 🏆\n"
-            "• `/gay` `/couple` — Fun daily commands\n"
-            f"• Mention *beluga* — AI chat 🐾{ocmds}\n\n"
-            "🎬 *Auto:* Send YouTube/Instagram/X links → I download them!\n\n"
-            "👋 _Start chatting now!_"
+            "🧠 *SMART BELUGA BOT*\n\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            "«🌊 Welcome aboard,\n\n"
+            "I'm your smart all-in-one assistant built to make your Telegram experience faster, easier and more fun.\n\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            "⚡ *Features*\n\n"
+            "🎮 Games\n"
+            "└ Play Tic Tac Toe and more\n\n"
+            "📥 Media Downloader\n"
+            "└ Auto download YouTube & Instagram links\n\n"
+            "🏆 Leaderboard\n"
+            "└ Earn points and climb ranks\n\n"
+            "🤖 Smart Utilities\n"
+            "└ Fast tools and useful commands\n\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            "🎯 *Quick Commands*\n\n"
+            "/tictac — Start Tic Tac Toe\n"
+            "/lb — View leaderboard\n"
+            "/help — View all commands\n\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            "🔥 Ready to begin?"
         )
         await u.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
         bot_status["message_count"] += 1
     except Exception as e:
         logger.error(f"[start] {e}", exc_info=True)
+
+async def help_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not u.message: return
+    try:
+        text = (
+            "📚 *ALL COMMANDS*\n\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            "🎮 *GAMES*\n"
+            "/tictac — Tic Tac Toe\n\n"
+            "🎓 *UTILITIES*\n"
+            "/search — Smart search\n"
+            "/quiz — Trivia quiz\n"
+            "/lb — Leaderboard\n\n"
+            "🎉 *FUN*\n"
+            "/gay — Random gay\n"
+            "/couple — Random couple\n\n"
+            "💬 Mention 'beluga' for AI chat!"
+        )
+        await u.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        bot_status["message_count"] += 1
+    except Exception as e:
+        logger.error(f"[help] {e}", exc_info=True)
 
 # ══════════════════════════════════════════
 #  MONITOR
@@ -1383,7 +1120,6 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
         cid  = str(u.effective_chat.id)
         now  = datetime.now()
 
-        # Spam guard
         spam_tracker.setdefault(uid, [])
         spam_tracker[uid] = [t for t in spam_tracker[uid] if now - t < timedelta(seconds=2)]
         spam_tracker[uid].append(now)
@@ -1392,7 +1128,6 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
             except Exception: pass
             return
 
-        # Track user
         db.setdefault("seen",{}).setdefault(cid,{})[str(uid)] = {
             "id": uid, "un": u.effective_user.username,
             "n": u.effective_user.first_name or "User",
@@ -1406,13 +1141,6 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
         text     = (u.message.text or "").strip()
         text_low = text.lower()
 
-        # ── Auto media download ───────────────────────────────
-        media_match = _MEDIA_RE.search(text)
-        if media_match:
-            asyncio.create_task(
-                download_and_send(u, c, media_match.group(0)))
-
-        # ── AI chat trigger ───────────────────────────────────
         beluga   = "beluga" in text_low
         reply_me = (u.message.reply_to_message and
                     u.message.reply_to_message.from_user and
@@ -1460,16 +1188,14 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════
 async def main():
     logger.info("=" * 55)
-    logger.info("🐱  BELUGA BOT  v5.0.0")
-    logger.info(f"   PORT={HTTP_PORT}  OWNER={OWNER_ID}")
+    logger.info("🐱  BELUGA BOT  v5.1.0")
+    logger.info(f"   PORT={HTTP_PORT}")
     logger.info(f"   GitHub={'✅' if GITHUB_TOKEN and GITHUB_GIST else '❌'}")
     logger.info("=" * 55)
 
-    # 1. HTTP first — Render health check
     http_runner = await start_http(HTTP_PORT)
     await asyncio.sleep(0.3)
 
-    # 2. Load GitHub scores
     loop = asyncio.get_running_loop()
     if GITHUB_TOKEN and GITHUB_GIST:
         try:
@@ -1479,33 +1205,28 @@ async def main():
         except Exception as e:
             logger.warning(f"[GitHub startup] {e}")
 
-    # 3. Build PTB
     app = TGApp.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start",              start_handler))
+    app.add_handler(CommandHandler("help",               help_handler))
     app.add_handler(CommandHandler("search",             search_handler))
     app.add_handler(CommandHandler("quiz",               quiz_handler))
     app.add_handler(CommandHandler(["lb","leaderboard"], lb_handler))
     app.add_handler(CommandHandler(["gay","couple"],     fun_dispatcher))
-    app.add_handler(CommandHandler(["pump","dump"],      pump_dump_handler))
     app.add_handler(CommandHandler("tictac",             tictac_handler))
-    app.add_handler(CommandHandler("rock",               rock_handler))
     app.add_handler(CallbackQueryHandler(ttt_callback,   pattern=r"^ttt:"))
-    app.add_handler(CallbackQueryHandler(rps_callback,   pattern=r"^rps:"))
     app.add_handler(PollAnswerHandler(poll_answer_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, monitor))
     app.add_error_handler(error_handler)
     logger.info("✅ Handlers registered")
 
-    # 4. Start polling
     await app.initialize()
     await app.start()
     await app.updater.start_polling(
         drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES)
     bot_status["running"] = True
-    logger.info("✅ Beluga v5 is LIVE 🐱")
+    logger.info("✅ Beluga v5.1 is LIVE 🐱")
 
-    # 5. Keep alive + periodic cleanup
     stop_evt = asyncio.Event()
     try:
         import signal
@@ -1525,7 +1246,6 @@ async def main():
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
 
-    # 6. Graceful shutdown
     cleanup_task.cancel()
     bot_status["running"] = False
     logger.info("🔄 Shutdown…")
