@@ -35,3 +35,7 @@ tzlocal==5.3.1
 urllib3==2.7.0
 werkzeug==3.1.8
 yarl==1.23.0
+python-telegram-bot==21.10
+aiohttp==3.9.5
+requests==2.32.3
+yt-dlp==2024.12.23
