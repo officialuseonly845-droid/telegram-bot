@@ -1,5 +1,5 @@
 import os, logging, random, json, asyncio, requests, re
-import urllib.parse, traceback, sys, hashlib, time, tempfile, shutil
+import urllib.parse, traceback, sys, hashlib, time
 from datetime import datetime, timedelta
 from typing import Optional
 from aiohttp import web
@@ -37,6 +37,7 @@ OR_KEY       = os.environ.get("OPENROUTER_API_KEY", "")
 GROQ_KEY     = os.environ.get("GROQ_API_KEY", "")
 BOT_TOKEN    = os.environ.get("BOT_TOKEN", "")
 HTTP_PORT    = int(os.environ.get("PORT", "10000"))
+OWNER_ID     = int(os.environ.get("OWNER_ID", "0"))
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_GIST  = os.environ.get("GITHUB_GIST_ID", "")
 
@@ -61,10 +62,10 @@ db:            dict                        = {}
 # Game state dicts
 ttt_games: dict[str, dict] = {}
 user_in_game: dict[str, str] = {}
-game_timers: dict[str, dict] = {}  # Track timers for games
+game_timers: dict[str, dict] = {}
 
 GAME_TIMEOUT = 300
-TIMER_DURATION = 60  # 1 minute timer for games
+TIMER_DURATION = 60
 
 # ══════════════════════════════════════════
 #  DATABASE
@@ -93,14 +94,50 @@ db.setdefault("scores", {})
 # ══════════════════════════════════════════
 #  GITHUB GIST PERSISTENCE
 # ══════════════════════════════════════════
-GIST_FILENAME = "beluga_scores.json"
+GIST_FILENAME = "beluga_leaderboard.json"
+_gist_id_cache = None
+
+def github_create_gist() -> Optional[str]:
+    """Create new GitHub Gist for leaderboard"""
+    if not GITHUB_TOKEN:
+        logger.warning("[GitHub] No GITHUB_TOKEN set")
+        return None
+    try:
+        r = requests.post(
+            "https://api.github.com/gists",
+            headers={"Authorization": f"token {GITHUB_TOKEN}",
+                     "Accept": "application/vnd.github.v3+json"},
+            json={
+                "description": "Beluga Bot Leaderboard - Auto created",
+                "public": False,
+                "files": {GIST_FILENAME: {
+                    "content": json.dumps(db.get("scores", {}), indent=2)
+                }}
+            },
+            timeout=10)
+        if r.status_code == 201:
+            gist_id = r.json().get("id")
+            logger.info(f"✅ Created new GitHub Gist: {gist_id}")
+            logger.info(f"📌 Add to .env: GITHUB_GIST_ID={gist_id}")
+            return gist_id
+    except Exception as e:
+        logger.error(f"[GitHub Create] {e}")
+    return None
 
 def github_load_scores() -> dict:
-    if not GITHUB_TOKEN or not GITHUB_GIST:
+    """Load leaderboard from GitHub Gist"""
+    if not GITHUB_TOKEN:
+        logger.warning("[GitHub] No GITHUB_TOKEN - leaderboard won't persist")
         return {}
+    
+    gist_id = GITHUB_GIST
+    if not gist_id:
+        logger.debug("[GitHub] No GIST_ID set, will create on first save")
+        return {}
+    
     try:
         r = requests.get(
-            f"https://api.github.com/gists/{GITHUB_GIST}",
+            f"https://api.github.com/gists/{gist_id}",
             headers={"Authorization": f"token {GITHUB_TOKEN}",
                      "Accept": "application/vnd.github.v3+json"},
             timeout=10)
@@ -108,37 +145,60 @@ def github_load_scores() -> dict:
             files = r.json().get("files", {})
             if GIST_FILENAME in files:
                 scores = json.loads(files[GIST_FILENAME].get("content", "{}"))
-                logger.info(f"[GitHub] Loaded scores ({len(scores)} chats)")
+                logger.info(f"✅ Loaded leaderboard from GitHub ({len(scores)} chats)")
                 return scores
+        elif r.status_code == 404:
+            logger.warning("[GitHub] Gist not found (404)")
     except Exception as e:
         logger.error(f"[GitHub Load] {e}")
     return {}
 
 def github_save_scores() -> bool:
-    if not GITHUB_TOKEN or not GITHUB_GIST:
+    """Save leaderboard to GitHub Gist (or create if doesn't exist)"""
+    if not GITHUB_TOKEN:
+        logger.debug("[GitHub] No token, skipping save")
         return False
+    
+    gist_id = GITHUB_GIST
+    
+    # If no gist ID, try to create one
+    if not gist_id:
+        logger.info("[GitHub] Creating new Gist...")
+        gist_id = github_create_gist()
+        if not gist_id:
+            logger.error("[GitHub] Failed to create Gist")
+            return False
+    
     try:
         r = requests.patch(
-            f"https://api.github.com/gists/{GITHUB_GIST}",
+            f"https://api.github.com/gists/{gist_id}",
             headers={"Authorization": f"token {GITHUB_TOKEN}",
                      "Accept": "application/vnd.github.v3+json"},
             json={"files": {GIST_FILENAME: {
                 "content": json.dumps(db.get("scores", {}), indent=2)
             }}},
             timeout=10)
-        return r.status_code == 200
+        
+        if r.status_code == 200:
+            logger.debug(f"✅ Leaderboard saved to GitHub")
+            return True
+        else:
+            logger.warning(f"[GitHub] Save failed: {r.status_code}")
+            return False
     except Exception as e:
         logger.error(f"[GitHub Save] {e}")
     return False
 
 async def async_github_save():
+    """Async wrapper for GitHub save"""
     loop = asyncio.get_running_loop()
     try:
         await loop.run_in_executor(None, github_save_scores)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"[Async GitHub] {e}")
 
 def update_score(cid: str, uid: str, name: str, delta: int) -> int:
+    """Update score in memory and trigger GitHub save"""
     db.setdefault("scores", {}).setdefault(cid, {})
     e = db["scores"][cid].get(uid, {"name": name, "score": 0})
     e["name"]  = name
@@ -146,6 +206,9 @@ def update_score(cid: str, uid: str, name: str, delta: int) -> int:
     db["scores"][cid][uid] = e
     save_db()
     return e["score"]
+
+def is_owner(uid: int) -> bool:
+    return OWNER_ID != 0 and uid == OWNER_ID
 
 # ══════════════════════════════════════════
 #  HTTP SERVER
@@ -156,7 +219,7 @@ async def _health(req):
         "status": "healthy", "uptime_seconds": up,
         "running": bot_status["running"],
         "messages": bot_status["message_count"],
-        "version": "5.1.0",
+        "version": "5.1.2",
     }, status=200)
 
 async def _ping(req):
@@ -206,9 +269,6 @@ def clean_html(t: str) -> str:
 
 def q_hash(q: str) -> str:
     return hashlib.md5(q.lower().strip().encode()).hexdigest()[:12]
-
-def now_ts() -> float:
-    return time.time()
 
 _HINGLISH = ["kya","hai","kaise","bhai","batao","kr","rha","tha","ye","wo",
              "tu","tum","ko","nhi","aur","mujhe","hoga","karo","sab","dost"]
@@ -611,7 +671,7 @@ async def poll_answer_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         uid  = str(ans.user.id)
         name = (ans.user.first_name or "?")[:30]
         new_score = update_score(cid, uid, name, +10)
-        await async_github_save()
+        asyncio.create_task(async_github_save())
         logger.info(f"[Score] +10 {name} = {new_score} pts")
     except Exception as e:
         logger.debug(f"[poll_answer] {e}")
@@ -646,6 +706,40 @@ async def lb_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         bot_status["message_count"] += 1
     except Exception as e:
         logger.error(f"[lb] {e}", exc_info=True)
+
+# ══════════════════════════════════════════
+#  /pump  /dump (OWNER ONLY)
+# ══════════════════════════════════════════
+async def pump_dump_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not u.message: return
+    try:
+        if not is_owner(u.effective_user.id if u.effective_user else 0):
+            await u.message.reply_text("🚫 Owner-only command."); return
+        if not u.message.reply_to_message or not u.message.reply_to_message.from_user:
+            await u.message.reply_text("⚠️ Reply to a user's message.\nExample: reply + `/pump 80000`",
+                parse_mode=ParseMode.MARKDOWN); return
+        parts = u.message.text.split()
+        if len(parts) < 2 or not parts[1].isdigit():
+            await u.message.reply_text("⚠️ Usage: `/pump 80000` or `/dump 80000`",
+                parse_mode=ParseMode.MARKDOWN); return
+        amount  = int(parts[1])
+        cmd     = parts[0].lstrip("/").lower().split("@")[0]
+        delta   = +amount if cmd == "pump" else -amount
+        target  = u.message.reply_to_message.from_user
+        cid     = str(u.effective_chat.id)
+        new_sc  = update_score(cid, str(target.id), (target.first_name or "User")[:30], delta)
+        asyncio.create_task(async_github_save())
+        emoji   = "🚀" if cmd == "pump" else "📉"
+        sign    = "+" if delta > 0 else ""
+        await u.message.reply_text(
+            f"{emoji} *{'PUMP' if cmd=='pump' else 'DUMP'}*\n\n"
+            f"👤 *{target.first_name}*\n"
+            f"{'📈' if delta>0 else '📉'} {sign}{amount:,} pts\n"
+            f"💰 New Total: *{new_sc:,} pts*",
+            parse_mode=ParseMode.MARKDOWN)
+        bot_status["message_count"] += 1
+    except Exception as e:
+        logger.error(f"[pump_dump] {e}", exc_info=True)
 
 # ══════════════════════════════════════════
 #  GAME PROTECTION HELPERS
@@ -692,11 +786,9 @@ async def update_game_timer(c: ContextTypes.DEFAULT_TYPE, gkey: str):
         cid = g["chat_id"]
         msg_id = int(gkey.split(":")[1])
         
-        # Reduce by 3 seconds
         timer_data["remaining"] -= 3
         
         if timer_data["remaining"] <= 0:
-            # Timer expired
             g["status"] = "timeout"
             winner_name = g["x_name"] if g["turn"] == "O" else g["o_name"]
             g["winner_name"] = winner_name
@@ -715,11 +807,10 @@ async def update_game_timer(c: ContextTypes.DEFAULT_TYPE, gkey: str):
             except Exception:
                 pass
             
-            # Update leaderboard if applicable
             cid_s = str(cid)
             if not g["vs_bot"]:
                 new_sc = update_score(cid_s, str(g["x_id"] if g["turn"] == "O" else g["o_id"]), winner_name, +20)
-                await async_github_save()
+                asyncio.create_task(async_github_save())
             
             release_player(str(g["x_id"]))
             release_player(str(g["o_id"]))
@@ -727,7 +818,6 @@ async def update_game_timer(c: ContextTypes.DEFAULT_TYPE, gkey: str):
                 del game_timers[gkey]
             del ttt_games[gkey]
         else:
-            # Update timer display
             text = ttt_build_text(g)
             kbd = ttt_build_keyboard(g["board"])
             
@@ -742,7 +832,6 @@ async def update_game_timer(c: ContextTypes.DEFAULT_TYPE, gkey: str):
             except Exception:
                 pass
             
-            # Schedule next update in 3 seconds
             await asyncio.sleep(3)
             await update_game_timer(c, gkey)
     
@@ -803,17 +892,17 @@ def ttt_build_text(g: dict) -> str:
     o_name = g["o_name"]
     turn   = g["turn"]
     status = g.get("status","playing")
-    timer_data = game_timers.get(f"{g['chat_id']}:{g.get('msg_id','')}", {})
+    gkey = f"{g['chat_id']}:{g.get('msg_id','')}"
+    timer_data = game_timers.get(gkey, {})
     remaining = timer_data.get("remaining", TIMER_DURATION)
     timer_str = f"{remaining//60:02d}:{remaining%60:02d}"
 
     if status == "playing":
         cur_name   = x_name if turn == "X" else o_name
-        cur_symbol = TTT_X  if turn == "X" else TTT_O
         status_line = f"🎯 {cur_name}'s Turn\n⏱ {timer_str}"
     elif status == "timeout":
         winner_name = g.get("winner_name","")
-        status_line = f"⏰ Time Expired!\n\n🏆 {winner_name} Wins by Timeout!"
+        status_line = f"⏰ Time Expired!\n\n🏆 {winner_name} Wins by Timeout! +20 pts"
     elif status == "draw":
         status_line = "🤝 Match Draw!"
     else:
@@ -887,14 +976,12 @@ async def tictac_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         gkey = game_key(msg.message_id, cid)
         ttt_games[gkey] = g
         
-        # Initialize timer
         game_timers[gkey] = {"remaining": TIMER_DURATION}
         
         register_player(uid_a, gkey)
         if not vs_bot:
             register_player(str(user_b_id), gkey)
         
-        # Start timer task
         asyncio.create_task(update_game_timer(c, gkey))
 
         bot_status["message_count"] += 1
@@ -1069,8 +1156,8 @@ async def start_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             "⚡ *Features*\n\n"
             "🎮 Games\n"
             "└ Play Tic Tac Toe and more\n\n"
-            "📥 Media Downloader\n"
-            "└ Auto download YouTube & Instagram links\n\n"
+            "📚 Learning\n"
+            "└ Smart search & trivia\n\n"
             "🏆 Leaderboard\n"
             "└ Earn points and climb ranks\n\n"
             "🤖 Smart Utilities\n"
@@ -1078,8 +1165,10 @@ async def start_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             "━━━━━━━━━━━━━━━━━━\n\n"
             "🎯 *Quick Commands*\n\n"
             "/tictac — Start Tic Tac Toe\n"
-            "/lb — View leaderboard\n"
-            "/help — View all commands\n\n"
+            "/quiz — Play trivia\n"
+            "/search — Smart search\n"
+            "/lb — Leaderboard\n"
+            "/help — All commands\n\n"
             "━━━━━━━━━━━━━━━━━━\n\n"
             "🔥 Ready to begin?"
         )
@@ -1101,8 +1190,8 @@ async def help_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             "/quiz — Trivia quiz\n"
             "/lb — Leaderboard\n\n"
             "🎉 *FUN*\n"
-            "/gay — Random gay\n"
-            "/couple — Random couple\n\n"
+            "/gay — Random funny message\n"
+            "/couple — Random couple message\n\n"
             "💬 Mention 'beluga' for AI chat!"
         )
         await u.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
@@ -1188,22 +1277,27 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════
 async def main():
     logger.info("=" * 55)
-    logger.info("🐱  BELUGA BOT  v5.1.0")
-    logger.info(f"   PORT={HTTP_PORT}")
-    logger.info(f"   GitHub={'✅' if GITHUB_TOKEN and GITHUB_GIST else '❌'}")
+    logger.info("🐱  BELUGA BOT  v5.1.2")
+    logger.info(f"   PORT={HTTP_PORT}  OWNER={OWNER_ID}")
+    logger.info(f"   GitHub={'✅' if GITHUB_TOKEN else '❌'}")
     logger.info("=" * 55)
 
     http_runner = await start_http(HTTP_PORT)
     await asyncio.sleep(0.3)
 
     loop = asyncio.get_running_loop()
-    if GITHUB_TOKEN and GITHUB_GIST:
+    if GITHUB_TOKEN:
         try:
             gh = await asyncio.wait_for(
                 loop.run_in_executor(None, github_load_scores), timeout=15)
-            if gh: db["scores"] = gh; save_db()
+            if gh: 
+                db["scores"] = gh
+                save_db()
+                logger.info(f"✅ Loaded {len(gh)} chat leaderboards from GitHub")
         except Exception as e:
-            logger.warning(f"[GitHub startup] {e}")
+            logger.warning(f"[GitHub Load] {e}")
+    else:
+        logger.warning("[GitHub] No token - leaderboard won't persist across restarts")
 
     app = TGApp.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start",              start_handler))
@@ -1212,6 +1306,7 @@ async def main():
     app.add_handler(CommandHandler("quiz",               quiz_handler))
     app.add_handler(CommandHandler(["lb","leaderboard"], lb_handler))
     app.add_handler(CommandHandler(["gay","couple"],     fun_dispatcher))
+    app.add_handler(CommandHandler(["pump","dump"],      pump_dump_handler))
     app.add_handler(CommandHandler("tictac",             tictac_handler))
     app.add_handler(CallbackQueryHandler(ttt_callback,   pattern=r"^ttt:"))
     app.add_handler(PollAnswerHandler(poll_answer_handler))
@@ -1225,7 +1320,7 @@ async def main():
         drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES)
     bot_status["running"] = True
-    logger.info("✅ Beluga v5.1 is LIVE 🐱")
+    logger.info("✅ Beluga v5.1.2 is LIVE 🐱")
 
     stop_evt = asyncio.Event()
     try:
@@ -1249,8 +1344,10 @@ async def main():
     cleanup_task.cancel()
     bot_status["running"] = False
     logger.info("🔄 Shutdown…")
-    if GITHUB_TOKEN and GITHUB_GIST:
-        try: await loop.run_in_executor(None, github_save_scores)
+    if GITHUB_TOKEN:
+        try: 
+            await loop.run_in_executor(None, github_save_scores)
+            logger.info("✅ Saved leaderboard to GitHub")
         except Exception: pass
     for fn in [app.updater.stop, app.stop, app.shutdown, http_runner.cleanup]:
         try: await fn()
