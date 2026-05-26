@@ -1,11 +1,11 @@
 # ═══════════════════════════════════════════════════════════════
-#  BELUGA BOT  v7.0.0  — FULLY FIXED
-#  GitHub: auto-creates gist if missing, stores user_id+name+pts
+#  BELUGA BOT  v8.0.0
+#  Supabase: replaces GitHub gist for persistence
 #  yt-dlp: YouTube + Instagram auto-download on link detection
 #  /tictac PvP + vs Bot with timer
-#  /rock RPS PvP + vs Bot
 #  /quiz /lb /pump /dump /search /gay /couple
 #  /health /ping always 200
+#  /rock REMOVED
 # ═══════════════════════════════════════════════════════════════
 
 import os, logging, random, json, asyncio, requests, re
@@ -34,15 +34,14 @@ logger = logging.getLogger("Beluga")
 # ══════════════════════════════════════════════════════
 #  CONFIG — all from env vars
 # ══════════════════════════════════════════════════════
-DATA_FILE    = "beluga_brain.json"
-OR_KEY       = os.environ.get("OPENROUTER_API_KEY", "")
-GROQ_KEY     = os.environ.get("GROQ_API_KEY", "")
-BOT_TOKEN    = os.environ.get("BOT_TOKEN", "")
-HTTP_PORT    = int(os.environ.get("PORT", "10000"))
-OWNER_ID     = int(os.environ.get("OWNER_ID", "0"))
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
-# GITHUB_GIST_ID is OPTIONAL — if blank, bot auto-creates one
-GITHUB_GIST  = os.environ.get("GITHUB_GIST_ID", "").strip()
+DATA_FILE      = "beluga_brain.json"
+OR_KEY         = os.environ.get("OPENROUTER_API_KEY", "")
+GROQ_KEY       = os.environ.get("GROQ_API_KEY", "")
+BOT_TOKEN      = os.environ.get("BOT_TOKEN", "")
+HTTP_PORT      = int(os.environ.get("PORT", "10000"))
+OWNER_ID       = int(os.environ.get("OWNER_ID", "0"))
+SUPABASE_URL   = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY   = os.environ.get("SUPABASE_KEY", "")
 
 if not BOT_TOKEN or len(BOT_TOKEN) < 20:
     logger.critical("❌ BOT_TOKEN missing"); sys.exit(1)
@@ -60,16 +59,16 @@ active_polls:  dict[str, dict]             = {}
 spam_tracker:  dict[int, list]             = {}
 db:            dict                        = {}
 ttt_games:     dict[str, dict]             = {}
-rps_games:     dict[str, dict]             = {}
 user_in_game:  dict[str, str]              = {}
 game_timers:   dict[str, dict]             = {}
 GAME_TIMEOUT   = 300
 TIMER_DURATION = 60
 _dl_tracker:   dict[str, list]             = {}
-_resolved_gist_id: str                     = ""   # cached after creation
+
+LB_PHOTO_URL = "https://i.postimg.cc/FKN1C157/file-00000000bce4720b905dc2e04c58fa80.png"
 
 # ══════════════════════════════════════════════════════
-#  DATABASE (local JSON)
+#  DATABASE (local JSON — fallback/cache)
 # ══════════════════════════════════════════════════════
 def load_db() -> dict:
     try:
@@ -78,7 +77,7 @@ def load_db() -> dict:
                 return json.load(f)
     except Exception as e:
         logger.error(f"[DB Load] {e}")
-    return {"seen": {}, "locks": {}, "counts": {}, "scores": {}}
+    return {"seen": {}, "locks": {}, "counts": {}, "scores": {}, "weekly_winners": {}}
 
 def save_db() -> None:
     try:
@@ -91,170 +90,181 @@ def save_db() -> None:
 
 db = load_db()
 db.setdefault("scores", {})
-db.setdefault("gist_id", "")   # persists auto-created gist id
-db.setdefault("weekly_winners", {})  # stores top3 from last /nw
+db.setdefault("weekly_winners", {})
 
 # ══════════════════════════════════════════════════════
-#  GITHUB GIST  — auto-create, load, save
+#  SUPABASE HELPERS
 #
-#  Schema saved to gist (beluga_scores.json):
-#  {
-#    "chat_id_string": {
-#      "user_id_string": {
-#        "name": "First Name",
-#        "user_id": 123456789,
-#        "score": 480
-#      },
-#      ...
-#    },
-#    ...
-#  }
+#  Tables required (run in Supabase SQL editor):
+#
+#  CREATE TABLE IF NOT EXISTS users (
+#    id          BIGSERIAL PRIMARY KEY,
+#    chat_id     TEXT NOT NULL,
+#    user_id     TEXT NOT NULL,
+#    name        TEXT NOT NULL DEFAULT '',
+#    score       INTEGER NOT NULL DEFAULT 0,
+#    updated_at  TIMESTAMPTZ DEFAULT NOW(),
+#    UNIQUE(chat_id, user_id)
+#  );
+#
+#  CREATE TABLE IF NOT EXISTS weekly_winners (
+#    id          BIGSERIAL PRIMARY KEY,
+#    chat_id     TEXT NOT NULL UNIQUE,
+#    top3        JSONB NOT NULL DEFAULT '[]',
+#    week_label  TEXT NOT NULL DEFAULT '',
+#    reset_at    TIMESTAMPTZ DEFAULT NOW()
+#  );
 # ══════════════════════════════════════════════════════
-GIST_FILENAME = "beluga_scores.json"
-GH_HEADERS = lambda: {
-    "Authorization": f"token {GITHUB_TOKEN}",
-    "Accept": "application/vnd.github.v3+json",
-    "Content-Type": "application/json",
-}
 
-def gh_get_gist_id() -> str:
-    """Return gist ID: env var → db cache → auto-create"""
-    global _resolved_gist_id
-    if _resolved_gist_id:
-        return _resolved_gist_id
-    if GITHUB_GIST:
-        _resolved_gist_id = GITHUB_GIST
-        return _resolved_gist_id
-    if db.get("gist_id"):
-        _resolved_gist_id = db["gist_id"]
-        return _resolved_gist_id
-    return ""
+def _sb_headers() -> dict:
+    return {
+        "apikey":        SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type":  "application/json",
+        "Prefer":        "return=representation",
+    }
 
-def gh_create_gist() -> str:
-    """Create a new private gist and cache its ID."""
-    global _resolved_gist_id
-    if not GITHUB_TOKEN:
-        return ""
-    try:
-        payload = {
-            "description": "Beluga Bot Leaderboard — auto-created",
-            "public": False,
-            "files": {
-                GIST_FILENAME: {
-                    "content": json.dumps({}, indent=2)
-                }
-            }
-        }
-        r = requests.post(
-            "https://api.github.com/gists",
-            headers=GH_HEADERS(), json=payload, timeout=15
-        )
-        if r.status_code == 201:
-            gid = r.json()["id"]
-            _resolved_gist_id = gid
-            db["gist_id"] = gid
-            save_db()
-            logger.info(f"✅ GitHub Gist created: {gid}")
-            logger.info(f"   Add to Render env: GITHUB_GIST_ID={gid}")
-            return gid
-        else:
-            logger.error(f"[GitHub Create] status {r.status_code}: {r.text[:200]}")
-    except Exception as e:
-        logger.error(f"[GitHub Create] {e}")
-    return ""
+def _sb_url(table: str) -> str:
+    return f"{SUPABASE_URL}/rest/v1/{table}"
 
-def github_load_scores() -> dict:
-    """Load scores from gist on startup. Auto-creates gist if missing."""
-    if not GITHUB_TOKEN:
-        logger.warning("[GitHub] No GITHUB_TOKEN — scores won't persist across restarts")
+def supabase_load_scores() -> dict:
+    """Load all user scores from Supabase → dict[chat_id][user_id]={name,score,user_id}"""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        logger.warning("[Supabase] Credentials not set — running without persistence")
         return {}
-    gid = gh_get_gist_id()
-    if not gid:
-        logger.info("[GitHub] No gist ID found — creating one now…")
-        gid = gh_create_gist()
-        if not gid:
-            logger.error("[GitHub] Could not create gist at startup")
-            return {}
     try:
         r = requests.get(
-            f"https://api.github.com/gists/{gid}",
-            headers=GH_HEADERS(), timeout=15
+            _sb_url("users"),
+            headers=_sb_headers(),
+            params={"select": "chat_id,user_id,name,score"},
+            timeout=15,
         )
-        if r.status_code == 200:
-            files = r.json().get("files", {})
-            if GIST_FILENAME in files:
-                raw = files[GIST_FILENAME].get("content", "{}")
-                scores = json.loads(raw)
-                logger.info(f"✅ Loaded scores from GitHub ({len(scores)} chats)")
-                return scores
-            else:
-                logger.warning(f"[GitHub] File '{GIST_FILENAME}' not in gist")
-        elif r.status_code == 404:
-            logger.warning("[GitHub] Gist not found (404) — will create new one")
-            db["gist_id"] = ""
-            global _resolved_gist_id
-            _resolved_gist_id = ""
-            save_db()
-        else:
-            logger.warning(f"[GitHub Load] status {r.status_code}")
+        if r.status_code != 200:
+            logger.error(f"[Supabase Load Scores] status={r.status_code} {r.text[:200]}")
+            return {}
+        rows = r.json()
+        out: dict = {}
+        for row in rows:
+            cid = row["chat_id"]; uid = row["user_id"]
+            out.setdefault(cid, {})[uid] = {
+                "name":    row["name"],
+                "user_id": int(uid) if uid.lstrip("-").isdigit() else 0,
+                "score":   row["score"],
+            }
+        logger.info(f"✅ Loaded scores from Supabase ({len(rows)} rows, {len(out)} chats)")
+        return out
     except Exception as e:
-        logger.error(f"[GitHub Load] {e}")
-    return {}
+        logger.error(f"[Supabase Load Scores] {e}")
+        return {}
 
-def github_save_scores() -> bool:
-    """Save scores to gist. Auto-creates gist if none exists."""
-    if not GITHUB_TOKEN:
+def supabase_upsert_score(chat_id: str, user_id: str, name: str, score: int) -> bool:
+    """Upsert a single user's score into Supabase."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
         return False
-    gid = gh_get_gist_id()
-    if not gid:
-        gid = gh_create_gist()
-        if not gid:
-            logger.error("[GitHub] Cannot save — failed to create gist")
-            return False
-
-    scores = db.get("scores", {})
-    # Ensure every entry has user_id stored
-    for cid_s, users in scores.items():
-        for uid_s, entry in users.items():
-            entry.setdefault("user_id", int(uid_s) if uid_s.lstrip("-").isdigit() else 0)
-
     try:
-        r = requests.patch(
-            f"https://api.github.com/gists/{gid}",
-            headers=GH_HEADERS(),
-            json={"files": {GIST_FILENAME: {"content": json.dumps(scores, indent=2)}}},
-            timeout=15
-        )
-        if r.status_code == 200:
-            logger.debug("✅ Scores saved to GitHub")
+        payload = {
+            "chat_id":    chat_id,
+            "user_id":    user_id,
+            "name":       name,
+            "score":      score,
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+        hdrs = {**_sb_headers(), "Prefer": "resolution=merge-duplicates,return=minimal"}
+        r = requests.post(_sb_url("users"), headers=hdrs, json=payload, timeout=10)
+        if r.status_code in (200, 201):
             return True
-        else:
-            logger.warning(f"[GitHub Save] status {r.status_code}: {r.text[:200]}")
-            if r.status_code == 404:
-                # Gist deleted externally — recreate
-                global _resolved_gist_id
-                _resolved_gist_id = ""
-                db["gist_id"] = ""
-                save_db()
+        logger.warning(f"[Supabase Upsert Score] status={r.status_code} {r.text[:200]}")
     except Exception as e:
-        logger.error(f"[GitHub Save] {e}")
+        logger.error(f"[Supabase Upsert Score] {e}")
     return False
 
-async def async_github_save():
+def supabase_load_weekly_winners() -> dict:
+    """Load weekly_winners table → dict[chat_id]={top3, week_label, reset_at}"""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return {}
+    try:
+        r = requests.get(
+            _sb_url("weekly_winners"),
+            headers=_sb_headers(),
+            params={"select": "chat_id,top3,week_label,reset_at"},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            logger.error(f"[Supabase Load Winners] status={r.status_code} {r.text[:200]}")
+            return {}
+        rows = r.json()
+        out = {}
+        for row in rows:
+            out[row["chat_id"]] = {
+                "top3":       row.get("top3", []),
+                "week_label": row.get("week_label", ""),
+                "reset_at":   row.get("reset_at", ""),
+            }
+        logger.info(f"✅ Loaded weekly winners ({len(out)} chats)")
+        return out
+    except Exception as e:
+        logger.error(f"[Supabase Load Winners] {e}")
+        return {}
+
+def supabase_save_weekly_winners(chat_id: str, top3: list, week_label: str) -> bool:
+    """Upsert weekly winners for a chat."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return False
+    try:
+        payload = {
+            "chat_id":    chat_id,
+            "top3":       top3,
+            "week_label": week_label,
+            "reset_at":   datetime.utcnow().isoformat(),
+        }
+        hdrs = {**_sb_headers(), "Prefer": "resolution=merge-duplicates,return=minimal"}
+        r = requests.post(_sb_url("weekly_winners"), headers=hdrs, json=payload, timeout=10)
+        if r.status_code in (200, 201):
+            return True
+        logger.warning(f"[Supabase Save Winners] status={r.status_code} {r.text[:200]}")
+    except Exception as e:
+        logger.error(f"[Supabase Save Winners] {e}")
+    return False
+
+def supabase_reset_scores(chat_id: str) -> bool:
+    """Set all scores in a chat to 0."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return False
+    try:
+        r = requests.patch(
+            _sb_url("users"),
+            headers=_sb_headers(),
+            params={"chat_id": f"eq.{chat_id}"},
+            json={"score": 0, "updated_at": datetime.utcnow().isoformat()},
+            timeout=10,
+        )
+        if r.status_code in (200, 204):
+            return True
+        logger.warning(f"[Supabase Reset Scores] status={r.status_code} {r.text[:200]}")
+    except Exception as e:
+        logger.error(f"[Supabase Reset Scores] {e}")
+    return False
+
+async def async_sb_upsert(chat_id: str, user_id: str, name: str, score: int):
     loop = asyncio.get_running_loop()
     try:
-        await loop.run_in_executor(None, github_save_scores)
+        await loop.run_in_executor(None, supabase_upsert_score, chat_id, user_id, name, score)
     except Exception as e:
-        logger.debug(f"[Async GitHub] {e}")
+        logger.debug(f"[Async SB Upsert] {e}")
 
 def update_score(cid: str, uid: str, name: str, delta: int) -> int:
     db.setdefault("scores", {}).setdefault(cid, {})
-    e = db["scores"][cid].get(uid, {"name": name, "user_id": int(uid) if uid.lstrip("-").isdigit() else 0, "score": 0})
+    e = db["scores"][cid].get(uid, {
+        "name":    name,
+        "user_id": int(uid) if uid.lstrip("-").isdigit() else 0,
+        "score":   0,
+    })
     e["name"]    = name
     e["user_id"] = int(uid) if uid.lstrip("-").isdigit() else 0
     e["score"]   = max(0, e["score"] + delta)
     db["scores"][cid][uid] = e
     save_db()
+    asyncio.create_task(async_sb_upsert(cid, uid, name, e["score"]))
     return e["score"]
 
 def is_owner(uid: int) -> bool:
@@ -265,15 +275,15 @@ def is_owner(uid: int) -> bool:
 # ══════════════════════════════════════════════════════
 async def _health(req):
     up = int((datetime.now() - bot_status["start_time"]).total_seconds())
-    gid = gh_get_gist_id()
     return web.json_response({
-        "status": "healthy", "uptime_seconds": up,
-        "running": bot_status["running"],
-        "messages": bot_status["message_count"],
-        "errors": bot_status["error_count"],
-        "github_gist": gid or "not configured",
-        "version": "6.0.0",
-        "ts": datetime.now().isoformat(),
+        "status":    "healthy",
+        "uptime_seconds": up,
+        "running":   bot_status["running"],
+        "messages":  bot_status["message_count"],
+        "errors":    bot_status["error_count"],
+        "supabase":  "configured" if SUPABASE_URL else "not configured",
+        "version":   "8.0.0",
+        "ts":        datetime.now().isoformat(),
     }, status=200)
 
 async def _ping(req):
@@ -283,13 +293,12 @@ async def _stats(req):
     up = (datetime.now() - bot_status["start_time"]).total_seconds()
     ok = bot_status["api_calls"] - bot_status["failed_apis"]
     return web.json_response({
-        "uptime_hours": round(up/3600, 2),
-        "messages": bot_status["message_count"],
-        "errors": bot_status["error_count"],
-        "api_calls": bot_status["api_calls"],
+        "uptime_hours":    round(up/3600, 2),
+        "messages":        bot_status["message_count"],
+        "errors":          bot_status["error_count"],
+        "api_calls":       bot_status["api_calls"],
         "success_rate_pct": round(ok/max(bot_status["api_calls"],1)*100, 2),
         "active_ttt_games": len(ttt_games),
-        "active_rps_games": len(rps_games),
     }, status=200)
 
 async def start_http(port: int):
@@ -411,7 +420,7 @@ async def ai_emoji(text: str) -> str:
 # ══════════════════════════════════════════════════════
 #  WIKIPEDIA + GOOGLE + AI SEARCH
 # ══════════════════════════════════════════════════════
-WIKI_UA = {"User-Agent": "BelugaBot/6.0"}
+WIKI_UA = {"User-Agent": "BelugaBot/8.0"}
 G_HDR   = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
            "Accept-Language": "en-US,en;q=0.9"}
 
@@ -510,15 +519,15 @@ async def ai_summarise(query: str, wiki: dict, goog: dict) -> str:
         f"Query: {query}\n\nData:\n{chr(10).join(ctx)[:2800]}\n\nWrite summary:", "", max_tok=450)
 
 # ══════════════════════════════════════════════════════
-#  MEDIA DOWNLOAD  — YouTube + Instagram + X
-#  Uses yt-dlp (must be in requirements.txt)
+#  MEDIA DOWNLOAD — YouTube + Instagram + X
+#  Uses yt-dlp (add yt-dlp to requirements.txt)
 # ══════════════════════════════════════════════════════
 _MEDIA_RE = re.compile(
     r"https?://(?:www\.)?"
     r"(?:"
     r"(?:twitter\.com|x\.com)/\S+?/status/\d+"
     r"|instagram\.com/(?:p|reel|tv|stories)/[A-Za-z0-9_\-]+"
-    r"|(?:youtu\.be|youtube\.com/(?:watch|shorts|embed))\S+"
+    r"|(?:youtu\.be/[A-Za-z0-9_\-]+|youtube\.com/(?:watch|shorts|embed)\S+)"
     r")",
     re.IGNORECASE
 )
@@ -532,11 +541,7 @@ def _dl_rate_ok(cid: str) -> bool:
     return True
 
 def _ydl_download(url: str, outdir: str) -> dict:
-    """
-    Download with yt-dlp. Returns {ok, path, type, title, error}.
-    Optimised for speed: prefers mp4 <= 720p, skips ffmpeg merge when possible.
-    Runs in executor — blocking I/O.
-    """
+    """Download with yt-dlp. Returns {ok, path, type, title, error}."""
     result = {"ok": False, "path": None, "type": "video", "title": "", "error": ""}
     try:
         import yt_dlp
@@ -545,15 +550,17 @@ def _ydl_download(url: str, outdir: str) -> dict:
         logger.error("yt_dlp not installed — add yt-dlp to requirements.txt")
         return result
 
-    # Speed strategy:
-    # 1. Try a pre-muxed mp4 <= 720p first (no ffmpeg needed = fast)
-    # 2. Fall back to merging best video+audio
-    # 3. Last resort: any best single file
+    # ── Cookie approach for age-restricted / login-required content ──
+    # If you have a cookies.txt file exported from your browser, set path here.
+    cookies_file = os.environ.get("YT_COOKIES_FILE", "")
+
     ydl_opts = {
+        # Priority: pre-muxed mp4 ≤ 720p (no ffmpeg = fast), then merge, then any
         "format": (
-            "best[ext=mp4][height<=720][filesize<49M]"
+            "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]"
+            "/best[ext=mp4][height<=720][filesize<49M]"
             "/best[ext=mp4][filesize<49M]"
-            "/bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/bestvideo+bestaudio"
+            "/bestvideo[ext=mp4]+bestaudio"
             "/best[filesize<49M]"
         ),
         "outtmpl":            os.path.join(outdir, "media.%(ext)s"),
@@ -561,24 +568,35 @@ def _ydl_download(url: str, outdir: str) -> dict:
         "no_warnings":        True,
         "noplaylist":         True,
         "max_filesize":       49 * 1024 * 1024,
-        "socket_timeout":     20,
-        "retries":            2,
-        "fragment_retries":   2,
+        "socket_timeout":     30,
+        "retries":            3,
+        "fragment_retries":   3,
         "merge_output_format":"mp4",
-        "concurrent_fragment_downloads": 4,   # faster fragment dl
+        "concurrent_fragment_downloads": 4,
+        # Keep ffmpeg merge enabled — required for bestvideo+bestaudio
+        "postprocessors": [{
+            "key":            "FFmpegVideoConvertor",
+            "preferedformat": "mp4",
+        }],
         "http_headers": {
             "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
+                "Mozilla/5.0 (Linux; Android 12; SM-S906N Build/QP1A.190711.020; wv) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 "
+                "Chrome/80.0.3987.119 Mobile Safari/537.36"
             ),
             "Accept-Language": "en-US,en;q=0.9",
         },
-        # Instagram / X specific: embed cookies approach via extractor args
         "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web"],
+            },
             "instagram": {"api": ["android"]},
         },
     }
+
+    # Attach cookies if available
+    if cookies_file and os.path.exists(cookies_file):
+        ydl_opts["cookiefile"] = cookies_file
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -588,7 +606,7 @@ def _ydl_download(url: str, outdir: str) -> dict:
 
             result["title"] = (info.get("title") or info.get("description") or "")[:80].strip()
 
-            # Find the downloaded file — outtmpl uses "media" as base name
+            # Find the downloaded file
             found = None
             for ext in [".mp4", ".webm", ".mkv", ".mov", ".m4v", ".avi",
                         ".jpg", ".jpeg", ".png", ".gif", ".webp"]:
@@ -597,11 +615,10 @@ def _ydl_download(url: str, outdir: str) -> dict:
                     found = candidate; break
 
             if not found:
-                # Scan outdir for any completed file
                 files = sorted(
-                    [f for f in os.listdir(outdir) if not f.endswith((".part",".ytdl"))],
+                    [f for f in os.listdir(outdir) if not f.endswith((".part", ".ytdl"))],
                     key=lambda f: os.path.getsize(os.path.join(outdir, f)),
-                    reverse=True
+                    reverse=True,
                 )
                 if files:
                     found = os.path.join(outdir, files[0])
@@ -610,11 +627,11 @@ def _ydl_download(url: str, outdir: str) -> dict:
                 result["error"] = "No file after download"; return result
 
             sz = os.path.getsize(found)
-            if sz == 0:    result["error"] = "Empty file"; return result
-            if sz > 50*1024*1024: result["error"] = f"Too large ({sz//1024//1024}MB)"; return result
+            if sz == 0:             result["error"] = "Empty file"; return result
+            if sz > 50*1024*1024:   result["error"] = f"Too large ({sz//1024//1024} MB)"; return result
 
             ext_l = os.path.splitext(found)[1].lower()
-            ftype = "image" if ext_l in (".jpg",".jpeg",".png",".gif",".webp") else "video"
+            ftype  = "image" if ext_l in (".jpg",".jpeg",".png",".gif",".webp") else "video"
             result.update({"ok": True, "path": found, "type": ftype})
 
     except Exception as e:
@@ -623,7 +640,7 @@ def _ydl_download(url: str, outdir: str) -> dict:
             "private","login required","age","unavailable","removed",
             "suspended","not found","403","404","not available",
             "this video is not available","members-only","requires authentication",
-            "this post may have been removed"
+            "this post may have been removed","sign in",
         ]):
             result["error"] = "unavailable"
         else:
@@ -638,11 +655,10 @@ async def download_and_send(u: Update, c: ContextTypes.DEFAULT_TYPE, url: str):
         return  # silent rate limit
 
     url_l = url.lower()
-    if "youtu"      in url_l: platform, pemoji = "YouTube",    "▶️"
-    elif "instagram" in url_l: platform, pemoji = "Instagram", "📸"
-    else:                      platform, pemoji = "X (Twitter)","🐦"
+    if "youtu"       in url_l: platform, pemoji = "YouTube",    "▶️"
+    elif "instagram" in url_l: platform, pemoji = "Instagram",  "📸"
+    else:                      platform, pemoji = "X (Twitter)", "🐦"
 
-    # Show downloading status
     status_msg = None
     try:
         await c.bot.send_chat_action(cid, "upload_video")
@@ -657,7 +673,7 @@ async def download_and_send(u: Update, c: ContextTypes.DEFAULT_TYPE, url: str):
         loop   = asyncio.get_running_loop()
         result = await asyncio.wait_for(
             loop.run_in_executor(None, _ydl_download, url, tmpdir),
-            timeout=90.0)
+            timeout=120.0)
 
         if status_msg:
             try: await status_msg.delete()
@@ -668,6 +684,12 @@ async def download_and_send(u: Update, c: ContextTypes.DEFAULT_TYPE, url: str):
                 await safe_react(c.bot, cid, u.message.message_id, "🔒")
             else:
                 logger.debug(f"[DL fail] {result['error']}")
+                try:
+                    await u.message.reply_text(
+                        f"⚠️ _Could not download:_ `{result['error'][:100]}`",
+                        parse_mode=ParseMode.MARKDOWN)
+                except Exception:
+                    pass
             return
 
         caption = f"{pemoji} *Downloaded from {platform}*"
@@ -676,12 +698,11 @@ async def download_and_send(u: Update, c: ContextTypes.DEFAULT_TYPE, url: str):
         caption += "\n✅ _via Beluga Bot_"
 
         await c.bot.send_chat_action(
-            cid, "upload_photo" if result["type"]=="image" else "upload_video")
+            cid, "upload_photo" if result["type"] == "image" else "upload_video")
 
         with open(result["path"], "rb") as f:
             if result["type"] == "image":
-                await u.message.reply_photo(
-                    photo=f, caption=caption, parse_mode=ParseMode.MARKDOWN)
+                await u.message.reply_photo(photo=f, caption=caption, parse_mode=ParseMode.MARKDOWN)
             else:
                 await u.message.reply_video(
                     video=f, caption=caption,
@@ -698,7 +719,7 @@ async def download_and_send(u: Update, c: ContextTypes.DEFAULT_TYPE, url: str):
         logger.error(f"[DL] {e}", exc_info=True)
         bot_status["error_count"] += 1
         if status_msg:
-            try: await status_msg.edit_text("⚠️ Download failed.")
+            try: await status_msg.edit_text("⚠️ Download failed — try again.")
             except Exception: pass
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -879,56 +900,102 @@ async def poll_answer_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         cid  = str(info["chat_id"]); uid = str(ans.user.id)
         name = (ans.user.first_name or "?")[:30]
         new_score = update_score(cid, uid, name, +10)
-        asyncio.create_task(async_github_save())
         logger.info(f"[Score] +10 {name} (uid={uid}) = {new_score} pts in chat {cid}")
     except Exception as e: logger.debug(f"[poll_answer] {e}")
 
 # ══════════════════════════════════════════════════════
-#  LEADERBOARD
+#  LEADERBOARD  — new design
 # ══════════════════════════════════════════════════════
 MEDALS = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
+
+def _days_until_next_monday() -> int:
+    """Days until next Monday (weekly reset day)."""
+    today = datetime.now().weekday()  # 0=Mon
+    return (7 - today) % 7 or 7
 
 async def lb_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message: return
     try:
         cid    = str(u.effective_chat.id)
         scores = db.get("scores",{}).get(cid,{})
+        ww     = db.get("weekly_winners",{}).get(cid)
+        days   = _days_until_next_monday()
 
         lines = []
 
-        # ── Show last week's top 3 if stored ──────────────────────
-        ww = db.get("weekly_winners",{}).get(cid)
+        # ── Hall of Fame ─────────────────────────────────────────
+        lines.append("╭────────────────────────────────╮")
+        lines.append("        🏆 *WEEKLY HALL OF FAME*")
+        lines.append("╰────────────────────────────────╯")
+        lines.append("")
+        lines.append("       *PREVIOUS TOP 3 WEEK WINNERS*")
+        lines.append("")
+
         if ww and ww.get("top3"):
             wk_label = ww.get("week_label","Last Week")
-            lines.append(f"🏆🎉 *LAST WEEK CHAMPIONS* 🎉🏆")
-            lines.append(f"_Week: {wk_label}_\n")
+            lines.append(f"_Week: {wk_label}_")
+            lines.append("")
             for i, e in enumerate(ww["top3"]):
                 m = MEDALS[i]
-                lines.append(f"{m} *{e['name'][:18]}* — {e['score']:,} pts")
-            lines.append("\n━━━━━━━━━━━━━━━━━━━━\n")
+                lines.append(f"  {m}  *{e['name'][:20]}*   —   {e['score']:,} pts")
+        else:
+            lines.append("  _(No previous week data yet)_")
+
+        lines.append("")
+        lines.append("╭────────────────────────────────╮")
+        lines.append("          ⚡ *LIVE LEADERBOARD*")
+        lines.append("╰────────────────────────────────╯")
+        lines.append("")
+        lines.append(f"⏳ *Weekly Reset In:* {days} Day{'s' if days != 1 else ''}")
+        lines.append("")
 
         if not scores:
-            lines.append("📊 No current scores yet!\nPlay `/quiz` or `/tictac` to earn points 🐾")
-            await u.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN); return
+            for i in range(10):
+                m = MEDALS[i]
+                lines.append(f"{m}  `{'_'*19}`   0 pts")
+        else:
+            board = sorted(scores.values(), key=lambda x: x["score"], reverse=True)
+            for i in range(10):
+                m = MEDALS[i]
+                if i < len(board):
+                    e    = board[i]
+                    name = e["name"][:18]
+                    pts  = e["score"]
+                else:
+                    name = "—"
+                    pts  = 0
+                lines.append(f"{m}  *{name:<18}*   {pts:,} pts")
 
-        board = sorted(scores.values(), key=lambda x: x["score"], reverse=True)
-        lines += ["╔════════════════════════════╗",
-                  "🏆  *CURRENT LEADERBOARD*  🏆",
-                  "╚════════════════════════════╝\n"]
-        for i, e in enumerate(board[:10]):
-            medal = MEDALS[i] if i < len(MEDALS) else f"{i+1}."
-            lines.append(f"{medal} {e['name'][:18]:<18} —  *{e['score']:,} pts*")
-        lines += ["\n━━━━━━━━━━━━━━━━━━━━",
-                  "📈 Sorted: Highest → Lowest",
-                  "━━━━━━━━━━━━━━━━━━━━",
-                  "_+10 quiz/game win  |  -10 game loss_"]
-        await u.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        lines.append("")
+        lines.append("📊 *Highest → Lowest*")
+        lines.append("")
+        lines.append("🎮 *Points System*")
+        lines.append("➕ +10 Quiz / Game Win")
+        lines.append("➖ \\-10 If Game Lost")
+
+        caption = "\n".join(lines)
+
+        # Send with the leaderboard photo
+        try:
+            await u.message.reply_photo(
+                photo=LB_PHOTO_URL,
+                caption=caption,
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            # fallback: send as text if photo fails
+            await u.message.reply_text(caption, parse_mode=ParseMode.MARKDOWN)
+
         bot_status["message_count"] += 1
-    except Exception as e: logger.error(f"[lb] {e}", exc_info=True)
+    except Exception as e:
+        logger.error(f"[lb] {e}", exc_info=True)
+        try: await u.message.reply_text("😿 Leaderboard failed to load.")
+        except Exception: pass
 
-# /nw — New Week: owner saves top3 then resets all scores to 0
+# ══════════════════════════════════════════════════════
+#  /nw — New Week (owner only)
+# ══════════════════════════════════════════════════════
 async def nw_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """/nw — Owner only. Saves top 3 as weekly champions, resets all scores to 0."""
     if not u.message: return
     try:
         if not is_owner(u.effective_user.id if u.effective_user else 0):
@@ -936,8 +1003,6 @@ async def nw_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
         cid    = str(u.effective_chat.id)
         scores = db.get("scores",{}).get(cid,{})
-
-        # Save top 3 before reset
         board  = sorted(scores.values(), key=lambda x: x["score"], reverse=True)
         top3   = [{"name": e["name"], "score": e["score"]} for e in board[:3]]
         wk_label = datetime.now().strftime("%d %b %Y")
@@ -948,15 +1013,19 @@ async def nw_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             "reset_at":   datetime.now().isoformat(),
         }
 
-        # Reset all scores to 0
+        # Reset all scores in memory
         if cid in db.get("scores",{}):
             for uid_s in db["scores"][cid]:
                 db["scores"][cid][uid_s]["score"] = 0
-
         save_db()
-        asyncio.create_task(async_github_save())
 
-        # Announce top 3 winners
+        # Persist to Supabase
+        loop = asyncio.get_running_loop()
+        asyncio.create_task(loop.run_in_executor(
+            None, supabase_save_weekly_winners, cid, top3, wk_label))
+        asyncio.create_task(loop.run_in_executor(
+            None, supabase_reset_scores, cid))
+
         announce = [
             "🏆🎉 *NEW WEEK STARTED!* 🎉🏆",
             f"\n_Week ending {wk_label}_\n",
@@ -1004,7 +1073,6 @@ async def pump_dump_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         target = u.message.reply_to_message.from_user
         cid    = str(u.effective_chat.id)
         new_sc = update_score(cid, str(target.id), (target.first_name or "User")[:30], delta)
-        asyncio.create_task(async_github_save())
         sign   = "+" if delta > 0 else ""
         emoji  = "🚀" if cmd == "pump" else "📉"
         await u.message.reply_text(
@@ -1030,7 +1098,7 @@ def release_player(uid: str):
 def player_busy(uid: str) -> bool:
     gkey = user_in_game.get(uid)
     if not gkey: return False
-    if gkey in ttt_games or gkey in rps_games: return True
+    if gkey in ttt_games: return True
     release_player(uid); return False
 
 async def cleanup_expired_games():
@@ -1040,21 +1108,11 @@ async def cleanup_expired_games():
         if now - g.get("created", now) > GAME_TIMEOUT:
             release_player(str(g.get("x_id",""))); release_player(str(g.get("o_id","")))
             game_timers.pop(gkey, None); del ttt_games[gkey]
-    for gkey in list(rps_games.keys()):
-        g = rps_games[gkey]
-        if now - g.get("created", now) > GAME_TIMEOUT:
-            release_player(str(g.get("p1_id",""))); release_player(str(g.get("p2_id","")))
-            del rps_games[gkey]
 
 # ══════════════════════════════════════════════════════
 #  TIMER TASK for TTT
 # ══════════════════════════════════════════════════════
 async def run_game_timer(c: ContextTypes.DEFAULT_TYPE, gkey: str):
-    """
-    60-second SHARED game clock. Ticks every 3s.
-    Loser = player whose turn it is when time runs out.
-    Winner +10 pts, Loser -10 pts (PvP only).
-    """
     try:
         while True:
             await asyncio.sleep(3)
@@ -1072,7 +1130,6 @@ async def run_game_timer(c: ContextTypes.DEFAULT_TYPE, gkey: str):
                 return
 
             if td["remaining"] <= 0:
-                # Player whose turn it is loses by timeout
                 if g["turn"] == "X":
                     winner_name = g["o_name"]; winner_uid = str(g["o_id"])
                     loser_name  = g["x_name"]; loser_uid  = str(g["x_id"])
@@ -1092,14 +1149,12 @@ async def run_game_timer(c: ContextTypes.DEFAULT_TYPE, gkey: str):
                 if not g["vs_bot"]:
                     update_score(cid_s, winner_uid, winner_name, +10)
                     update_score(cid_s, loser_uid,  loser_name,  -10)
-                    asyncio.create_task(async_github_save())
                 release_player(str(g["x_id"]))
                 release_player(str(g["o_id"]))
                 game_timers.pop(gkey, None)
                 ttt_games.pop(gkey, None)
                 return
             else:
-                # Refresh timer display every 3s
                 try:
                     await c.bot.edit_message_text(
                         chat_id=cid, message_id=msg_id,
@@ -1128,16 +1183,10 @@ def ttt_is_draw(board: list) -> bool:
     return all(c != TTT_EMPTY for c in board) and not ttt_check_winner(board)
 
 def _minimax(board: list, is_maximizing: bool, alpha: int, beta: int) -> int:
-    """
-    Minimax with alpha-beta pruning.
-    Bot = TTT_O (maximizer, +10), Human = TTT_X (minimizer, -10).
-    Returns score from bot's perspective.
-    """
     winner = ttt_check_winner(board)
     if winner == TTT_O: return 10
     if winner == TTT_X: return -10
     if all(c != TTT_EMPTY for c in board): return 0
-
     if is_maximizing:
         best = -100
         for i in range(9):
@@ -1162,11 +1211,6 @@ def _minimax(board: list, is_maximizing: bool, alpha: int, beta: int) -> int:
         return best
 
 def ttt_bot_move(board: list) -> int:
-    """
-    UNBEATABLE bot using minimax + alpha-beta pruning.
-    Always plays the mathematically optimal move.
-    Human can never win — best outcome is draw.
-    """
     best_score = -1000
     best_move  = -1
     for i in range(9):
@@ -1186,9 +1230,8 @@ def ttt_build_keyboard(board: list, disabled: bool = False) -> InlineKeyboardMar
         for col in range(3):
             idx  = row*3 + col
             cell = board[idx]
-            label = cell if cell != TTT_EMPTY else TTT_EMPTY
             cb = f"ttt:noop:{idx}" if (cell != TTT_EMPTY or disabled) else f"ttt:move:{idx}"
-            r.append(InlineKeyboardButton(label, callback_data=cb))
+            r.append(InlineKeyboardButton(cell, callback_data=cb))
         rows.append(r)
     return InlineKeyboardMarkup(rows)
 
@@ -1287,7 +1330,6 @@ async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if g["turn"] == "O" and not g["vs_bot"] and not valid_o:
             await q.answer("❌ You are not part of this game!" if not is_participant else "Not your turn!", show_alert=True); return
 
-        # Reset timer on move
         if gkey in game_timers:
             game_timers[gkey]["remaining"] = TIMER_DURATION
 
@@ -1297,7 +1339,6 @@ async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         def _end(winner_sym=None):
             if winner_sym:
-                # Winner gets +10, loser gets -10
                 wname  = g["x_name"] if winner_sym == TTT_X else g["o_name"]
                 wuid   = str(g["x_id"]) if winner_sym == TTT_X else str(g["o_id"])
                 lname  = g["o_name"] if winner_sym == TTT_X else g["x_name"]
@@ -1305,15 +1346,10 @@ async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 g["status"] = "win"; g["winner_name"] = wname
                 cid_s  = str(cid)
                 if not g["vs_bot"]:
-                    # PvP: both get scored
                     update_score(cid_s, wuid, wname, +10)
                     update_score(cid_s, luid, lname, -10)
-                    asyncio.create_task(async_github_save())
                 elif winner_sym == TTT_X:
-                    # Player beat the bot — player gets +10
                     update_score(cid_s, wuid, wname, +10)
-                    asyncio.create_task(async_github_save())
-                # Bot winning: no score change
             else:
                 g["status"] = "draw"
             game_timers.pop(gkey, None)
@@ -1346,125 +1382,6 @@ async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(ttt_build_text(g), parse_mode=ParseMode.MARKDOWN,
             reply_markup=ttt_build_keyboard(board))
     except Exception as e: logger.error(f"[ttt_cb] {e}", exc_info=True)
-
-# ══════════════════════════════════════════════════════
-#  ROCK PAPER SCISSORS
-# ══════════════════════════════════════════════════════
-RPS_BEATS = {"rock":"scissors","scissors":"paper","paper":"rock"}
-RPS_EMOJI = {"rock":"🪨","paper":"📄","scissors":"✂️"}
-
-def rps_keyboard(gkey: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🟥🪨 Rock",     callback_data=f"rps:{gkey}:rock"),
-        InlineKeyboardButton("🟦📄 Paper",    callback_data=f"rps:{gkey}:paper"),
-        InlineKeyboardButton("🟨✂️ Scissors", callback_data=f"rps:{gkey}:scissors"),
-    ]])
-
-def rps_build_text(g: dict) -> str:
-    p1   = g["p1_name"]; p2 = g["p2_name"]
-    c1   = g.get("p1_choice"); c2 = g.get("p2_choice")
-    status = g.get("status","waiting")
-    p1l  = f"✅ *{p1}* — Locked 🔒" if c1 else f"⌛ *{p1}* — Choosing…"
-    p2l  = f"✅ *{p2}* — Locked 🔒" if c2 else f"⌛ *{p2}* — Choosing…"
-    if status == "done":
-        e1 = RPS_EMOJI.get(c1,"?"); e2 = RPS_EMOJI.get(c2,"?")
-        winner = g.get("winner","draw"); wn = g.get("winner_name","")
-        result = (f"👤 *{p1}*: {e1} {c1}\n👤 *{p2}*: {e2} {c2}\n"
-                  f"━━━━━━━━━━━━━━━\n"
-                  + (f"🤝 *Draw!*" if winner=="draw" else f"👑 *{wn} Wins!*  🎁 +20 pts"))
-        return f"🪨📄✂️ *ROCK • PAPER • SCISSORS*\n━━━━━━━━━━━━━━━\n{result}"
-    return (f"🎮 *ROCK • PAPER • SCISSORS*\n━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚔️  *{p1}*   🆚   *{p2}*\n━━━━━━━━━━━━━━━━━━━━\n\n{p1l}\n{p2l}")
-
-async def rock_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    if not u.message: return
-    try:
-        await cleanup_expired_games()
-        ua    = u.effective_user; cid = u.effective_chat.id
-        uid_a = str(ua.id);  name_a = (ua.first_name or "Player")[:20]
-        vs_bot = True; uid_b = None; name_b = "🤖 Bot"
-
-        if u.message.reply_to_message and u.message.reply_to_message.from_user:
-            rb = u.message.reply_to_message.from_user
-            if not rb.is_bot:
-                vs_bot = False; uid_b = str(rb.id)
-                name_b = (rb.first_name or "Player2")[:20]
-                if player_busy(uid_b):
-                    await u.message.reply_text("⚠️ That player is already in a game!"); return
-
-        if player_busy(uid_a):
-            await u.message.reply_text("⚠️ You're already in a game!"); return
-
-        g = {"p1_id":ua.id,"p1_name":name_a,"p2_id":int(uid_b) if uid_b else -1,
-             "p2_name":name_b,"p1_choice":None,"p2_choice":None,
-             "vs_bot":vs_bot,"status":"waiting","created":time.time(),"chat_id":cid}
-
-        msg = await u.message.reply_text(rps_build_text(g),
-            parse_mode=ParseMode.MARKDOWN, reply_markup=rps_keyboard("tmp"))
-        gkey = game_key(msg.message_id, cid)
-        rps_games[gkey] = g
-        register_player(uid_a, gkey)
-        if not vs_bot and uid_b: register_player(uid_b, gkey)
-        try: await msg.edit_reply_markup(rps_keyboard(gkey))
-        except Exception: pass
-        bot_status["message_count"] += 1
-    except Exception as e: logger.error(f"[rock] {e}", exc_info=True)
-
-async def rps_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if not q: return
-    try:
-        await q.answer()
-        parts = q.data.split(":")
-        if len(parts) != 3 or parts[0] != "rps": return
-        _, raw_gkey, choice = parts
-        # gkey is "cid:mid" but split by ":" gives 3 parts total — reconstruct
-        cid    = q.message.chat_id; mid = q.message.message_id
-        gkey   = game_key(mid, cid)
-        g      = rps_games.get(gkey)
-
-        if not g: await q.answer("⏰ Game expired.", show_alert=True); return
-        if g["status"] == "done": await q.answer("Game ended!", show_alert=True); return
-
-        uid  = str(q.from_user.id)
-        is_p1 = uid == str(g["p1_id"])
-        is_p2 = uid == str(g["p2_id"]) or (g["vs_bot"] and is_p1)
-
-        if not is_p1 and not is_p2:
-            await q.answer("❌ You are not part of this game!", show_alert=True); return
-
-        if is_p1 and not g["p1_choice"]:
-            g["p1_choice"] = choice
-            if g["vs_bot"]:
-                g["p2_choice"] = random.choice(list(RPS_BEATS.keys()))
-            await q.answer("✅ Choice locked!")
-        elif not is_p1 and is_p2 and not g["p2_choice"]:
-            g["p2_choice"] = choice
-            await q.answer("✅ Choice locked!")
-        elif (is_p1 and g["p1_choice"]) or (not is_p1 and g["p2_choice"]):
-            await q.answer("You already chose!", show_alert=True); return
-
-        if g["p1_choice"] and g["p2_choice"]:
-            c1 = g["p1_choice"]; c2 = g["p2_choice"]
-            if c1 == c2:
-                g["winner"] = "draw"; g["winner_name"] = ""
-            elif RPS_BEATS.get(c1) == c2:
-                g["winner"] = "p1"; g["winner_name"] = g["p1_name"]
-                update_score(str(cid), str(g["p1_id"]), g["p1_name"], +20)
-                asyncio.create_task(async_github_save())
-            else:
-                g["winner"] = "p2"; g["winner_name"] = g["p2_name"]
-                if not g["vs_bot"]:
-                    update_score(str(cid), str(g["p2_id"]), g["p2_name"], +20)
-                    asyncio.create_task(async_github_save())
-            g["status"] = "done"
-            await q.edit_message_text(rps_build_text(g), parse_mode=ParseMode.MARKDOWN)
-            release_player(str(g["p1_id"])); release_player(str(g["p2_id"]))
-            del rps_games[gkey]
-        else:
-            await q.edit_message_text(rps_build_text(g),
-                parse_mode=ParseMode.MARKDOWN, reply_markup=rps_keyboard(gkey))
-    except Exception as e: logger.error(f"[rps_cb] {e}", exc_info=True)
 
 # ══════════════════════════════════════════════════════
 #  FUN COMMANDS
@@ -1502,34 +1419,64 @@ async def fun_dispatcher(u: Update, c: ContextTypes.DEFAULT_TYPE):
     except Exception as e: logger.error(f"[fun] {e}", exc_info=True)
 
 # ══════════════════════════════════════════════════════
-#  /start  /help
+#  /start  — eye-catching new design
 # ══════════════════════════════════════════════════════
 async def start_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message: return
     try:
-        ocmds = "\n`/pump` `/dump` — Owner adjust points\n`/nw` — Start new week (resets lb)" if OWNER_ID else ""
+        name = (u.effective_user.first_name or "human") if u.effective_user else "human"
+        owner_section = ""
+        if OWNER_ID:
+            owner_section = (
+                "\n┌─────────────────────────────┐\n"
+                "│  🔐  *ADMIN CONTROLS*\n"
+                "│  `/pump` `/dump` — Edit points\n"
+                "│  `/nw` — Start new week + reset\n"
+                "└─────────────────────────────┘\n"
+            )
         text = (
-            "🧠 *BELUGA BOT*  v6.0\n\n"
-            "━━━━━━━━━━━━━━━━━━\n\n"
-            "🎮 *Games*\n"
-            "`/tictac` — Tic Tac Toe (reply = PvP)\n"
-            "`/rock` — Rock Paper Scissors (reply = PvP)\n\n"
-            "🎓 *Utilities*\n"
-            "`/search <topic>` — AI Smart Search\n"
-            "`/quiz` — Trivia  |  `/quiz crypto` — Topic quiz\n"
-            "`/lb` — Leaderboard 🏆\n\n"
-            "🎉 *Fun*\n"
-            "`/gay`  `/couple` — Daily fun\n\n"
-            "🤖 *Auto*\n"
-            "• Mention *beluga* — AI chat\n"
-            "• Send YT/Instagram link → auto download\n"
-            f"{ocmds}\n\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            "🔥 _Ready? Start chatting!_"
+            f"🐱✨ *Meow, {name}!* ✨🐱\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"         *BELUGA BOT v8.0*\n"
+            f"    _Your sassy AI cat companion_\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"┌─────────────────────────────┐\n"
+            f"│  🎮  *GAMES*\n"
+            f"│  `/tictac` — Tic Tac Toe\n"
+            f"│  ↳ _Reply a user for PvP_ ⚔️\n"
+            f"│  ↳ _or play vs unbeatable bot_ 🤖\n"
+            f"└─────────────────────────────┘\n\n"
+            f"┌─────────────────────────────┐\n"
+            f"│  🧠  *TRIVIA & SEARCH*\n"
+            f"│  `/quiz` — Random trivia poll\n"
+            f"│  `/quiz crypto` — Topic quiz\n"
+            f"│  `/search <anything>` — AI search\n"
+            f"└─────────────────────────────┘\n\n"
+            f"┌─────────────────────────────┐\n"
+            f"│  🏆  *LEADERBOARD*\n"
+            f"│  `/lb` — Live rankings + Hall of Fame\n"
+            f"└─────────────────────────────┘\n\n"
+            f"┌─────────────────────────────┐\n"
+            f"│  🎉  *FUN STUFF*\n"
+            f"│  `/gay` — Daily gay detector 🌈\n"
+            f"│  `/couple` — Today's ship 💞\n"
+            f"└─────────────────────────────┘\n\n"
+            f"┌─────────────────────────────┐\n"
+            f"│  ⚡  *AUTO FEATURES*\n"
+            f"│  📥 Paste YT / Instagram link\n"
+            f"│     → auto downloads video\n"
+            f"│  💬 Mention *Beluga* → AI chat\n"
+            f"│  💬 Reply to me → AI chat\n"
+            f"└─────────────────────────────┘\n"
+            f"{owner_section}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔥 *Built by Team Oldy Crypto*\n"
+            f"_Start chatting — I don't bite... much_ 😼"
         )
         await u.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
         bot_status["message_count"] += 1
-    except Exception as e: logger.error(f"[start] {e}", exc_info=True)
+    except Exception as e:
+        logger.error(f"[start] {e}", exc_info=True)
 
 # ══════════════════════════════════════════════════════
 #  MONITOR
@@ -1602,31 +1549,35 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════
 async def main():
     logger.info("="*55)
-    logger.info("🐱  BELUGA BOT  v7.0.0")
+    logger.info("🐱  BELUGA BOT  v8.0.0")
     logger.info(f"   PORT={HTTP_PORT}  OWNER_ID={OWNER_ID}")
-    logger.info(f"   GITHUB_TOKEN={'set ✅' if GITHUB_TOKEN else 'NOT SET ❌'}")
-    logger.info(f"   GITHUB_GIST_ID='{GITHUB_GIST or '(will auto-create)'}'")
+    logger.info(f"   SUPABASE_URL={'set ✅' if SUPABASE_URL else 'NOT SET ❌'}")
+    logger.info(f"   SUPABASE_KEY={'set ✅' if SUPABASE_KEY else 'NOT SET ❌'}")
     logger.info("="*55)
 
     # 1. HTTP first
     http_runner = await start_http(HTTP_PORT)
     await asyncio.sleep(0.3)
 
-    # 2. Load scores from GitHub
+    # 2. Load data from Supabase
     loop = asyncio.get_running_loop()
-    if GITHUB_TOKEN:
+    if SUPABASE_URL and SUPABASE_KEY:
         try:
-            gh = await asyncio.wait_for(
-                loop.run_in_executor(None, github_load_scores), timeout=20)
-            if gh:
-                db["scores"] = gh; save_db()
-                logger.info(f"✅ Loaded {sum(len(v) for v in gh.values())} user scores")
-            else:
-                logger.info("[GitHub] No scores yet — will save on first update")
+            scores = await asyncio.wait_for(
+                loop.run_in_executor(None, supabase_load_scores), timeout=20)
+            if scores:
+                db["scores"] = scores
+                logger.info(f"✅ Scores loaded ({sum(len(v) for v in scores.values())} users)")
+            winners = await asyncio.wait_for(
+                loop.run_in_executor(None, supabase_load_weekly_winners), timeout=20)
+            if winners:
+                db["weekly_winners"] = winners
+                logger.info(f"✅ Weekly winners loaded ({len(winners)} chats)")
+            save_db()
         except Exception as e:
-            logger.warning(f"[GitHub startup] {e}")
+            logger.warning(f"[Supabase startup] {e} — using local cache")
     else:
-        logger.warning("⚠️  GITHUB_TOKEN not set — add it to Render env vars for persistence!")
+        logger.warning("⚠️  SUPABASE_URL/KEY not set — add them to env vars for persistence!")
 
     # 3. Build PTB
     app = TGApp.builder().token(BOT_TOKEN).build()
@@ -1638,9 +1589,7 @@ async def main():
     app.add_handler(CommandHandler(["gay","couple"],     fun_dispatcher))
     app.add_handler(CommandHandler(["pump","dump"],      pump_dump_handler))
     app.add_handler(CommandHandler("tictac",             tictac_handler))
-    app.add_handler(CommandHandler("rock",               rock_handler))
     app.add_handler(CallbackQueryHandler(ttt_callback,   pattern=r"^ttt:"))
-    app.add_handler(CallbackQueryHandler(rps_callback,   pattern=r"^rps:"))
     app.add_handler(PollAnswerHandler(poll_answer_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, monitor))
     app.add_error_handler(error_handler)
@@ -1651,7 +1600,7 @@ async def main():
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
     bot_status["running"] = True
-    logger.info("✅ Beluga v6.0.0 is LIVE 🐱")
+    logger.info("✅ Beluga v8.0.0 is LIVE 🐱")
 
     # 5. Keep alive
     stop_evt = asyncio.Event()
@@ -1674,10 +1623,7 @@ async def main():
     # 6. Shutdown
     cleanup_task.cancel()
     bot_status["running"] = False
-    logger.info("🔄 Saving to GitHub before shutdown…")
-    if GITHUB_TOKEN:
-        try: await loop.run_in_executor(None, github_save_scores)
-        except Exception: pass
+    logger.info("🔄 Shutdown in progress…")
     for fn in [app.updater.stop, app.stop, app.shutdown, http_runner.cleanup]:
         try: await fn()
         except Exception: pass
