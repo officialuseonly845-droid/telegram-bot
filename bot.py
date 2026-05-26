@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════════════════════
-#  BELUGA BOT  v6.0.0  — FULLY FIXED WITH AUTO-DISCOVERY GIST
+#  BELUGA BOT  v7.0.0  — FULLY FIXED
 #  GitHub: auto-creates gist if missing, stores user_id+name+pts
 #  yt-dlp: YouTube + Instagram auto-download on link detection
 #  /tictac PvP + vs Bot with timer
@@ -92,6 +92,7 @@ def save_db() -> None:
 db = load_db()
 db.setdefault("scores", {})
 db.setdefault("gist_id", "")   # persists auto-created gist id
+db.setdefault("weekly_winners", {})  # stores top3 from last /nw
 
 # ══════════════════════════════════════════════════════
 #  GITHUB GIST  — auto-create, load, save
@@ -111,32 +112,13 @@ db.setdefault("gist_id", "")   # persists auto-created gist id
 # ══════════════════════════════════════════════════════
 GIST_FILENAME = "beluga_scores.json"
 GH_HEADERS = lambda: {
-    "Authorization": f"Bearer {GITHUB_TOKEN}",
+    "Authorization": f"token {GITHUB_TOKEN}",
     "Accept": "application/vnd.github.v3+json",
     "Content-Type": "application/json",
 }
 
-def gh_find_existing_gist() -> str:
-    """Scan user's gists to find one containing beluga_scores.json if local cache was wiped."""
-    if not GITHUB_TOKEN:
-        return ""
-    try:
-        r = requests.get(
-            "https://api.github.com/gists",
-            headers=GH_HEADERS(), timeout=15
-        )
-        if r.status_code == 200:
-            for g in r.json():
-                if GIST_FILENAME in g.get("files", {}):
-                    gid = g.get("id", "")
-                    logger.info(f"🔍 Found existing GitHub Gist automatically: {gid}")
-                    return gid
-    except Exception as e:
-        logger.error(f"[GitHub Find] {e}")
-    return ""
-
 def gh_get_gist_id() -> str:
-    """Return gist ID: env var → db cache → auto-discover → auto-create"""
+    """Return gist ID: env var → db cache → auto-create"""
     global _resolved_gist_id
     if _resolved_gist_id:
         return _resolved_gist_id
@@ -146,15 +128,6 @@ def gh_get_gist_id() -> str:
     if db.get("gist_id"):
         _resolved_gist_id = db["gist_id"]
         return _resolved_gist_id
-    
-    # Auto-discover from GitHub if local file was wiped
-    discovered = gh_find_existing_gist()
-    if discovered:
-        _resolved_gist_id = discovered
-        db["gist_id"] = discovered
-        save_db()
-        return discovered
-        
     return ""
 
 def gh_create_gist() -> str:
@@ -191,14 +164,17 @@ def gh_create_gist() -> str:
     return ""
 
 def github_load_scores() -> dict:
-    """Load scores from gist on startup."""
+    """Load scores from gist on startup. Auto-creates gist if missing."""
     if not GITHUB_TOKEN:
         logger.warning("[GitHub] No GITHUB_TOKEN — scores won't persist across restarts")
         return {}
     gid = gh_get_gist_id()
     if not gid:
-        logger.info("[GitHub] No gist yet — will create on first save")
-        return {}
+        logger.info("[GitHub] No gist ID found — creating one now…")
+        gid = gh_create_gist()
+        if not gid:
+            logger.error("[GitHub] Could not create gist at startup")
+            return {}
     try:
         r = requests.get(
             f"https://api.github.com/gists/{gid}",
@@ -558,6 +534,7 @@ def _dl_rate_ok(cid: str) -> bool:
 def _ydl_download(url: str, outdir: str) -> dict:
     """
     Download with yt-dlp. Returns {ok, path, type, title, error}.
+    Optimised for speed: prefers mp4 <= 720p, skips ffmpeg merge when possible.
     Runs in executor — blocking I/O.
     """
     result = {"ok": False, "path": None, "type": "video", "title": "", "error": ""}
@@ -568,32 +545,38 @@ def _ydl_download(url: str, outdir: str) -> dict:
         logger.error("yt_dlp not installed — add yt-dlp to requirements.txt")
         return result
 
+    # Speed strategy:
+    # 1. Try a pre-muxed mp4 <= 720p first (no ffmpeg needed = fast)
+    # 2. Fall back to merging best video+audio
+    # 3. Last resort: any best single file
     ydl_opts = {
-        # Best quality under 50MB, merge video+audio into mp4
         "format": (
-            "bestvideo[ext=mp4][filesize<45M]+bestaudio[ext=m4a]"
-            "/bestvideo[filesize<45M]+bestaudio"
-            "/best[filesize<45M]"
-            "/best"
+            "best[ext=mp4][height<=720][filesize<49M]"
+            "/best[ext=mp4][filesize<49M]"
+            "/bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/bestvideo+bestaudio"
+            "/best[filesize<49M]"
         ),
-        "outtmpl":       os.path.join(outdir, "%(id)s.%(ext)s"),
-        "quiet":         True,
-        "no_warnings":   True,
-        "noplaylist":    True,
-        "max_filesize":  49 * 1024 * 1024,
-        "socket_timeout": 25,
-        "retries":       3,
-        "merge_output_format": "mp4",
-        "postprocessors": [{
-            "key": "FFmpegVideoConvertor",
-            "preferedformat": "mp4",
-        }],
+        "outtmpl":            os.path.join(outdir, "media.%(ext)s"),
+        "quiet":              True,
+        "no_warnings":        True,
+        "noplaylist":         True,
+        "max_filesize":       49 * 1024 * 1024,
+        "socket_timeout":     20,
+        "retries":            2,
+        "fragment_retries":   2,
+        "merge_output_format":"mp4",
+        "concurrent_fragment_downloads": 4,   # faster fragment dl
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+        # Instagram / X specific: embed cookies approach via extractor args
+        "extractor_args": {
+            "instagram": {"api": ["android"]},
         },
     }
 
@@ -603,44 +586,48 @@ def _ydl_download(url: str, outdir: str) -> dict:
             if not info:
                 result["error"] = "No info extracted"; return result
 
-            result["title"] = (info.get("title") or "")[:80]
+            result["title"] = (info.get("title") or info.get("description") or "")[:80].strip()
 
-            # Find downloaded file
-            downloaded = ydl.prepare_filename(info)
-            # Try common extensions including post-merge mp4
-            for ext in [".mp4", ".webm", ".mkv", ".mov", ".m4v",
+            # Find the downloaded file — outtmpl uses "media" as base name
+            found = None
+            for ext in [".mp4", ".webm", ".mkv", ".mov", ".m4v", ".avi",
                         ".jpg", ".jpeg", ".png", ".gif", ".webp"]:
-                candidate = os.path.splitext(downloaded)[0] + ext
-                if os.path.exists(candidate):
-                    downloaded = candidate; break
+                candidate = os.path.join(outdir, f"media{ext}")
+                if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+                    found = candidate; break
 
-            if not os.path.exists(downloaded):
-                # Fallback: find any file in outdir
-                files = [f for f in os.listdir(outdir) if not f.endswith(".part")]
-                if not files:
-                    result["error"] = "No file after download"; return result
-                # Pick largest file
-                files.sort(key=lambda f: os.path.getsize(os.path.join(outdir, f)), reverse=True)
-                downloaded = os.path.join(outdir, files[0])
+            if not found:
+                # Scan outdir for any completed file
+                files = sorted(
+                    [f for f in os.listdir(outdir) if not f.endswith((".part",".ytdl"))],
+                    key=lambda f: os.path.getsize(os.path.join(outdir, f)),
+                    reverse=True
+                )
+                if files:
+                    found = os.path.join(outdir, files[0])
 
-            sz = os.path.getsize(downloaded)
-            if sz == 0:
-                result["error"] = "Empty file"; return result
-            if sz > 50 * 1024 * 1024:
-                result["error"] = f"Too large ({sz//1024//1024}MB)"; return result
+            if not found:
+                result["error"] = "No file after download"; return result
 
-            ext_l = os.path.splitext(downloaded)[1].lower()
+            sz = os.path.getsize(found)
+            if sz == 0:    result["error"] = "Empty file"; return result
+            if sz > 50*1024*1024: result["error"] = f"Too large ({sz//1024//1024}MB)"; return result
+
+            ext_l = os.path.splitext(found)[1].lower()
             ftype = "image" if ext_l in (".jpg",".jpeg",".png",".gif",".webp") else "video"
-            result.update({"ok": True, "path": downloaded, "type": ftype})
+            result.update({"ok": True, "path": found, "type": ftype})
 
     except Exception as e:
-        err = str(e).lower()
-        if any(x in err for x in ["private","login required","age","unavailable",
-                                    "removed","suspended","not found","403","404",
-                                    "this video is not available","members-only"]):
+        err_s = str(e).lower()
+        if any(x in err_s for x in [
+            "private","login required","age","unavailable","removed",
+            "suspended","not found","403","404","not available",
+            "this video is not available","members-only","requires authentication",
+            "this post may have been removed"
+        ]):
             result["error"] = "unavailable"
         else:
-            result["error"] = str(e)[:150]
+            result["error"] = str(e)[:200]
             logger.debug(f"[yt-dlp] {e}")
 
     return result
@@ -831,5 +818,874 @@ async def gen_quiz(topic: str, cid: str) -> Optional[dict]:
             "", max_tok=280)
         if not raw: continue
         try:
-            cleaned = re.sub(r"
-http://googleusercontent.com/immersive_entry_chip/0
+            cleaned = re.sub(r"```(?:json)?", "", raw).strip().strip("`")
+            m = re.search(r"\{[\s\S]+\}", cleaned)
+            if not m: continue
+            d    = json.loads(m.group(0))
+            q    = str(d.get("question","")).strip()
+            opts = d.get("options",[])
+            idx  = int(d.get("correct_index",0))
+            fact = str(d.get("fun_fact","Beluga knows all! 🐾")).strip()
+            if not q or len(opts) != 4 or not (0 <= idx <= 3): continue
+            if quiz_on_cooldown(cid, q): continue
+            return {"question":q,"options":opts,"correct_index":idx,"fun_fact":fact}
+        except Exception as e: logger.debug(f"[Quiz parse] {e}")
+    return None
+
+async def quiz_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not u.message: return
+    try:
+        parts = u.message.text.split(maxsplit=1)
+        topic = parts[1].strip() if len(parts) > 1 and parts[1].strip() else random.choice(QUIZ_TOPICS)
+        cid   = str(u.effective_chat.id); cid_i = u.effective_chat.id
+        await safe_react(c.bot, cid_i, u.message.message_id, "💡")
+        await c.bot.send_chat_action(cid_i, "typing")
+        sm = await u.message.reply_text("🎲 Generating quiz… 🐈")
+        qdata = await gen_quiz(topic, cid)
+        try: await sm.delete()
+        except Exception: pass
+        if qdata:
+            mark_quiz(cid, qdata["question"])
+            try:
+                pm = await c.bot.send_poll(
+                    chat_id=cid_i, question=f"🐱 {qdata['question'][:255]}",
+                    options=[str(o)[:100] for o in qdata["options"]],
+                    type="quiz", correct_option_id=qdata["correct_index"],
+                    is_anonymous=False, explanation=qdata["fun_fact"][:200])
+                active_polls[pm.poll.id] = {"chat_id":cid_i,"correct_index":qdata["correct_index"],"topic":topic}
+                bot_status["message_count"] += 1; return
+            except Exception as e: logger.error(f"[Quiz/poll] {e}")
+        now   = time.time()
+        used  = {h for h,exp in quiz_cooldown.get(cid,{}).items() if exp > now}
+        avail = [fb for fb in FALLBACK_QS if q_hash(fb["q"]) not in used] or FALLBACK_QS
+        fb    = random.choice(avail); mark_quiz(cid, fb["q"])
+        pm = await c.bot.send_poll(
+            chat_id=cid_i, question=f"🐱 {fb['q']}", options=fb["opts"],
+            type="quiz", correct_option_id=fb["ans"], is_anonymous=False, explanation=fb["fact"])
+        active_polls[pm.poll.id] = {"chat_id":cid_i,"correct_index":fb["ans"],"topic":topic}
+        bot_status["message_count"] += 1
+    except Exception as e:
+        logger.error(f"[quiz] {e}", exc_info=True); bot_status["error_count"] += 1
+        try: await u.message.reply_text("😿 Quiz failed!")
+        except Exception: pass
+
+async def poll_answer_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    try:
+        ans  = u.poll_answer
+        if not ans: return
+        info = active_polls.get(ans.poll_id)
+        if not info or not ans.option_ids: return
+        if ans.option_ids[0] != info["correct_index"]: return
+        cid  = str(info["chat_id"]); uid = str(ans.user.id)
+        name = (ans.user.first_name or "?")[:30]
+        new_score = update_score(cid, uid, name, +10)
+        asyncio.create_task(async_github_save())
+        logger.info(f"[Score] +10 {name} (uid={uid}) = {new_score} pts in chat {cid}")
+    except Exception as e: logger.debug(f"[poll_answer] {e}")
+
+# ══════════════════════════════════════════════════════
+#  LEADERBOARD
+# ══════════════════════════════════════════════════════
+MEDALS = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
+
+async def lb_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not u.message: return
+    try:
+        cid    = str(u.effective_chat.id)
+        scores = db.get("scores",{}).get(cid,{})
+
+        lines = []
+
+        # ── Show last week's top 3 if stored ──────────────────────
+        ww = db.get("weekly_winners",{}).get(cid)
+        if ww and ww.get("top3"):
+            wk_label = ww.get("week_label","Last Week")
+            lines.append(f"🏆🎉 *LAST WEEK CHAMPIONS* 🎉🏆")
+            lines.append(f"_Week: {wk_label}_\n")
+            for i, e in enumerate(ww["top3"]):
+                m = MEDALS[i]
+                lines.append(f"{m} *{e['name'][:18]}* — {e['score']:,} pts")
+            lines.append("\n━━━━━━━━━━━━━━━━━━━━\n")
+
+        if not scores:
+            lines.append("📊 No current scores yet!\nPlay `/quiz` or `/tictac` to earn points 🐾")
+            await u.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN); return
+
+        board = sorted(scores.values(), key=lambda x: x["score"], reverse=True)
+        lines += ["╔════════════════════════════╗",
+                  "🏆  *CURRENT LEADERBOARD*  🏆",
+                  "╚════════════════════════════╝\n"]
+        for i, e in enumerate(board[:10]):
+            medal = MEDALS[i] if i < len(MEDALS) else f"{i+1}."
+            lines.append(f"{medal} {e['name'][:18]:<18} —  *{e['score']:,} pts*")
+        lines += ["\n━━━━━━━━━━━━━━━━━━━━",
+                  "📈 Sorted: Highest → Lowest",
+                  "━━━━━━━━━━━━━━━━━━━━",
+                  "_+10 quiz/game win  |  -10 game loss_"]
+        await u.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        bot_status["message_count"] += 1
+    except Exception as e: logger.error(f"[lb] {e}", exc_info=True)
+
+# /nw — New Week: owner saves top3 then resets all scores to 0
+async def nw_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """/nw — Owner only. Saves top 3 as weekly champions, resets all scores to 0."""
+    if not u.message: return
+    try:
+        if not is_owner(u.effective_user.id if u.effective_user else 0):
+            await u.message.reply_text("🚫 Owner-only command."); return
+
+        cid    = str(u.effective_chat.id)
+        scores = db.get("scores",{}).get(cid,{})
+
+        # Save top 3 before reset
+        board  = sorted(scores.values(), key=lambda x: x["score"], reverse=True)
+        top3   = [{"name": e["name"], "score": e["score"]} for e in board[:3]]
+        wk_label = datetime.now().strftime("%d %b %Y")
+
+        db.setdefault("weekly_winners",{})[cid] = {
+            "top3":       top3,
+            "week_label": wk_label,
+            "reset_at":   datetime.now().isoformat(),
+        }
+
+        # Reset all scores to 0
+        if cid in db.get("scores",{}):
+            for uid_s in db["scores"][cid]:
+                db["scores"][cid][uid_s]["score"] = 0
+
+        save_db()
+        asyncio.create_task(async_github_save())
+
+        # Announce top 3 winners
+        announce = [
+            "🏆🎉 *NEW WEEK STARTED!* 🎉🏆",
+            f"\n_Week ending {wk_label}_\n",
+            "👑 *Last Week's Champions:*\n",
+        ]
+        if top3:
+            for i, e in enumerate(top3):
+                announce.append(f"{MEDALS[i]} *{e['name']}* — {e['score']:,} pts")
+        else:
+            announce.append("_(No scores recorded)_")
+
+        announce += [
+            "\n━━━━━━━━━━━━━━━━━━━━",
+            "🔄 *All scores reset to 0*",
+            "━━━━━━━━━━━━━━━━━━━━",
+            "_New week, new battle! Play `/quiz` and `/tictac` to climb! 🚀_",
+        ]
+        await u.message.reply_text("\n".join(announce), parse_mode=ParseMode.MARKDOWN)
+        bot_status["message_count"] += 1
+
+    except Exception as e:
+        logger.error(f"[nw] {e}", exc_info=True)
+        try: await u.message.reply_text("😿 /nw failed!")
+        except Exception: pass
+
+# ══════════════════════════════════════════════════════
+#  /pump  /dump
+# ══════════════════════════════════════════════════════
+async def pump_dump_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not u.message: return
+    try:
+        if not is_owner(u.effective_user.id if u.effective_user else 0):
+            await u.message.reply_text("🚫 Owner-only command."); return
+        if not u.message.reply_to_message or not u.message.reply_to_message.from_user:
+            await u.message.reply_text(
+                "⚠️ Reply to a user's message.\nExample: reply + `/pump 80000`",
+                parse_mode=ParseMode.MARKDOWN); return
+        parts = u.message.text.split()
+        if len(parts) < 2 or not parts[1].isdigit():
+            await u.message.reply_text("⚠️ Usage: `/pump 80000` or `/dump 80000`",
+                parse_mode=ParseMode.MARKDOWN); return
+        amount = int(parts[1])
+        cmd    = parts[0].lstrip("/").lower().split("@")[0]
+        delta  = +amount if cmd == "pump" else -amount
+        target = u.message.reply_to_message.from_user
+        cid    = str(u.effective_chat.id)
+        new_sc = update_score(cid, str(target.id), (target.first_name or "User")[:30], delta)
+        asyncio.create_task(async_github_save())
+        sign   = "+" if delta > 0 else ""
+        emoji  = "🚀" if cmd == "pump" else "📉"
+        await u.message.reply_text(
+            f"{emoji} *{'PUMP' if cmd=='pump' else 'DUMP'}*\n\n"
+            f"👤 *{target.first_name}*\n"
+            f"🪪 User ID: `{target.id}`\n"
+            f"{'📈' if delta>0 else '📉'} {sign}{amount:,} pts\n"
+            f"💰 New Total: *{new_sc:,} pts*",
+            parse_mode=ParseMode.MARKDOWN)
+        bot_status["message_count"] += 1
+    except Exception as e:
+        logger.error(f"[pump_dump] {e}", exc_info=True)
+
+# ══════════════════════════════════════════════════════
+#  GAME HELPERS
+# ══════════════════════════════════════════════════════
+def register_player(uid: str, gkey: str):
+    user_in_game[uid] = gkey
+
+def release_player(uid: str):
+    user_in_game.pop(uid, None)
+
+def player_busy(uid: str) -> bool:
+    gkey = user_in_game.get(uid)
+    if not gkey: return False
+    if gkey in ttt_games or gkey in rps_games: return True
+    release_player(uid); return False
+
+async def cleanup_expired_games():
+    now = time.time()
+    for gkey in list(ttt_games.keys()):
+        g = ttt_games[gkey]
+        if now - g.get("created", now) > GAME_TIMEOUT:
+            release_player(str(g.get("x_id",""))); release_player(str(g.get("o_id","")))
+            game_timers.pop(gkey, None); del ttt_games[gkey]
+    for gkey in list(rps_games.keys()):
+        g = rps_games[gkey]
+        if now - g.get("created", now) > GAME_TIMEOUT:
+            release_player(str(g.get("p1_id",""))); release_player(str(g.get("p2_id","")))
+            del rps_games[gkey]
+
+# ══════════════════════════════════════════════════════
+#  TIMER TASK for TTT
+# ══════════════════════════════════════════════════════
+async def run_game_timer(c: ContextTypes.DEFAULT_TYPE, gkey: str):
+    """
+    60-second SHARED game clock. Ticks every 3s.
+    Loser = player whose turn it is when time runs out.
+    Winner +10 pts, Loser -10 pts (PvP only).
+    """
+    try:
+        while True:
+            await asyncio.sleep(3)
+            g  = ttt_games.get(gkey)
+            td = game_timers.get(gkey)
+            if not g or not td:
+                return
+            if g.get("status") != "playing":
+                return
+
+            td["remaining"] = max(0, td["remaining"] - 3)
+            cid    = g["chat_id"]
+            msg_id = g.get("msg_id")
+            if not msg_id:
+                return
+
+            if td["remaining"] <= 0:
+                # Player whose turn it is loses by timeout
+                if g["turn"] == "X":
+                    winner_name = g["o_name"]; winner_uid = str(g["o_id"])
+                    loser_name  = g["x_name"]; loser_uid  = str(g["x_id"])
+                else:
+                    winner_name = g["x_name"]; winner_uid = str(g["x_id"])
+                    loser_name  = g["o_name"]; loser_uid  = str(g["o_id"])
+                g["status"]      = "timeout"
+                g["winner_name"] = winner_name
+                try:
+                    await c.bot.edit_message_text(
+                        chat_id=cid, message_id=msg_id,
+                        text=ttt_build_text(g), parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=ttt_build_keyboard(g["board"], disabled=True))
+                except Exception:
+                    pass
+                cid_s = str(cid)
+                if not g["vs_bot"]:
+                    update_score(cid_s, winner_uid, winner_name, +10)
+                    update_score(cid_s, loser_uid,  loser_name,  -10)
+                    asyncio.create_task(async_github_save())
+                release_player(str(g["x_id"]))
+                release_player(str(g["o_id"]))
+                game_timers.pop(gkey, None)
+                ttt_games.pop(gkey, None)
+                return
+            else:
+                # Refresh timer display every 3s
+                try:
+                    await c.bot.edit_message_text(
+                        chat_id=cid, message_id=msg_id,
+                        text=ttt_build_text(g), parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=ttt_build_keyboard(g["board"]))
+                except Exception:
+                    pass
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        logger.debug(f"[Timer] {e}")
+
+# ══════════════════════════════════════════════════════
+#  TIC TAC TOE
+# ══════════════════════════════════════════════════════
+TTT_EMPTY = "⬜"; TTT_X = "❌"; TTT_O = "⭕"
+WINS = [(0,1,2),(3,4,5),(6,7,8),(0,3,6),(1,4,7),(2,5,8),(0,4,8),(2,4,6)]
+
+def ttt_check_winner(board: list) -> Optional[str]:
+    for a,b,cc in WINS:
+        if board[a] == board[b] == board[cc] and board[a] != TTT_EMPTY:
+            return board[a]
+    return None
+
+def ttt_is_draw(board: list) -> bool:
+    return all(c != TTT_EMPTY for c in board) and not ttt_check_winner(board)
+
+def _minimax(board: list, is_maximizing: bool, alpha: int, beta: int) -> int:
+    """
+    Minimax with alpha-beta pruning.
+    Bot = TTT_O (maximizer, +10), Human = TTT_X (minimizer, -10).
+    Returns score from bot's perspective.
+    """
+    winner = ttt_check_winner(board)
+    if winner == TTT_O: return 10
+    if winner == TTT_X: return -10
+    if all(c != TTT_EMPTY for c in board): return 0
+
+    if is_maximizing:
+        best = -100
+        for i in range(9):
+            if board[i] == TTT_EMPTY:
+                board[i] = TTT_O
+                score = _minimax(board, False, alpha, beta)
+                board[i] = TTT_EMPTY
+                best  = max(best, score)
+                alpha = max(alpha, best)
+                if beta <= alpha: break
+        return best
+    else:
+        best = 100
+        for i in range(9):
+            if board[i] == TTT_EMPTY:
+                board[i] = TTT_X
+                score = _minimax(board, True, alpha, beta)
+                board[i] = TTT_EMPTY
+                best = min(best, score)
+                beta = min(beta, best)
+                if beta <= alpha: break
+        return best
+
+def ttt_bot_move(board: list) -> int:
+    """
+    UNBEATABLE bot using minimax + alpha-beta pruning.
+    Always plays the mathematically optimal move.
+    Human can never win — best outcome is draw.
+    """
+    best_score = -1000
+    best_move  = -1
+    for i in range(9):
+        if board[i] == TTT_EMPTY:
+            board[i] = TTT_O
+            score = _minimax(board, False, -1000, 1000)
+            board[i] = TTT_EMPTY
+            if score > best_score:
+                best_score = score
+                best_move  = i
+    return best_move
+
+def ttt_build_keyboard(board: list, disabled: bool = False) -> InlineKeyboardMarkup:
+    rows = []
+    for row in range(3):
+        r = []
+        for col in range(3):
+            idx  = row*3 + col
+            cell = board[idx]
+            label = cell if cell != TTT_EMPTY else TTT_EMPTY
+            cb = f"ttt:noop:{idx}" if (cell != TTT_EMPTY or disabled) else f"ttt:move:{idx}"
+            r.append(InlineKeyboardButton(label, callback_data=cb))
+        rows.append(r)
+    return InlineKeyboardMarkup(rows)
+
+def ttt_build_text(g: dict) -> str:
+    x_name = g["x_name"]; o_name = g["o_name"]
+    turn   = g["turn"];    status = g.get("status","playing")
+    gkey   = f"{g['chat_id']}:{g.get('msg_id','')}"
+    td     = game_timers.get(gkey, {})
+    rem    = td.get("remaining", TIMER_DURATION)
+    tsec   = f"{rem//60:02d}:{rem%60:02d}"
+
+    board = g["board"]
+    rows  = [" ".join(board[r*3+col] for col in range(3)) for r in range(3)]
+    board_str = "\n".join(rows)
+
+    if status == "playing":
+        cur = x_name if turn == "X" else o_name
+        sym = TTT_X  if turn == "X" else TTT_O
+        sl  = f"🎯 *{cur}'s Turn* {sym}\n⏱ `{tsec}` remaining"
+    elif status == "timeout":
+        sl = f"⏰ *Time Up!*\n🏆 *{g.get('winner_name','')}* wins by timeout!  +10 pts  📉 -10 pts"
+    elif status == "draw":
+        sl = "🤝 *Match Draw!*"
+    else:
+        sl = f"🏆 *{g.get('winner_name','')} Wins!*  🎁 +10 pts  📉 -10 pts"
+
+    return (
+        f"🎮 *TIC TAC TOE*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"❌ *{x_name}*   🆚   *{o_name}* ⭕\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{board_str}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{sl}"
+    )
+
+async def tictac_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not u.message: return
+    try:
+        await cleanup_expired_games()
+        ua    = u.effective_user; cid = u.effective_chat.id
+        uid_a = str(ua.id);  name_a = (ua.first_name or "Player")[:20]
+        vs_bot = True; user_b_id = None; name_b = "🤖 Bot"
+
+        if u.message.reply_to_message and u.message.reply_to_message.from_user:
+            rb = u.message.reply_to_message.from_user
+            if not rb.is_bot:
+                vs_bot = False; user_b_id = rb.id
+                name_b = (rb.first_name or "Player2")[:20]
+                if player_busy(str(rb.id)):
+                    await u.message.reply_text("⚠️ That player is already in a game!"); return
+
+        if player_busy(uid_a):
+            await u.message.reply_text("⚠️ You're already in a game! Finish it first."); return
+
+        board = [TTT_EMPTY] * 9
+        g = {"board":board,"turn":"X","x_id":ua.id,"x_name":name_a,
+             "o_id":user_b_id if not vs_bot else -1,"o_name":name_b,
+             "vs_bot":vs_bot,"status":"playing","created":time.time(),
+             "chat_id":cid,"msg_id":None}
+
+        msg  = await u.message.reply_text(ttt_build_text(g),
+            parse_mode=ParseMode.MARKDOWN, reply_markup=ttt_build_keyboard(board))
+        g["msg_id"] = msg.message_id
+        gkey = game_key(msg.message_id, cid)
+        ttt_games[gkey] = g
+        game_timers[gkey] = {"remaining": TIMER_DURATION}
+        register_player(uid_a, gkey)
+        if not vs_bot: register_player(str(user_b_id), gkey)
+        asyncio.create_task(run_game_timer(c, gkey))
+        bot_status["message_count"] += 1
+    except Exception as e: logger.error(f"[tictac] {e}", exc_info=True)
+
+async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q: return
+    try:
+        await q.answer()
+        parts = q.data.split(":")
+        if len(parts) != 3 or parts[0] != "ttt": return
+        action = parts[1]; idx = int(parts[2])
+        cid    = q.message.chat_id; mid = q.message.message_id
+        gkey   = game_key(mid, cid); g = ttt_games.get(gkey)
+
+        if not g: await q.answer("⏰ Game expired.", show_alert=True); return
+        if g["status"] != "playing": await q.answer("Game ended!", show_alert=True); return
+        if action == "noop": await q.answer("Cell taken!", show_alert=True); return
+
+        uid     = str(q.from_user.id)
+        valid_x = uid == str(g["x_id"])
+        valid_o = uid == str(g["o_id"]) or (g["vs_bot"] and valid_x)
+        is_participant = uid in [str(g["x_id"]), str(g["o_id"])]
+
+        if g["turn"] == "X" and not valid_x:
+            await q.answer("❌ You are not part of this game!" if not is_participant else "Not your turn!", show_alert=True); return
+        if g["turn"] == "O" and not g["vs_bot"] and not valid_o:
+            await q.answer("❌ You are not part of this game!" if not is_participant else "Not your turn!", show_alert=True); return
+
+        # Reset timer on move
+        if gkey in game_timers:
+            game_timers[gkey]["remaining"] = TIMER_DURATION
+
+        board = g["board"]
+        board[idx] = TTT_X if g["turn"] == "X" else TTT_O
+        ws = ttt_check_winner(board)
+
+        def _end(winner_sym=None):
+            if winner_sym:
+                # Winner gets +10, loser gets -10
+                wname  = g["x_name"] if winner_sym == TTT_X else g["o_name"]
+                wuid   = str(g["x_id"]) if winner_sym == TTT_X else str(g["o_id"])
+                lname  = g["o_name"] if winner_sym == TTT_X else g["x_name"]
+                luid   = str(g["o_id"]) if winner_sym == TTT_X else str(g["x_id"])
+                g["status"] = "win"; g["winner_name"] = wname
+                cid_s  = str(cid)
+                if not g["vs_bot"]:
+                    # PvP: both get scored
+                    update_score(cid_s, wuid, wname, +10)
+                    update_score(cid_s, luid, lname, -10)
+                    asyncio.create_task(async_github_save())
+                elif winner_sym == TTT_X:
+                    # Player beat the bot — player gets +10
+                    update_score(cid_s, wuid, wname, +10)
+                    asyncio.create_task(async_github_save())
+                # Bot winning: no score change
+            else:
+                g["status"] = "draw"
+            game_timers.pop(gkey, None)
+            release_player(str(g["x_id"])); release_player(str(g["o_id"]))
+            ttt_games.pop(gkey, None)
+
+        if ws:
+            _end(ws)
+            await q.edit_message_text(ttt_build_text(g), parse_mode=ParseMode.MARKDOWN,
+                reply_markup=ttt_build_keyboard(board, disabled=True)); return
+        if ttt_is_draw(board):
+            _end(); await q.edit_message_text(ttt_build_text(g), parse_mode=ParseMode.MARKDOWN,
+                reply_markup=ttt_build_keyboard(board, disabled=True)); return
+
+        g["turn"] = "O" if g["turn"] == "X" else "X"
+
+        if g["vs_bot"] and g["turn"] == "O":
+            bi = ttt_bot_move(board)
+            if bi >= 0:
+                board[bi] = TTT_O; ws2 = ttt_check_winner(board)
+                if ws2:
+                    _end(ws2)
+                    await q.edit_message_text(ttt_build_text(g), parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=ttt_build_keyboard(board, disabled=True)); return
+                if ttt_is_draw(board):
+                    _end(); await q.edit_message_text(ttt_build_text(g), parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=ttt_build_keyboard(board, disabled=True)); return
+                g["turn"] = "X"
+
+        await q.edit_message_text(ttt_build_text(g), parse_mode=ParseMode.MARKDOWN,
+            reply_markup=ttt_build_keyboard(board))
+    except Exception as e: logger.error(f"[ttt_cb] {e}", exc_info=True)
+
+# ══════════════════════════════════════════════════════
+#  ROCK PAPER SCISSORS
+# ══════════════════════════════════════════════════════
+RPS_BEATS = {"rock":"scissors","scissors":"paper","paper":"rock"}
+RPS_EMOJI = {"rock":"🪨","paper":"📄","scissors":"✂️"}
+
+def rps_keyboard(gkey: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🟥🪨 Rock",     callback_data=f"rps:{gkey}:rock"),
+        InlineKeyboardButton("🟦📄 Paper",    callback_data=f"rps:{gkey}:paper"),
+        InlineKeyboardButton("🟨✂️ Scissors", callback_data=f"rps:{gkey}:scissors"),
+    ]])
+
+def rps_build_text(g: dict) -> str:
+    p1   = g["p1_name"]; p2 = g["p2_name"]
+    c1   = g.get("p1_choice"); c2 = g.get("p2_choice")
+    status = g.get("status","waiting")
+    p1l  = f"✅ *{p1}* — Locked 🔒" if c1 else f"⌛ *{p1}* — Choosing…"
+    p2l  = f"✅ *{p2}* — Locked 🔒" if c2 else f"⌛ *{p2}* — Choosing…"
+    if status == "done":
+        e1 = RPS_EMOJI.get(c1,"?"); e2 = RPS_EMOJI.get(c2,"?")
+        winner = g.get("winner","draw"); wn = g.get("winner_name","")
+        result = (f"👤 *{p1}*: {e1} {c1}\n👤 *{p2}*: {e2} {c2}\n"
+                  f"━━━━━━━━━━━━━━━\n"
+                  + (f"🤝 *Draw!*" if winner=="draw" else f"👑 *{wn} Wins!*  🎁 +20 pts"))
+        return f"🪨📄✂️ *ROCK • PAPER • SCISSORS*\n━━━━━━━━━━━━━━━\n{result}"
+    return (f"🎮 *ROCK • PAPER • SCISSORS*\n━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚔️  *{p1}*   🆚   *{p2}*\n━━━━━━━━━━━━━━━━━━━━\n\n{p1l}\n{p2l}")
+
+async def rock_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not u.message: return
+    try:
+        await cleanup_expired_games()
+        ua    = u.effective_user; cid = u.effective_chat.id
+        uid_a = str(ua.id);  name_a = (ua.first_name or "Player")[:20]
+        vs_bot = True; uid_b = None; name_b = "🤖 Bot"
+
+        if u.message.reply_to_message and u.message.reply_to_message.from_user:
+            rb = u.message.reply_to_message.from_user
+            if not rb.is_bot:
+                vs_bot = False; uid_b = str(rb.id)
+                name_b = (rb.first_name or "Player2")[:20]
+                if player_busy(uid_b):
+                    await u.message.reply_text("⚠️ That player is already in a game!"); return
+
+        if player_busy(uid_a):
+            await u.message.reply_text("⚠️ You're already in a game!"); return
+
+        g = {"p1_id":ua.id,"p1_name":name_a,"p2_id":int(uid_b) if uid_b else -1,
+             "p2_name":name_b,"p1_choice":None,"p2_choice":None,
+             "vs_bot":vs_bot,"status":"waiting","created":time.time(),"chat_id":cid}
+
+        msg = await u.message.reply_text(rps_build_text(g),
+            parse_mode=ParseMode.MARKDOWN, reply_markup=rps_keyboard("tmp"))
+        gkey = game_key(msg.message_id, cid)
+        rps_games[gkey] = g
+        register_player(uid_a, gkey)
+        if not vs_bot and uid_b: register_player(uid_b, gkey)
+        try: await msg.edit_reply_markup(rps_keyboard(gkey))
+        except Exception: pass
+        bot_status["message_count"] += 1
+    except Exception as e: logger.error(f"[rock] {e}", exc_info=True)
+
+async def rps_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q: return
+    try:
+        await q.answer()
+        parts = q.data.split(":")
+        if len(parts) != 3 or parts[0] != "rps": return
+        _, raw_gkey, choice = parts
+        # gkey is "cid:mid" but split by ":" gives 3 parts total — reconstruct
+        cid    = q.message.chat_id; mid = q.message.message_id
+        gkey   = game_key(mid, cid)
+        g      = rps_games.get(gkey)
+
+        if not g: await q.answer("⏰ Game expired.", show_alert=True); return
+        if g["status"] == "done": await q.answer("Game ended!", show_alert=True); return
+
+        uid  = str(q.from_user.id)
+        is_p1 = uid == str(g["p1_id"])
+        is_p2 = uid == str(g["p2_id"]) or (g["vs_bot"] and is_p1)
+
+        if not is_p1 and not is_p2:
+            await q.answer("❌ You are not part of this game!", show_alert=True); return
+
+        if is_p1 and not g["p1_choice"]:
+            g["p1_choice"] = choice
+            if g["vs_bot"]:
+                g["p2_choice"] = random.choice(list(RPS_BEATS.keys()))
+            await q.answer("✅ Choice locked!")
+        elif not is_p1 and is_p2 and not g["p2_choice"]:
+            g["p2_choice"] = choice
+            await q.answer("✅ Choice locked!")
+        elif (is_p1 and g["p1_choice"]) or (not is_p1 and g["p2_choice"]):
+            await q.answer("You already chose!", show_alert=True); return
+
+        if g["p1_choice"] and g["p2_choice"]:
+            c1 = g["p1_choice"]; c2 = g["p2_choice"]
+            if c1 == c2:
+                g["winner"] = "draw"; g["winner_name"] = ""
+            elif RPS_BEATS.get(c1) == c2:
+                g["winner"] = "p1"; g["winner_name"] = g["p1_name"]
+                update_score(str(cid), str(g["p1_id"]), g["p1_name"], +20)
+                asyncio.create_task(async_github_save())
+            else:
+                g["winner"] = "p2"; g["winner_name"] = g["p2_name"]
+                if not g["vs_bot"]:
+                    update_score(str(cid), str(g["p2_id"]), g["p2_name"], +20)
+                    asyncio.create_task(async_github_save())
+            g["status"] = "done"
+            await q.edit_message_text(rps_build_text(g), parse_mode=ParseMode.MARKDOWN)
+            release_player(str(g["p1_id"])); release_player(str(g["p2_id"]))
+            del rps_games[gkey]
+        else:
+            await q.edit_message_text(rps_build_text(g),
+                parse_mode=ParseMode.MARKDOWN, reply_markup=rps_keyboard(gkey))
+    except Exception as e: logger.error(f"[rps_cb] {e}", exc_info=True)
+
+# ══════════════════════════════════════════════════════
+#  FUN COMMANDS
+# ══════════════════════════════════════════════════════
+GAY_T = [
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━\n🚨 *ATTENTION* 🚨\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nAfter deep investigation:\n👉 *{u}* 👈\nis 🌈✨ *SUPER GAY* ✨🌈\nMust slay forever 💅😭\n━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━\n📡 *GOVERNMENT ALERT* 📡\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nRainbow activity from:\n👉 *{u}* 👈\n🌈 *Certified Gay Citizen* 🌈\nToo fabulous! 😭✨\n━━━━━━━━━━━━━━━━━━━━━━━━━━",
+]
+COUPLE_T = [
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━\n💘 *LOVE DETECTOR 3000* 💘\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👉 *{u1}* ❤️ *{u2}* 👈\nCompatibility: ██████████ 100%\n━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━\n🚨 *COUPLE ALERT* 🚨\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n👉 *{u1}* 💞 *{u2}* 👈\n\n💖 *OFFICIAL COUPLE* 💖\n━━━━━━━━━━━━━━━━━━━━━━━━━━",
+]
+
+async def fun_dispatcher(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not u.message: return
+    try:
+        cid   = str(u.effective_chat.id)
+        cmd   = u.message.text.lower().split()[0].lstrip("/").split("@")[0]
+        users = list(db.get("seen",{}).get(cid,{}).values())
+        if len(users) < (2 if cmd == "couple" else 1):
+            await u.message.reply_text("Meow… need more members! 😿🐾"); return
+        day  = datetime.now().strftime("%y-%m-%d"); lk = f"{cid}:{cmd}"
+        if lk in db.get("locks",{}) and db["locks"][lk]["date"] == day:
+            res = db["locks"][lk]["res"]
+        else:
+            if cmd == "couple":
+                m   = random.sample(users, 2)
+                res = random.choice(COUPLE_T).format(u1=m[0]["n"], u2=m[1]["n"])
+            else:
+                m   = [random.choice(users)]
+                res = random.choice(GAY_T).format(u=m[0]["n"])
+            db.setdefault("locks",{})[lk] = {"date": day, "res": res}; save_db()
+        await u.message.reply_text(res, parse_mode=ParseMode.MARKDOWN)
+        bot_status["message_count"] += 1
+    except Exception as e: logger.error(f"[fun] {e}", exc_info=True)
+
+# ══════════════════════════════════════════════════════
+#  /start  /help
+# ══════════════════════════════════════════════════════
+async def start_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not u.message: return
+    try:
+        ocmds = "\n`/pump` `/dump` — Owner adjust points\n`/nw` — Start new week (resets lb)" if OWNER_ID else ""
+        text = (
+            "🧠 *BELUGA BOT*  v6.0\n\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            "🎮 *Games*\n"
+            "`/tictac` — Tic Tac Toe (reply = PvP)\n"
+            "`/rock` — Rock Paper Scissors (reply = PvP)\n\n"
+            "🎓 *Utilities*\n"
+            "`/search <topic>` — AI Smart Search\n"
+            "`/quiz` — Trivia  |  `/quiz crypto` — Topic quiz\n"
+            "`/lb` — Leaderboard 🏆\n\n"
+            "🎉 *Fun*\n"
+            "`/gay`  `/couple` — Daily fun\n\n"
+            "🤖 *Auto*\n"
+            "• Mention *beluga* — AI chat\n"
+            "• Send YT/Instagram link → auto download\n"
+            f"{ocmds}\n\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "🔥 _Ready? Start chatting!_"
+        )
+        await u.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        bot_status["message_count"] += 1
+    except Exception as e: logger.error(f"[start] {e}", exc_info=True)
+
+# ══════════════════════════════════════════════════════
+#  MONITOR
+# ══════════════════════════════════════════════════════
+async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not u.message or not u.effective_user or u.effective_user.is_bot: return
+    try:
+        uid = u.effective_user.id; cid = str(u.effective_chat.id); now = datetime.now()
+        spam_tracker.setdefault(uid, [])
+        spam_tracker[uid] = [t for t in spam_tracker[uid] if now - t < timedelta(seconds=2)]
+        spam_tracker[uid].append(now)
+        if len(spam_tracker[uid]) >= 4:
+            try: await u.message.delete()
+            except Exception: pass
+            return
+
+        db.setdefault("seen",{}).setdefault(cid,{})[str(uid)] = {
+            "id": uid, "un": u.effective_user.username,
+            "n": u.effective_user.first_name or "User",
+        }
+        db.setdefault("counts",{})[cid] = db["counts"].get(cid, 0) + 1
+        save_db()
+        if db["counts"][cid] % 6 == 0:
+            await safe_react(c.bot, u.effective_chat.id, u.message.message_id)
+
+        text     = (u.message.text or "").strip()
+        text_low = text.lower()
+
+        # ── Auto media download ────────────────────────────
+        media_m = _MEDIA_RE.search(text)
+        if media_m:
+            asyncio.create_task(download_and_send(u, c, media_m.group(0)))
+
+        # ── AI chat ───────────────────────────────────────
+        beluga   = "beluga" in text_low
+        reply_me = (u.message.reply_to_message and
+                    u.message.reply_to_message.from_user and
+                    u.message.reply_to_message.from_user.id == c.bot.id)
+        mention  = any("beluga" in text_low[e.offset:e.offset+e.length]
+                       for e in (u.message.entities or []) if e.type == "mention")
+        if beluga or reply_me or mention:
+            try:
+                await c.bot.send_chat_action(u.effective_chat.id, "typing")
+                emoji = await ai_emoji(text)
+                await safe_react(c.bot, u.effective_chat.id, u.message.message_id, emoji)
+                reply = await ai(CHAT_PROMPT, text, "Meow! 🐾")
+                await u.message.reply_text(reply)
+            except Exception as e: logger.error(f"[monitor/chat] {e}", exc_info=True)
+
+        bot_status["message_count"] += 1
+        bot_status["last_update"] = datetime.now()
+    except Exception as e:
+        logger.error(f"[monitor] {e}", exc_info=True); bot_status["error_count"] += 1
+
+# ══════════════════════════════════════════════════════
+#  ERROR HANDLER
+# ══════════════════════════════════════════════════════
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    err = context.error
+    if isinstance(err, (NetworkError, TimedOut)): logger.debug(f"[Net] {type(err).__name__}"); return
+    if isinstance(err, RetryAfter):
+        logger.warning(f"[RateLimit] {err.retry_after}s"); await asyncio.sleep(err.retry_after+1); return
+    if isinstance(err, (Forbidden, BadRequest)): logger.debug(f"[{type(err).__name__}] {err}"); return
+    if isinstance(err, InvalidToken): logger.critical("❌ TOKEN REJECTED"); bot_status["running"]=False; return
+    logger.error("".join(traceback.format_exception(type(err), err, err.__traceback__)))
+    bot_status["error_count"] += 1
+
+# ══════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════
+async def main():
+    logger.info("="*55)
+    logger.info("🐱  BELUGA BOT  v7.0.0")
+    logger.info(f"   PORT={HTTP_PORT}  OWNER_ID={OWNER_ID}")
+    logger.info(f"   GITHUB_TOKEN={'set ✅' if GITHUB_TOKEN else 'NOT SET ❌'}")
+    logger.info(f"   GITHUB_GIST_ID='{GITHUB_GIST or '(will auto-create)'}'")
+    logger.info("="*55)
+
+    # 1. HTTP first
+    http_runner = await start_http(HTTP_PORT)
+    await asyncio.sleep(0.3)
+
+    # 2. Load scores from GitHub
+    loop = asyncio.get_running_loop()
+    if GITHUB_TOKEN:
+        try:
+            gh = await asyncio.wait_for(
+                loop.run_in_executor(None, github_load_scores), timeout=20)
+            if gh:
+                db["scores"] = gh; save_db()
+                logger.info(f"✅ Loaded {sum(len(v) for v in gh.values())} user scores")
+            else:
+                logger.info("[GitHub] No scores yet — will save on first update")
+        except Exception as e:
+            logger.warning(f"[GitHub startup] {e}")
+    else:
+        logger.warning("⚠️  GITHUB_TOKEN not set — add it to Render env vars for persistence!")
+
+    # 3. Build PTB
+    app = TGApp.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start",              start_handler))
+    app.add_handler(CommandHandler("search",             search_handler))
+    app.add_handler(CommandHandler("quiz",               quiz_handler))
+    app.add_handler(CommandHandler(["lb","leaderboard"], lb_handler))
+    app.add_handler(CommandHandler("nw",                 nw_handler))
+    app.add_handler(CommandHandler(["gay","couple"],     fun_dispatcher))
+    app.add_handler(CommandHandler(["pump","dump"],      pump_dump_handler))
+    app.add_handler(CommandHandler("tictac",             tictac_handler))
+    app.add_handler(CommandHandler("rock",               rock_handler))
+    app.add_handler(CallbackQueryHandler(ttt_callback,   pattern=r"^ttt:"))
+    app.add_handler(CallbackQueryHandler(rps_callback,   pattern=r"^rps:"))
+    app.add_handler(PollAnswerHandler(poll_answer_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, monitor))
+    app.add_error_handler(error_handler)
+    logger.info("✅ All handlers registered")
+
+    # 4. Start polling
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    bot_status["running"] = True
+    logger.info("✅ Beluga v6.0.0 is LIVE 🐱")
+
+    # 5. Keep alive
+    stop_evt = asyncio.Event()
+    try:
+        import signal
+        loop.add_signal_handler(signal.SIGTERM, stop_evt.set)
+        loop.add_signal_handler(signal.SIGINT,  stop_evt.set)
+    except (NotImplementedError, RuntimeError): pass
+
+    async def periodic():
+        while not stop_evt.is_set():
+            await asyncio.sleep(60)
+            await cleanup_expired_games()
+
+    cleanup_task = asyncio.create_task(periodic())
+    try:
+        await stop_evt.wait()
+    except (KeyboardInterrupt, asyncio.CancelledError): pass
+
+    # 6. Shutdown
+    cleanup_task.cancel()
+    bot_status["running"] = False
+    logger.info("🔄 Saving to GitHub before shutdown…")
+    if GITHUB_TOKEN:
+        try: await loop.run_in_executor(None, github_save_scores)
+        except Exception: pass
+    for fn in [app.updater.stop, app.stop, app.shutdown, http_runner.cleanup]:
+        try: await fn()
+        except Exception: pass
+    logger.info("✅ Shutdown complete")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt: logger.info("👋 Bye!")
+    except InvalidToken: logger.critical("❌ Invalid BOT_TOKEN"); sys.exit(1)
+    except Exception as e: logger.critical(f"❌ FATAL: {e}", exc_info=True); sys.exit(1)
