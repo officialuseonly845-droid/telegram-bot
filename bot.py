@@ -29,8 +29,8 @@ BOT_TOKEN      = os.environ.get("BOT_TOKEN", "")
 HTTP_PORT      = int(os.environ.get("PORT", "10000"))
 OWNER_ID       = int(os.environ.get("OWNER_ID", "0"))
 
-# Fixed Sticker Pack ID
-STICKER_PACK = "belugapack_mystickers_by_fStikBot" 
+# Fixed Sticker Pack ID (Fixed to match exact Telegram Short Name identifier link)
+STICKER_PACK = "t_me_belugapack_mystickers_by_fStikBot" 
 
 if not BOT_TOKEN or len(BOT_TOKEN) < 20:
     logger.critical("❌ BOT_TOKEN missing"); sys.exit(1)
@@ -55,7 +55,7 @@ mine_games:    dict[str, dict]             = {}  # {gkey: {state}}
 GAME_TIMEOUT   = 300
 TIMER_DURATION = 60
 _dl_tracker:   dict[str, list]             = {}
-LB_IMAGE_URL   = "https://i.postimg.cc/P5THW6RQ/file-00000000bce4720b905dc2e04c58fa80.png"
+LB_IMAGE_URL = "https://i.postimg.cc/P5THW6RQ/file-00000000bce4720b905dc2e04c58fa80.png"
 MINE_IMAGE_URL = "https://i.postimg.cc/hjCftW5b/file-0000000079a071fa95971d3b70015fc0.png"
 GM_IMAGE_URL   = "https://i.postimg.cc/Fs1h0CPs/file-000000001d7872078a894cdf6f6247c9.png"
 
@@ -67,7 +67,7 @@ def _sb_headers():
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "application/json",
-        "Prefer": "resolution=merge-duplicates" # Fixes silent upsert failures
+        "Prefer": "resolution=merge-duplicates" 
     }
 
 def supabase_upsert_user(chat_id: str, user_id: str, name: str, score: int) -> bool:
@@ -226,7 +226,7 @@ async def send_random_sticker(bot, chat_id: int):
             random_sticker = random.choice(stickers.stickers)
             await bot.send_sticker(chat_id, random_sticker.file_id)
     except Exception as e:
-        logger.debug(f"[Sticker] {e}")
+        logger.debug(f"[Sticker Pack Error] {e}")
 
 # ══════════════════════════════════════════════════════
 #  HELPERS
@@ -721,6 +721,12 @@ async def lb_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         lw = await asyncio.wait_for(
             loop.run_in_executor(None, supabase_get_last_weekly, cid), timeout=10)
 
+        # Robust Fallback Check: If Supabase returns nothing or is offline, read from internal memory state
+        if not lb:
+            local_scores = db.get("scores", {}).get(cid, {})
+            if local_scores:
+                lb = sorted(local_scores.values(), key=lambda x: x.get("score", 0), reverse=True)
+
         lines = []
 
         if lw and lw.get("top3"):
@@ -770,6 +776,12 @@ async def nw_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
         lb = await asyncio.wait_for(
             loop.run_in_executor(None, supabase_get_leaderboard, cid), timeout=10)
+        
+        if not lb:
+            local_scores = db.get("scores", {}).get(cid, {})
+            if local_scores:
+                lb = sorted(local_scores.values(), key=lambda x: x.get("score", 0), reverse=True)
+
         top3 = [{"name": e.get("name","?"), "score": e.get("score",0)} for e in (lb or [])[:3]]
         wk_label = datetime.now().strftime("%d %b %Y")
 
@@ -812,7 +824,6 @@ async def pump_dump_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         cid = str(u.effective_chat.id)
         
         new_sc = update_score(cid, str(target.id), (target.first_name or "User")[:30], delta)
-        # Fix: Create background task correctly
         asyncio.create_task(async_supabase_upsert(cid, str(target.id), (target.first_name or "User")[:30], new_sc))
         
         emoji = "🚀" if cmd == "pump" else "📉"
@@ -962,11 +973,18 @@ async def gm_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         cid = str(u.effective_chat.id)
         date_str = datetime.now().strftime("%d %b %Y")
         
-        msg = await u.message.reply_photo(
-            photo=GM_IMAGE_URL,
-            caption=_build_gm_caption([], date_str),
-            reply_markup=_build_gm_keyboard(cid)
-        )
+        # Added a robust text Fallback logic if Telegram fails to pull/cache the PostImage URL
+        try:
+            msg = await u.message.reply_photo(
+                photo=GM_IMAGE_URL,
+                caption=_build_gm_caption([], date_str),
+                reply_markup=_build_gm_keyboard(cid)
+            )
+        except Exception:
+            msg = await u.message.reply_text(
+                text=_build_gm_caption([], date_str),
+                reply_markup=_build_gm_keyboard(cid)
+            )
         
         gm_tracker[cid] = (msg.message_id, [], date_str)
         gm_msg_lock[cid] = asyncio.Lock()
@@ -1008,12 +1026,16 @@ async def gm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             asyncio.create_task(async_supabase_upsert(cid_str, user_id, (user.first_name or "User")[:20], new_score))
             
             try:
-                await context.bot.edit_message_caption(
-                    chat_id=q.message.chat_id,
-                    message_id=msg_id,
-                    caption=_build_gm_caption(users, date_str),
-                    reply_markup=_build_gm_keyboard(cid))
-                await q.answer("Attendance Marked!", show_alert=False) # Silent 50 points
+                # Dynamic terminal switch to safely update layout regardless of whether it was sent as photo or text
+                if q.message.photo:
+                    await context.bot.edit_message_caption(
+                        chat_id=q.message.chat_id, message_id=msg_id,
+                        caption=_build_gm_caption(users, date_str), reply_markup=_build_gm_keyboard(cid))
+                else:
+                    await context.bot.edit_message_text(
+                        chat_id=q.message.chat_id, message_id=msg_id,
+                        text=_build_gm_caption(users, date_str), reply_markup=_build_gm_keyboard(cid))
+                await q.answer("Attendance Marked!", show_alert=False)
             except Exception as e:
                 logger.debug(f"[GM Edit] {e}")
                 
@@ -1500,7 +1522,10 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
         if media_m:
             asyncio.create_task(download_and_send(u, c, media_m.group(0)))
             
-        beluga = "beluga" in text_low or (c.bot.username.lower() in text_low)
+        # Fixed: Safe username check logic preventing NoneType AttributeError crash 
+        bot_username = c.bot.username.lower() if c.bot.username else ""
+        beluga = "beluga" in text_low or (bot_username in text_low)
+        
         reply_me = (u.message.reply_to_message and u.message.reply_to_message.from_user and
                     u.message.reply_to_message.from_user.id == c.bot.id)
         mention = any("beluga" in text_low[e.offset:e.offset+e.length]
