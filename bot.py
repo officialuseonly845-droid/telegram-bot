@@ -1624,8 +1624,12 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 emoji = await ai_emoji(text)
                 await safe_react(c.bot, u.effective_chat.id, u.message.message_id, emoji)
                 reply = await ai(CHAT_PROMPT, text, "Meow! 🐾")
-                await u.message.reply_text(reply)
-                await send_random_sticker(c.bot, u.effective_chat.id)
+                
+                # Bot explicitly sends and awaits the AI text reply successfully first
+                sent_msg = await u.message.reply_text(reply)
+                if sent_msg:
+                    # Sticker is dispatched only after successful validation of the text message frame resolution
+                    await send_random_sticker(c.bot, u.effective_chat.id)
             except Exception as e: logger.error(f"[monitor/chat] {e}")
             
         bot_status["message_count"] += 1
