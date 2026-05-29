@@ -4,10 +4,10 @@ from datetime import datetime, timedelta
 from typing import Optional
 from aiohttp import web
 
-from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResultArticle, InputTextMessageContent
+from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application as TGApp, CommandHandler, ContextTypes,
-    MessageHandler, PollAnswerHandler, CallbackQueryHandler, filters, InlineQueryHandler
+    MessageHandler, PollAnswerHandler, CallbackQueryHandler, filters
 )
 from telegram.constants import ParseMode
 from telegram.error import NetworkError, TimedOut, Forbidden, BadRequest, RetryAfter, InvalidToken
@@ -345,27 +345,6 @@ async def ai_emoji(text: str) -> str:
             if found: return found[0][0]
     except Exception: pass
     return "😼"
-
-# ══════════════════════════════════════════════════════
-#  INLINE QUERY HANDLER (GHOST MODE)
-# ══════════════════════════════════════════════════════
-async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.inline_query.query
-    if not query:
-        return
-    try:
-        reply = await ai(CHAT_PROMPT, query)
-        results = [
-            InlineQueryResultArticle(
-                id=hashlib.md5(query.encode()).hexdigest(),
-                title="Ask Beluga 🐱",
-                description=f"Send AI response to: {query[:30]}...",
-                input_message_content=InputTextMessageContent(f"💬 *{update.inline_query.from_user.first_name} asked:* {query}\n\n🐱 *Beluga:* {reply}", parse_mode=ParseMode.MARKDOWN)
-            )
-        ]
-        await update.inline_query.answer(results, cache_time=10)
-    except Exception as e:
-        logger.error(f"[Inline] {e}")
 
 # ══════════════════════════════════════════════════════
 #  WIKIPEDIA + GOOGLE
@@ -1038,7 +1017,7 @@ def _build_gm_caption(users: list, date_str: str) -> str:
     ]
     display_users = users[-15:] if len(users) > 15 else users
     if len(users) > 15:
-        lines.append(f"... and {len(users) - 15} more operational updates ...\n")
+        lines.append(f"... and {len(users) - 15} more Operation updates ...\n")
     for i, user in enumerate(display_users, 1):
         lines.append(f"{i}. {user['name']} • {user['time']}")
     lines.append("\n━━━━━━━━━━━━━━━━━━━━\n")
@@ -1093,7 +1072,7 @@ async def gm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         async with gm_msg_lock[cid]:
             if cid not in gm_tracker:
-                await q.answer("⏰ GM operational frame expired", show_alert=True)
+                await q.answer("⏰ GM Operation Frame Expired", show_alert=True)
                 return
             
             msg_id, users, date_str = gm_tracker[cid]
@@ -1533,7 +1512,7 @@ async def start_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             "`/nw` — New Week\n\n"
             "🎉 *FUN*\n"
             "`/gay`  `/couple` — Daily Vibes\n\n"
-            "👨‍💼 *GROUP*\n"
+            "👑 *GROUP*\n"
             "`/gm` — Daily Attendance (Owner)\n\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "🔥 *READY?* 🔥\n"
@@ -1583,6 +1562,7 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
             try: await u.message.delete()
             except Exception: pass
             return
+            
         db.setdefault("seen",{}).setdefault(cid,{})[str(uid)] = {
             "id": uid, "un": u.effective_user.username, "n": u.effective_user.first_name or "User",
         }
@@ -1598,20 +1578,21 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
             asyncio.create_task(download_and_send(u, c, media_m.group(0)))
             
         bot_username = bot_status.get("username", "")
-        beluga = "beluga" in text_low or (bot_username and bot_username in text_low)
         
-        reply_me = (u.message.reply_to_message and u.message.reply_to_message.from_user and
-                    u.message.reply_to_message.from_user.id == c.bot.id)
-        mention = any("beluga" in text_low[e.offset:e.offset+e.length]
-                      for e in (u.message.entities or u.message.caption_entities or []) if e.type == "mention")
+        # Trigger Conditions
+        contains_beluga = "beluga" in text_low
+        contains_username = (bot_username in text_low) if bot_username else False
+        is_reply_to_bot = (u.message.reply_to_message and u.message.reply_to_message.from_user and
+                           u.message.reply_to_message.from_user.id == c.bot.id)
                       
-        if text and (beluga or reply_me or mention):
+        if text and (contains_beluga or contains_username or is_reply_to_bot):
             try:
                 await c.bot.send_chat_action(u.effective_chat.id, "typing")
                 emoji = await ai_emoji(text)
                 await safe_react(c.bot, u.effective_chat.id, u.message.message_id, emoji)
-                reply = await ai(CHAT_PROMPT, text, "Meow! 🐾")
                 
+                # Fetch AI generated text from API endpoints
+                reply = await ai(CHAT_PROMPT, text, "Meow! 🐾")
                 await u.message.reply_text(reply)
             except Exception as e: logger.error(f"[monitor/chat] {e}")
             
@@ -1670,7 +1651,6 @@ async def main():
     app.add_handler(PollAnswerHandler(poll_answer_handler))
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, monitor))
-    app.add_handler(InlineQueryHandler(inline_query_handler))
     
     app.add_error_handler(error_handler)
     
