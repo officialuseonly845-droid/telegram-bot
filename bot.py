@@ -29,8 +29,7 @@ BOT_TOKEN      = os.environ.get("BOT_TOKEN", "")
 HTTP_PORT      = int(os.environ.get("PORT", "10000"))
 OWNER_ID       = int(os.environ.get("OWNER_ID", "0"))
 
-# Fixed Sticker Pack ID (Fixed to match exact Telegram Short Name identifier link)
-STICKER_PACK = "t_me_belugapack_mystickers_by_fStikBot" 
+STICKER_PACK   = "t_me_belugapack_mystickers_by_fStikBot" 
 
 if not BOT_TOKEN or len(BOT_TOKEN) < 20:
     logger.critical("❌ BOT_TOKEN missing"); sys.exit(1)
@@ -39,6 +38,7 @@ bot_status = {
     "running": False, "start_time": datetime.now(),
     "last_update": datetime.now(), "message_count": 0,
     "error_count": 0, "api_calls": 0, "failed_apis": 0,
+    "username": ""
 }
 
 quiz_cooldown: dict[str, dict[str, float]] = {}
@@ -46,11 +46,13 @@ active_polls:  dict[str, dict]             = {}
 spam_tracker:  dict[int, list]             = {}
 db:            dict                        = {}
 ttt_games:     dict[str, dict]             = {}
+mine_games:    dict[str, dict]             = {}  
 user_in_game:  dict[str, str]              = {}
 game_timers:   dict[str, dict]             = {}
-gm_tracker:    dict[str, tuple]            = {}  # {cid: (msg_id, list_of_users, date_str)}
+mine_timers:   dict[str, dict]             = {}  
+gm_tracker:    dict[str, tuple]            = {}  
 gm_msg_lock:   dict[str, asyncio.Lock]     = {}
-mine_games:    dict[str, dict]             = {}  # {gkey: {state}}
+sticker_file_ids: list                     = []
 
 GAME_TIMEOUT   = 300
 TIMER_DURATION = 60
@@ -189,7 +191,7 @@ def is_owner(uid: int) -> bool:
 async def _health(req):
     up = int((datetime.now() - bot_status["start_time"]).total_seconds())
     return web.json_response({
-        "status": "healthy", "uptime_seconds": up,
+        "Operation Status": "Healthy", "uptime_seconds": up,
         "running": bot_status["running"],
         "messages": bot_status["message_count"],
         "version": "7.3.0",
@@ -200,7 +202,6 @@ async def _ping(req):
 
 async def _stats(req):
     up = (datetime.now() - bot_status["start_time"]).total_seconds()
-    ok = bot_status["api_calls"] - bot_status["failed_apis"]
     return web.json_response({
         "uptime_hours": round(up/3600, 2),
         "messages": bot_status["message_count"],
@@ -220,13 +221,11 @@ async def start_http(port: int):
     return runner
 
 async def send_random_sticker(bot, chat_id: int):
-    try:
-        stickers = await bot.get_sticker_set(STICKER_PACK)
-        if stickers and stickers.stickers and len(stickers.stickers) > 0:
-            random_sticker = random.choice(stickers.stickers)
-            await bot.send_sticker(chat_id, random_sticker.file_id)
-    except Exception as e:
-        logger.debug(f"[Sticker Pack Error] {e}")
+    if sticker_file_ids:
+        try:
+            await bot.send_sticker(chat_id, random.choice(sticker_file_ids))
+        except Exception:
+            pass
 
 # ══════════════════════════════════════════════════════
 #  HELPERS
@@ -667,7 +666,7 @@ async def quiz_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         cid = str(u.effective_chat.id); cid_i = u.effective_chat.id
         await safe_react(c.bot, cid_i, u.message.message_id, "💡")
         await c.bot.send_chat_action(cid_i, "typing")
-        sm = await u.message.reply_text("🎲 Generating Progress…")
+        sm = await u.message.reply_text("🎲 Quiz Generation Operation In Progress…")
         qdata = await gen_quiz(topic, cid)
         try: await sm.delete()
         except Exception: pass
@@ -721,14 +720,14 @@ async def lb_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         lw = await asyncio.wait_for(
             loop.run_in_executor(None, supabase_get_last_weekly, cid), timeout=10)
 
-        # Robust Fallback Check: If Supabase returns nothing or is offline, read from internal memory state
         if not lb:
             local_scores = db.get("scores", {}).get(cid, {})
             if local_scores:
                 lb = sorted(local_scores.values(), key=lambda x: x.get("score", 0), reverse=True)
+                for entry in lb:
+                    asyncio.create_task(async_supabase_upsert(cid, str(entry.get("user_id")), entry.get("name","Unknown"), entry.get("score",0)))
 
         lines = []
-
         if lw and lw.get("top3"):
             lines.append("🏆 LAST WEEK CHAMPIONS 🏆\n")
             for i, e in enumerate(lw["top3"]):
@@ -755,7 +754,6 @@ async def lb_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
                   "➕ +10 quiz/win  ➖ -10 loss"]
 
         text = "\n".join(lines)
-
         try:
             await u.message.reply_photo(photo=LB_IMAGE_URL, caption=text, parse_mode=ParseMode.MARKDOWN)
         except Exception:
@@ -764,7 +762,6 @@ async def lb_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         bot_status["message_count"] += 1
     except Exception as e: logger.error(f"[Leaderboard] {e}", exc_info=True)
 
-# /nw — New Week
 async def nw_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message: return
     try:
@@ -840,7 +837,7 @@ async def pump_dump_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════
 #  /mine GAME
 # ══════════════════════════════════════════════════════
-def build_mine_keyboard(gkey: str, bombs: int, active: bool = False, revealed: bool = False, state: list = None) -> InlineKeyboardMarkup:
+def build_mine_keyboard(gkey: str, bombs: int, active: bool = False, revealed: bool = False, state: list = None, opened: list = None) -> InlineKeyboardMarkup:
     if not active and not revealed:
         return InlineKeyboardMarkup([[
             InlineKeyboardButton("3 Mines", callback_data=f"mine:set:{gkey}:3"),
@@ -851,17 +848,35 @@ def build_mine_keyboard(gkey: str, bombs: int, active: bool = False, revealed: b
     rows = []
     r = []
     for i in range(6):
-        if not revealed:
-            btn = InlineKeyboardButton("📦", callback_data=f"mine:play:{gkey}:{i}")
-        else:
-            is_bomb = state[i]
-            label = "💣" if is_bomb else "✅"
+        if revealed:
+            label = "💣" if state[i] else "✅"
             btn = InlineKeyboardButton(label, callback_data=f"mine:noop:{gkey}:{i}")
+        else:
+            if opened and opened[i]:
+                label = "✅"
+                btn = InlineKeyboardButton(label, callback_data=f"mine:noop:{gkey}:{i}")
+            else:
+                label = "📦"
+                btn = InlineKeyboardButton(label, callback_data=f"mine:play:{gkey}:{i}")
         r.append(btn)
         if len(r) == 3:
             rows.append(r)
             r = []
     return InlineKeyboardMarkup(rows)
+
+def mine_build_text(g: dict, rem: int) -> str:
+    bombs = g["bombs"]
+    opened_count = sum(1 for x in g["revealed"] if x)
+    total_safe = 6 - bombs
+    
+    if g.get("status") == "timeout":
+        return f"⏰ *Time Up!*\n\nOperation Status: Terminated due to inactivity. Lost -5 Points."
+    elif g.get("status") == "lost":
+        return f"BOOM 🔥 BE CAREFUL !!\n\nYou hit a mine! Lost -5 Points."
+    elif g.get("status") == "won":
+        return f"🎉 *VICTORY!*\n\nYou successfully uncovered all {total_safe} safe boxes without hitting a mine! Won +10 Points."
+    else:
+        return f"BOOM 🔥 BE CAREFUL !!\n\nFind all safe boxes!\n💣 Mines Count: {bombs}\n💎 Found Status: {opened_count}/{total_safe}\n⏱ Time Remaining: `{rem}` seconds"
 
 async def mine_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message: return
@@ -870,21 +885,69 @@ async def mine_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         uid = str(u.effective_user.id)
         gkey = f"{cid}_{uid}_{int(time.time())}"
         
-        mine_games[gkey] = {"uid": uid, "name": u.effective_user.first_name, "bombs": 0, "state": []}
+        mine_games[gkey] = {
+            "uid": uid, "name": u.effective_user.first_name, "bombs": 0, "state": [],
+            "revealed": [False]*6, "chat_id": u.effective_chat.id, "msg_id": None, "status": "setting"
+        }
         
-        await u.message.reply_photo(
+        msg = await u.message.reply_photo(
             photo=MINE_IMAGE_URL,
-            caption="BOOM 🔥 BE CAREFUL !!\nChoose number of mines:",
+            caption="BOOM 🔥 BE CAREFUL !!\nChoose number of mines to initialize the Operation Progress:",
             reply_markup=build_mine_keyboard(gkey, 0, False)
         )
+        mine_games[gkey]["msg_id"] = msg.message_id
         bot_status["message_count"] += 1
     except Exception as e: logger.error(f"[Mine Game] {e}")
+
+async def run_mine_timer(c: ContextTypes.DEFAULT_TYPE, gkey: str):
+    try:
+        while True:
+            await asyncio.sleep(3)
+            g = mine_games.get(gkey)
+            td = mine_timers.get(gkey)
+            if not g or not td or g.get("status") != "playing":
+                return
+            
+            td["remaining"] = max(0, td["remaining"] - 3)
+            cid = g.get("chat_id")
+            msg_id = g.get("msg_id")
+            if not msg_id: return
+            
+            if td["remaining"] <= 0:
+                g["status"] = "timeout"
+                cid_s = str(cid)
+                uid = g["uid"]
+                name = g["name"]
+                new_sc = update_score(cid_s, uid, name, -5)
+                asyncio.create_task(async_supabase_upsert(cid_s, uid, name, new_sc))
+                
+                try:
+                    await c.bot.edit_message_caption(
+                        chat_id=cid, message_id=msg_id,
+                        caption=mine_build_text(g, 0) + f"\nNew Balance: {new_sc:,} Points",
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=build_mine_keyboard(gkey, g["bombs"], active=False, revealed=True, state=g["state"])
+                    )
+                except Exception: pass
+                
+                mine_timers.pop(gkey, None)
+                mine_games.pop(gkey, None)
+                return
+            else:
+                try:
+                    await c.bot.edit_message_caption(
+                        chat_id=cid, message_id=msg_id,
+                        caption=mine_build_text(g, td["remaining"]), parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=build_mine_keyboard(gkey, g["bombs"], active=True, revealed=False, state=g["state"], opened=g["revealed"])
+                    )
+                except Exception: pass
+    except asyncio.CancelledError: pass
+    except Exception as e: logger.debug(f"[Mine Timer] {e}")
 
 async def mine_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q: return
     try:
-        await q.answer()
         parts = q.data.split(":")
         if len(parts) < 4 or parts[0] != "mine": return
         
@@ -893,27 +956,35 @@ async def mine_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         val = int(parts[3])
         
         if gkey not in mine_games:
-            await q.answer("Game expired!", show_alert=True)
+            await q.answer("Operation expired!", show_alert=True)
             return
             
         g = mine_games[gkey]
         if str(q.from_user.id) != g["uid"]:
-            await q.answer("This is not your game!", show_alert=True)
+            await q.answer("This operation does not belong to you!", show_alert=True)
             return
             
         if action == "set":
+            await q.answer()
             bombs = max(3, min(5, val))
             state = [True]*bombs + [False]*(6-bombs)
             random.shuffle(state)
             g["bombs"] = bombs
             g["state"] = state
+            g["status"] = "playing"
+            g["revealed"] = [False]*6
+            
+            mine_timers[gkey] = {"remaining": 60}
+            asyncio.create_task(run_mine_timer(context, gkey))
             
             await q.edit_message_caption(
-                caption=f"BOOM 🔥 BE CAREFUL !!\n\nFind the safe box! (Mines: {bombs})",
-                reply_markup=build_mine_keyboard(gkey, bombs, active=True)
+                caption=mine_build_text(g, 60),
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=build_mine_keyboard(gkey, bombs, active=True, state=state, opened=g["revealed"])
             )
             
         elif action == "play":
+            await q.answer()
             state = g["state"]
             is_bomb = state[val]
             cid = str(q.message.chat_id)
@@ -921,23 +992,46 @@ async def mine_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             name = g["name"]
             
             if is_bomb:
-                delta = -5
-                res_text = f"BOOM 🔥 BE CAREFUL !!\nYou hit a mine! Lost 5 Points."
-            else:
-                delta = 5
-                res_text = f"✅ SAFE!\nYou won 5 Points!"
+                g["status"] = "lost"
+                new_sc = update_score(cid, uid, name, -5)
+                asyncio.create_task(async_supabase_upsert(cid, uid, name, new_sc))
                 
-            new_sc = update_score(cid, uid, name, delta)
-            asyncio.create_task(async_supabase_upsert(cid, uid, name, new_sc))
-            
-            await q.edit_message_caption(
-                caption=f"{res_text}\nNew Balance: {new_sc:,} Points",
-                reply_markup=build_mine_keyboard(gkey, g["bombs"], active=False, revealed=True, state=state)
-            )
-            del mine_games[gkey]
+                await q.edit_message_caption(
+                    caption=mine_build_text(g, 0) + f"\n\nOperation Status: Terminated\nNew Balance: {new_sc:,} Points",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=build_mine_keyboard(gkey, g["bombs"], active=False, revealed=True, state=state)
+                )
+                mine_timers.pop(gkey, None)
+                mine_games.pop(gkey, None)
+            else:
+                g["revealed"][val] = True
+                total_safe = 6 - g["bombs"]
+                opened_count = sum(1 for x in g["revealed"] if x)
+                
+                if gkey in mine_timers:
+                    mine_timers[gkey]["remaining"] = 60
+                
+                if opened_count == total_safe:
+                    g["status"] = "won"
+                    new_sc = update_score(cid, uid, name, +10)
+                    asyncio.create_task(async_supabase_upsert(cid, uid, name, new_sc))
+                    
+                    await q.edit_message_caption(
+                        caption=mine_build_text(g, 0) + f"\n\nOperation Status: Completed Successfully\nNew Balance: {new_sc:,} Points",
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=build_mine_keyboard(gkey, g["bombs"], active=False, revealed=True, state=state)
+                    )
+                    mine_timers.pop(gkey, None)
+                    mine_games.pop(gkey, None)
+                else:
+                    await q.edit_message_caption(
+                        caption=mine_build_text(g, mine_timers[gkey]["remaining"]),
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=build_mine_keyboard(gkey, g["bombs"], active=True, revealed=False, state=state, opened=g["revealed"])
+                    )
             
         elif action == "noop":
-            await q.answer("Game already over!")
+            await q.answer("Box already processed!")
             
     except Exception as e: logger.error(f"[Mine Callback] {e}")
 
@@ -946,17 +1040,20 @@ async def mine_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════
 def _build_gm_caption(users: list, date_str: str) -> str:
     lines = [
-        "📸 DAILY ATTENDANCE\n",
-        "🥱 Dear Members, please mark your attendance!\n",
-        f"📅 {date_str}",
-        f"👥 Present: {len(users)}\n",
+        "📸 DAILY ATTENDANCE OPERATION\n",
+        "🥱 Dear Members, please mark your attendance status!\n",
+        f"📅 Date: {date_str}",
+        f"👥 Present Count: {len(users)}\n",
         "━━━━━━━━━━━━━━━━━━━━\n"
     ]
-    for i, user in enumerate(users, 1):
+    display_users = users[-15:] if len(users) > 15 else users
+    if len(users) > 15:
+        lines.append(f"... and {len(users) - 15} more operational updates ...\n")
+    for i, user in enumerate(display_users, 1):
         lines.append(f"{i}. {user['name']} • {user['time']}")
     lines.append("\n━━━━━━━━━━━━━━━━━━━━\n")
-    lines.append("🔥 Check in daily to maintain your streak!")
-    lines.append("🎯 Press the GM button below to mark attendance.")
+    lines.append("🔥 Check in daily to maintain your operational streak!")
+    lines.append("🎯 Press the GM button below to update Progress Status.")
     return "\n".join(lines)
 
 def _build_gm_keyboard(cid: str) -> InlineKeyboardMarkup:
@@ -973,14 +1070,14 @@ async def gm_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         cid = str(u.effective_chat.id)
         date_str = datetime.now().strftime("%d %b %Y")
         
-        # Added a robust text Fallback logic if Telegram fails to pull/cache the PostImage URL
         try:
             msg = await u.message.reply_photo(
                 photo=GM_IMAGE_URL,
                 caption=_build_gm_caption([], date_str),
                 reply_markup=_build_gm_keyboard(cid)
             )
-        except Exception:
+        except Exception as e:
+            logger.debug(f"[GM URL Image Fail Backup Triggereded] {e}")
             msg = await u.message.reply_text(
                 text=_build_gm_caption([], date_str),
                 reply_markup=_build_gm_keyboard(cid)
@@ -1006,7 +1103,7 @@ async def gm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         async with gm_msg_lock[cid]:
             if cid not in gm_tracker:
-                await q.answer("⏰ GM expired", show_alert=True)
+                await q.answer("⏰ GM operational frame expired", show_alert=True)
                 return
             
             msg_id, users, date_str = gm_tracker[cid]
@@ -1015,7 +1112,7 @@ async def gm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             utime = datetime.now().strftime("%H:%M")
             
             if any(uu.get("id") == user_id for uu in users):
-                await q.answer(f"✅ Already marked at {[u.get('time') for u in users if u.get('id')==user_id][0]}", show_alert=True)
+                await q.answer(f"✅ Status already marked at {[u.get('time') for u in users if u.get('id')==user_id][0]}", show_alert=True)
                 return
             
             users.append({"id": user_id, "name": (user.first_name or "User")[:20], "time": utime})
@@ -1026,7 +1123,6 @@ async def gm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             asyncio.create_task(async_supabase_upsert(cid_str, user_id, (user.first_name or "User")[:20], new_score))
             
             try:
-                # Dynamic terminal switch to safely update layout regardless of whether it was sent as photo or text
                 if q.message.photo:
                     await context.bot.edit_message_caption(
                         chat_id=q.message.chat_id, message_id=msg_id,
@@ -1035,9 +1131,9 @@ async def gm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await context.bot.edit_message_text(
                         chat_id=q.message.chat_id, message_id=msg_id,
                         text=_build_gm_caption(users, date_str), reply_markup=_build_gm_keyboard(cid))
-                await q.answer("Attendance Marked!", show_alert=False)
+                await q.answer("Attendance Progress Updated!", show_alert=False)
             except Exception as e:
-                logger.debug(f"[GM Edit] {e}")
+                logger.debug(f"[GM Edit Layout Failure] {e}")
                 
     except Exception as e:
         logger.error(f"[gm_callback] {e}")
@@ -1117,8 +1213,7 @@ async def run_game_timer(c: ContextTypes.DEFAULT_TYPE, gkey: str):
                         reply_markup=ttt_build_keyboard(g["board"]))
                 except Exception: pass
     except asyncio.CancelledError: pass
-    except Exception as e:
-        logger.debug(f"[Timer] {e}")
+    except Exception as e: logger.debug(f"[Timer] {e}")
 
 # ══════════════════════════════════════════════════════
 #  TIC TAC TOE
@@ -1322,8 +1417,7 @@ async def ttt_ready_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=_ready_keyboard(gkey))
             await q.answer("✅ Ready!")
-    except Exception as e:
-        logger.error(f"[ttt_ready] {e}")
+    except Exception as e: logger.error(f"[ttt_ready] {e}")
 
 async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1399,15 +1493,11 @@ async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await q.edit_message_text(ttt_build_text(g), parse_mode=ParseMode.MARKDOWN,
             reply_markup=ttt_build_keyboard(board))
-    except Exception as e:
-        logger.error(f"[ttt_cb] {e}", exc_info=True)
+    except Exception as e: logger.error(f"[ttt_cb] {e}", exc_info=True)
 
 # ══════════════════════════════════════════════════════
 #  FUN COMMANDS
 # ══════════════════════════════════════════════════════
-GAY_T = ["🌈 *SUPER GAY* 🌈\nMust slay! 💅", "📡 *Certified Gay* 🌈"]
-COUPLE_T = ["💘 *Perfect Match!* 100% ❤️", "💖 *OFFICIAL COUPLE* 💖"]
-
 async def fun_dispatcher(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message: return
     try:
@@ -1476,7 +1566,6 @@ async def photo_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         if "beluga" not in caption: return
         
         await c.bot.send_chat_action(u.effective_chat.id, "typing")
-        
         photo_file = await u.message.photo[-1].get_file()
         file_url = photo_file.file_path
         
@@ -1491,8 +1580,7 @@ async def photo_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         else:
             await u.message.reply_text("Hmm, my cat eyes can't quite see that right now! 🐾")
         bot_status["message_count"] += 1
-    except Exception as e:
-        logger.error(f"[photo_handler] {e}")
+    except Exception as e: logger.error(f"[photo_handler] {e}")
 
 # ══════════════════════════════════════════════════════
 #  MONITOR
@@ -1522,9 +1610,8 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
         if media_m:
             asyncio.create_task(download_and_send(u, c, media_m.group(0)))
             
-        # Fixed: Safe username check logic preventing NoneType AttributeError crash 
-        bot_username = c.bot.username.lower() if c.bot.username else ""
-        beluga = "beluga" in text_low or (bot_username in text_low)
+        bot_username = bot_status.get("username", "")
+        beluga = "beluga" in text_low or (bot_username and bot_username in text_low)
         
         reply_me = (u.message.reply_to_message and u.message.reply_to_message.from_user and
                     u.message.reply_to_message.from_user.id == c.bot.id)
@@ -1552,44 +1639,27 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     err = context.error
-    if isinstance(err, (NetworkError, TimedOut)):
-        logger.debug(f"[Net Error] {type(err).__name__}")
-        return
+    if isinstance(err, (NetworkError, TimedOut)): return
     if isinstance(err, RetryAfter):
-        logger.warning(f"[Rate Limited] Sleeping {err.retry_after}s")
         await asyncio.sleep(err.retry_after + 1)
         return
-    if isinstance(err, (Forbidden, BadRequest)):
-        logger.debug(f"[API Error] {type(err).__name__}: {str(err)[:100]}")
-        return
+    if isinstance(err, (Forbidden, BadRequest)): return
     if isinstance(err, InvalidToken):
-        logger.critical("❌ INVALID TOKEN - SHUTTING DOWN")
         bot_status["running"] = False
         return
     
-    logger.error("=" * 60)
-    logger.error(f"UNHANDLED ERROR: {type(err).__name__}")
-    logger.error("=" * 60)
-    tb = "".join(traceback.format_exception(type(err), err, err.__traceback__))
-    logger.error(tb)
-    logger.error("=" * 60)
     bot_status["error_count"] += 1
 
 # ══════════════════════════════════════════════════════
 #  MAIN
 # ══════════════════════════════════════════════════════
 async def main():
-    logger.info("=" * 60)
+    global sticker_file_ids
     logger.info("🐱  BELUGA BOT  v7.3.0  — PRODUCTION")
-    logger.info(f"   PORT={HTTP_PORT}  |  OWNER_ID={OWNER_ID}")
-    logger.info(f"   SUPABASE={'✅' if SUPABASE_URL and SUPABASE_KEY else '❌'}")
-    logger.info("=" * 60)
     
     http_runner = await start_http(HTTP_PORT)
     await asyncio.sleep(0.3)
-    logger.info("✅ Beluga v7.3.0 is LIVE 🐱")
     
-    loop = asyncio.get_running_loop()
     app = TGApp.builder().token(BOT_TOKEN).build()
     
     # Handlers
@@ -1616,24 +1686,34 @@ async def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, monitor))
     app.add_handler(InlineQueryHandler(inline_query_handler))
     
-    # Error handler
     app.add_error_handler(error_handler)
-    
-    logger.info("✅ All handlers registered")
     
     await app.initialize()
     await app.start()
+    
+    # Fetch and cache Username & Sticker pack on startup frame cleanly
+    try:
+        me = await app.bot.get_me()
+        bot_status["username"] = me.username.lower()
+        logger.info(f"🤖 Connected Frame: @{me.username}")
+        
+        stickers = await app.bot.get_sticker_set(STICKER_PACK)
+        if stickers and stickers.stickers:
+            sticker_file_ids = [s.file_id for s in stickers.stickers]
+            logger.info(f"📦 Cached {len(sticker_file_ids)} stickers natively.")
+    except Exception as e:
+        logger.warning(f"[Startup Cache Error] {e}")
+
     await app.updater.start_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
     bot_status["running"] = True
-    logger.info("✅ Polling started")
     
     stop_evt = asyncio.Event()
     try:
         import signal
+        loop = asyncio.get_running_loop()
         loop.add_signal_handler(signal.SIGTERM, stop_evt.set)
         loop.add_signal_handler(signal.SIGINT, stop_evt.set)
-    except (NotImplementedError, RuntimeError):
-        pass
+    except (NotImplementedError, RuntimeError): pass
     
     async def periodic_cleanup():
         while not stop_evt.is_set():
@@ -1641,30 +1721,18 @@ async def main():
             await cleanup_expired_games()
     
     cleanup_task = asyncio.create_task(periodic_cleanup())
-    
-    try:
-        await stop_evt.wait()
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        pass
+    await stop_evt.wait()
     
     cleanup_task.cancel()
     bot_status["running"] = False
-    logger.info("🔄 Shutting down…")
     
     for fn in [app.updater.stop, app.stop, app.shutdown, http_runner.cleanup]:
-        try:
-            await fn()
-        except Exception:
-            pass
-    
-    logger.info("✅ Shutdown complete")
+        try: await fn()
+        except Exception: pass
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("👋 Bye!")
-    except InvalidToken:
-        logger.critical("❌ Invalid BOT_TOKEN"); sys.exit(1)
+    except KeyboardInterrupt: pass
     except Exception as e:
-        logger.critical(f"❌ FATAL: {e}", exc_info=True); sys.exit(1)
+        sys.exit(1)
