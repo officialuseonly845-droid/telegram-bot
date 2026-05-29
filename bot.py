@@ -124,7 +124,8 @@ def supabase_reset_scores(chat_id: str) -> bool:
 def supabase_save_weekly_winners(chat_id: str, top3: list, week_label: str) -> bool:
     if not SUPABASE_URL or not SUPABASE_KEY:
         return False
-    try = payload = {
+    try:
+        payload = {
             "chat_id": chat_id,
             "top3_json": json.dumps(top3),
             "week_label": week_label,
