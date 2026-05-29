@@ -29,8 +29,6 @@ BOT_TOKEN      = os.environ.get("BOT_TOKEN", "")
 HTTP_PORT      = int(os.environ.get("PORT", "10000"))
 OWNER_ID       = int(os.environ.get("OWNER_ID", "0"))
 
-STICKER_PACK   = "t_me_belugapack_mystickers_by_fStikBot" 
-
 if not BOT_TOKEN or len(BOT_TOKEN) < 20:
     logger.critical("❌ BOT_TOKEN missing"); sys.exit(1)
 
@@ -52,14 +50,13 @@ game_timers:   dict[str, dict]             = {}
 mine_timers:   dict[str, dict]             = {}  
 gm_tracker:    dict[str, tuple]            = {}  
 gm_msg_lock:   dict[str, asyncio.Lock]     = {}
-sticker_file_ids: list                     = []
 
 GAME_TIMEOUT   = 300
 TIMER_DURATION = 60
 _dl_tracker:   dict[str, list]             = {}
 LB_IMAGE_URL = "https://i.postimg.cc/P5THW6RQ/file-00000000bce4720b905dc2e04c58fa80.png"
 MINE_IMAGE_URL = "https://i.postimg.cc/hjCftW5b/file-0000000079a071fa95971d3b70015fc0.png"
-GM_IMAGE_URL   = "https://i.postimg.cc/Fs1h0CPs/file-000000001d7872078a894cdf6f6247c9.png"
+GM_IMAGE_URL   = "https://i.postimg.cc/CzTyg7TW/file.png"
 
 # ══════════════════════════════════════════════════════
 #  SUPABASE FUNCTIONS
@@ -127,8 +124,7 @@ def supabase_reset_scores(chat_id: str) -> bool:
 def supabase_save_weekly_winners(chat_id: str, top3: list, week_label: str) -> bool:
     if not SUPABASE_URL or not SUPABASE_KEY:
         return False
-    try:
-        payload = {
+    try = payload = {
             "chat_id": chat_id,
             "top3_json": json.dumps(top3),
             "week_label": week_label,
@@ -219,13 +215,6 @@ async def start_http(port: int):
     await web.TCPSite(runner, "0.0.0.0", port).start()
     logger.info(f"✅ HTTP 0.0.0.0:{port}")
     return runner
-
-async def send_random_sticker(bot, chat_id: int):
-    if sticker_file_ids:
-        try:
-            await bot.send_sticker(chat_id, random.choice(sticker_file_ids))
-        except Exception:
-            pass
 
 # ══════════════════════════════════════════════════════
 #  HELPERS
@@ -1077,7 +1066,7 @@ async def gm_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 reply_markup=_build_gm_keyboard(cid)
             )
         except Exception as e:
-            logger.debug(f"[GM URL Image Fail Backup Triggereded] {e}")
+            logger.debug(f"[GM URL Image Fail Backup Triggered] {e}")
             msg = await u.message.reply_text(
                 text=_build_gm_caption([], date_str),
                 reply_markup=_build_gm_keyboard(cid)
@@ -1545,9 +1534,6 @@ async def start_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             "`/gay`  `/couple` — Daily Vibes\n\n"
             "👨‍💼 *GROUP*\n"
             "`/gm` — Daily Attendance (Owner)\n\n"
-            "🤖 *AUTO*\n"
-            "💬 Mention *beluga* for AI\n"
-            "🎬 YT/Instagram auto-download\n\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "🔥 *READY?* 🔥\n"
             "_+10 win, -10 loss, +50 GM_"
@@ -1625,11 +1611,7 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 await safe_react(c.bot, u.effective_chat.id, u.message.message_id, emoji)
                 reply = await ai(CHAT_PROMPT, text, "Meow! 🐾")
                 
-                # Bot explicitly sends and awaits the AI text reply successfully first
-                sent_msg = await u.message.reply_text(reply)
-                if sent_msg:
-                    # Sticker is dispatched only after successful validation of the text message frame resolution
-                    await send_random_sticker(c.bot, u.effective_chat.id)
+                await u.message.reply_text(reply)
             except Exception as e: logger.error(f"[monitor/chat] {e}")
             
         bot_status["message_count"] += 1
@@ -1658,7 +1640,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 #  MAIN
 # ══════════════════════════════════════════════════════
 async def main():
-    global sticker_file_ids
     logger.info("🐱  BELUGA BOT  v7.3.0  — PRODUCTION")
     
     http_runner = await start_http(HTTP_PORT)
@@ -1695,16 +1676,11 @@ async def main():
     await app.initialize()
     await app.start()
     
-    # Fetch and cache Username & Sticker pack on startup frame cleanly
+    # Fetch and cache Username on startup frame cleanly
     try:
         me = await app.bot.get_me()
         bot_status["username"] = me.username.lower()
         logger.info(f"🤖 Connected Frame: @{me.username}")
-        
-        stickers = await app.bot.get_sticker_set(STICKER_PACK)
-        if stickers and stickers.stickers:
-            sticker_file_ids = [s.file_id for s in stickers.stickers]
-            logger.info(f"📦 Cached {len(sticker_file_ids)} stickers natively.")
     except Exception as e:
         logger.warning(f"[Startup Cache Error] {e}")
 
