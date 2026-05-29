@@ -4,10 +4,10 @@ from datetime import datetime, timedelta
 from typing import Optional
 from aiohttp import web
 
-from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResultArticle, InputTextMessageContent
 from telegram.ext import (
     Application as TGApp, CommandHandler, ContextTypes,
-    MessageHandler, PollAnswerHandler, CallbackQueryHandler, filters
+    MessageHandler, PollAnswerHandler, CallbackQueryHandler, filters, InlineQueryHandler
 )
 from telegram.constants import ParseMode
 from telegram.error import NetworkError, TimedOut, Forbidden, BadRequest, RetryAfter, InvalidToken
@@ -29,8 +29,8 @@ BOT_TOKEN      = os.environ.get("BOT_TOKEN", "")
 HTTP_PORT      = int(os.environ.get("PORT", "10000"))
 OWNER_ID       = int(os.environ.get("OWNER_ID", "0"))
 
-# Sticker Pack
-STICKER_PACK = "t_me_belugapack_mystickers_by_fStikBot"  # From the link provided
+# Fixed Sticker Pack ID
+STICKER_PACK = "belugapack_mystickers_by_fStikBot" 
 
 if not BOT_TOKEN or len(BOT_TOKEN) < 20:
     logger.critical("❌ BOT_TOKEN missing"); sys.exit(1)
@@ -48,13 +48,16 @@ db:            dict                        = {}
 ttt_games:     dict[str, dict]             = {}
 user_in_game:  dict[str, str]              = {}
 game_timers:   dict[str, dict]             = {}
-gm_tracker:    dict[str, tuple]            = {}  # {cid: (msg_id, list_of_users)}
-gm_msg_lock:   dict[str, asyncio.Lock]     = {}  # Lock per chat for /gm
+gm_tracker:    dict[str, tuple]            = {}  # {cid: (msg_id, list_of_users, date_str)}
+gm_msg_lock:   dict[str, asyncio.Lock]     = {}
+mine_games:    dict[str, dict]             = {}  # {gkey: {state}}
 
 GAME_TIMEOUT   = 300
 TIMER_DURATION = 60
 _dl_tracker:   dict[str, list]             = {}
 LB_IMAGE_URL   = "https://i.postimg.cc/P5THW6RQ/file-00000000bce4720b905dc2e04c58fa80.png"
+MINE_IMAGE_URL = "https://i.postimg.cc/hjCftW5b/file-0000000079a071fa95971d3b70015fc0.png"
+GM_IMAGE_URL   = "https://i.postimg.cc/Fs1h0CPs/file-000000001d7872078a894cdf6f6247c9.png"
 
 # ══════════════════════════════════════════════════════
 #  SUPABASE FUNCTIONS
@@ -64,6 +67,7 @@ def _sb_headers():
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates" # Fixes silent upsert failures
     }
 
 def supabase_upsert_user(chat_id: str, user_id: str, name: str, score: int) -> bool:
@@ -71,10 +75,10 @@ def supabase_upsert_user(chat_id: str, user_id: str, name: str, score: int) -> b
         return False
     try:
         payload = {
-            "chat_id": chat_id,
-            "user_id": user_id,
-            "name": name,
-            "score": score,
+            "chat_id": str(chat_id),
+            "user_id": str(user_id),
+            "name": str(name),
+            "score": int(score),
             "updated_at": datetime.utcnow().isoformat(),
         }
         r = requests.post(
@@ -83,16 +87,7 @@ def supabase_upsert_user(chat_id: str, user_id: str, name: str, score: int) -> b
             json=payload,
             timeout=10,
         )
-        if r.status_code in (200, 201):
-            return True
-        elif r.status_code == 409:
-            r2 = requests.patch(
-                f"{SUPABASE_URL}/rest/v1/users?chat_id=eq.{chat_id}&user_id=eq.{user_id}",
-                headers=_sb_headers(),
-                json={"name": name, "score": score, "updated_at": datetime.utcnow().isoformat()},
-                timeout=10,
-            )
-            return r2.status_code in (200, 204)
+        return r.status_code in (200, 201, 204)
     except Exception as e:
         logger.debug(f"[SB Upsert] {e}")
     return False
@@ -108,8 +103,6 @@ def supabase_get_leaderboard(chat_id: str) -> list:
         )
         if r.status_code == 200:
             return r.json()
-        else:
-            logger.debug(f"[SB Get LB] {r.status_code}")
     except Exception as e:
         logger.debug(f"[SB Get LB] {e}")
     return []
@@ -199,7 +192,7 @@ async def _health(req):
         "status": "healthy", "uptime_seconds": up,
         "running": bot_status["running"],
         "messages": bot_status["message_count"],
-        "version": "7.2.0",
+        "version": "7.3.0",
     }, status=200)
 
 async def _ping(req):
@@ -227,13 +220,11 @@ async def start_http(port: int):
     return runner
 
 async def send_random_sticker(bot, chat_id: int):
-    """Send random sticker from Beluga pack."""
     try:
         stickers = await bot.get_sticker_set(STICKER_PACK)
         if stickers and stickers.stickers and len(stickers.stickers) > 0:
             random_sticker = random.choice(stickers.stickers)
             await bot.send_sticker(chat_id, random_sticker.file_id)
-            logger.debug(f"[Sticker] Sent from {STICKER_PACK}")
     except Exception as e:
         logger.debug(f"[Sticker] {e}")
 
@@ -275,7 +266,7 @@ def lang_hint(text: str) -> str:
     return text + "\n\n[STRICT: Reply in fluent English]"
 
 # ══════════════════════════════════════════════════════
-#  AI ENGINE
+#  AI ENGINE & COMPUTER VISION (CV)
 # ══════════════════════════════════════════════════════
 CHAT_PROMPT = (
     "You are Beluga — a cute, sassy, incredibly smart 2-year-old cat. "
@@ -299,6 +290,31 @@ def _groq_sync(system: str, user: str, max_tok: int = 400) -> Optional[str]:
         bot_status["failed_apis"] += 1
     except Exception as e:
         logger.debug(f"[Groq] {e}"); bot_status["failed_apis"] += 1
+    return None
+
+def _groq_vision_sync(system: str, image_url: str, prompt: str) -> Optional[str]:
+    if not GROQ_KEY: return None
+    bot_status["api_calls"] += 1
+    try:
+        payload = {
+            "model": "llama-3.2-11b-vision-preview",
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": image_url}}
+                ]}
+            ],
+            "max_tokens": 400
+        }
+        r = requests.post("https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
+            json=payload, timeout=20)
+        if r.status_code == 200:
+            return r.json()["choices"][0]["message"]["content"].strip()
+        bot_status["failed_apis"] += 1
+    except Exception as e:
+        logger.debug(f"[Groq Vision] {e}"); bot_status["failed_apis"] += 1
     return None
 
 def _or_sync(system: str, user: str, max_tok: int = 400) -> Optional[str]:
@@ -342,9 +358,30 @@ async def ai_emoji(text: str) -> str:
     return "😼"
 
 # ══════════════════════════════════════════════════════
+#  INLINE QUERY HANDLER (GHOST MODE)
+# ══════════════════════════════════════════════════════
+async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.inline_query.query
+    if not query:
+        return
+    try:
+        reply = await ai(CHAT_PROMPT, query)
+        results = [
+            InlineQueryResultArticle(
+                id=hashlib.md5(query.encode()).hexdigest(),
+                title="Ask Beluga 🐱",
+                description=f"Send AI response to: {query[:30]}...",
+                input_message_content=InputTextMessageContent(f"💬 *{update.inline_query.from_user.first_name} asked:* {query}\n\n🐱 *Beluga:* {reply}", parse_mode=ParseMode.MARKDOWN)
+            )
+        ]
+        await update.inline_query.answer(results, cache_time=10)
+    except Exception as e:
+        logger.error(f"[Inline] {e}")
+
+# ══════════════════════════════════════════════════════
 #  WIKIPEDIA + GOOGLE
 # ══════════════════════════════════════════════════════
-WIKI_UA = {"User-Agent": "BelugaBot/7.2"}
+WIKI_UA = {"User-Agent": "BelugaBot/7.3"}
 G_HDR   = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
            "Accept-Language": "en-US,en;q=0.9"}
 
@@ -413,7 +450,7 @@ async def ai_summarise(query: str, wiki: dict, goog: dict) -> str:
         f"Query: {query}\n\nData:\n{chr(10).join(ctx)[:2800]}\n\nWrite summary:", "", max_tok=450)
 
 # ══════════════════════════════════════════════════════
-#  MEDIA DOWNLOAD — Fixed YT + Instagram
+#  MEDIA DOWNLOAD 
 # ══════════════════════════════════════════════════════
 _MEDIA_RE = re.compile(
     r"https?://(?:www\.)?"
@@ -433,7 +470,6 @@ def _dl_rate_ok(cid: str) -> bool:
     return True
 
 def _ydl_download(url: str, outdir: str) -> dict:
-    """Download with yt-dlp. FIXED: proper format selection."""
     result = {"ok": False, "path": None, "type": "video", "title": "", "error": ""}
     try:
         import yt_dlp
@@ -466,7 +502,6 @@ def _ydl_download(url: str, outdir: str) -> dict:
 
             result["title"] = (info.get("title") or "")[:80].strip()
 
-            # Find downloaded file
             found = None
             if os.path.exists(outdir):
                 files = os.listdir(outdir)
@@ -489,7 +524,6 @@ def _ydl_download(url: str, outdir: str) -> dict:
             ext = os.path.splitext(found)[1].lower()
             ftype = "image" if ext in (".jpg",".jpeg",".png",".gif",".webp") else "video"
             result.update({"ok": True, "path": found, "type": ftype})
-            logger.debug(f"[DL] ✅ Downloaded")
 
     except Exception as e:
         err_s = str(e).lower()
@@ -501,7 +535,6 @@ def _ydl_download(url: str, outdir: str) -> dict:
     return result
 
 async def download_and_send(u: Update, c: ContextTypes.DEFAULT_TYPE, url: str):
-    """Download and send media."""
     cid = u.effective_chat.id
     if not _dl_rate_ok(str(cid)):
         return
@@ -529,8 +562,6 @@ async def download_and_send(u: Update, c: ContextTypes.DEFAULT_TYPE, url: str):
             except Exception: pass
 
         if not result["ok"]:
-            if result["error"] != "unavailable":
-                logger.debug(f"[DL] {result['error']}")
             return
 
         caption = f"{pemoji} *{platform}*"
@@ -547,7 +578,6 @@ async def download_and_send(u: Update, c: ContextTypes.DEFAULT_TYPE, url: str):
                     parse_mode=ParseMode.MARKDOWN, supports_streaming=True)
 
         bot_status["message_count"] += 1
-        logger.info(f"[DL] ✅ {platform}")
 
     except asyncio.TimeoutError:
         if status_msg:
@@ -637,7 +667,7 @@ async def quiz_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         cid = str(u.effective_chat.id); cid_i = u.effective_chat.id
         await safe_react(c.bot, cid_i, u.message.message_id, "💡")
         await c.bot.send_chat_action(cid_i, "typing")
-        sm = await u.message.reply_text("🎲 Generating…")
+        sm = await u.message.reply_text("🎲 Generating Progress…")
         qdata = await gen_quiz(topic, cid)
         try: await sm.delete()
         except Exception: pass
@@ -672,7 +702,7 @@ async def poll_answer_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         name = (ans.user.first_name or "?")[:30]
         new_score = update_score(cid, uid, name, +10)
         asyncio.create_task(async_supabase_upsert(cid, uid, name, new_score))
-        logger.info(f"[Quiz] {name}: +10")
+        logger.info(f"[Quiz] {name}: +10 Points")
     except Exception as e: logger.debug(f"[poll] {e}")
 
 # ══════════════════════════════════════════════════════
@@ -697,7 +727,7 @@ async def lb_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             lines.append("🏆 LAST WEEK CHAMPIONS 🏆\n")
             for i, e in enumerate(lw["top3"]):
                 m = MEDALS[i]
-                lines.append(f"{m} {e.get('name','?')[:18]} — {e.get('score',0):,} pts")
+                lines.append(f"{m} {e.get('name','?')[:18]} — {e.get('score',0):,} Points")
             lines.append("\n━━━━━━━━━━━━━━━━━━━━\n")
 
         lines.append("╔════════════════════════════╗")
@@ -711,7 +741,7 @@ async def lb_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 m = MEDALS[i] if i < len(MEDALS) else f"{i+1}."
                 name = e.get("name","Unknown")[:18]
                 score = e.get("score", 0)
-                lines.append(f"{m} {name:<18} {score:>6,} pts")
+                lines.append(f"{m} {name:<18} {score:>6,} Points")
 
         lines += ["\n━━━━━━━━━━━━━━━━━━━━",
                   "📈 Highest → Lowest",
@@ -726,7 +756,7 @@ async def lb_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             await u.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
         bot_status["message_count"] += 1
-    except Exception as e: logger.error(f"[lb] {e}", exc_info=True)
+    except Exception as e: logger.error(f"[Leaderboard] {e}", exc_info=True)
 
 # /nw — New Week
 async def nw_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -755,7 +785,7 @@ async def nw_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         ]
         if top3:
             for i, e in enumerate(top3):
-                announce.append(f"{MEDALS[i]} *{e['name']}* — {e['score']:,} pts")
+                announce.append(f"{MEDALS[i]} *{e['name']}* — {e['score']:,} Points")
         announce += ["\n🔄 *All scores reset!*", "🚀 _New battle!_"]
 
         await u.message.reply_text("\n".join(announce), parse_mode=ParseMode.MARKDOWN)
@@ -780,39 +810,142 @@ async def pump_dump_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         delta = +amount if cmd == "pump" else -amount
         target = u.message.reply_to_message.from_user
         cid = str(u.effective_chat.id)
+        
         new_sc = update_score(cid, str(target.id), (target.first_name or "User")[:30], delta)
+        # Fix: Create background task correctly
         asyncio.create_task(async_supabase_upsert(cid, str(target.id), (target.first_name or "User")[:30], new_sc))
+        
         emoji = "🚀" if cmd == "pump" else "📉"
         sign = "+" if delta > 0 else ""
         await u.message.reply_text(
             f"{emoji} *{'PUMP' if cmd=='pump' else 'DUMP'}*\n\n"
             f"👤 *{target.first_name}*\n"
-            f"{'📈' if delta>0 else '📉'} {sign}{amount:,} pts\n"
-            f"💰 New: *{new_sc:,} pts*",
+            f"{'📈' if delta>0 else '📉'} {sign}{amount:,} Points\n"
+            f"💰 New: *{new_sc:,} Points*",
             parse_mode=ParseMode.MARKDOWN)
         bot_status["message_count"] += 1
     except Exception as e: logger.error(f"[pump_dump] {e}")
 
 # ══════════════════════════════════════════════════════
+#  /mine GAME
+# ══════════════════════════════════════════════════════
+def build_mine_keyboard(gkey: str, bombs: int, active: bool = False, revealed: bool = False, state: list = None) -> InlineKeyboardMarkup:
+    if not active and not revealed:
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("3 Mines", callback_data=f"mine:set:{gkey}:3"),
+            InlineKeyboardButton("4 Mines", callback_data=f"mine:set:{gkey}:4"),
+            InlineKeyboardButton("5 Mines", callback_data=f"mine:set:{gkey}:5"),
+        ]])
+    
+    rows = []
+    r = []
+    for i in range(6):
+        if not revealed:
+            btn = InlineKeyboardButton("📦", callback_data=f"mine:play:{gkey}:{i}")
+        else:
+            is_bomb = state[i]
+            label = "💣" if is_bomb else "✅"
+            btn = InlineKeyboardButton(label, callback_data=f"mine:noop:{gkey}:{i}")
+        r.append(btn)
+        if len(r) == 3:
+            rows.append(r)
+            r = []
+    return InlineKeyboardMarkup(rows)
+
+async def mine_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not u.message: return
+    try:
+        cid = str(u.effective_chat.id)
+        uid = str(u.effective_user.id)
+        gkey = f"{cid}_{uid}_{int(time.time())}"
+        
+        mine_games[gkey] = {"uid": uid, "name": u.effective_user.first_name, "bombs": 0, "state": []}
+        
+        await u.message.reply_photo(
+            photo=MINE_IMAGE_URL,
+            caption="BOOM 🔥 BE CAREFUL !!\nChoose number of mines:",
+            reply_markup=build_mine_keyboard(gkey, 0, False)
+        )
+        bot_status["message_count"] += 1
+    except Exception as e: logger.error(f"[Mine Game] {e}")
+
+async def mine_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q: return
+    try:
+        await q.answer()
+        parts = q.data.split(":")
+        if len(parts) < 4 or parts[0] != "mine": return
+        
+        action = parts[1]
+        gkey = parts[2]
+        val = int(parts[3])
+        
+        if gkey not in mine_games:
+            await q.answer("Game expired!", show_alert=True)
+            return
+            
+        g = mine_games[gkey]
+        if str(q.from_user.id) != g["uid"]:
+            await q.answer("This is not your game!", show_alert=True)
+            return
+            
+        if action == "set":
+            bombs = max(3, min(5, val))
+            state = [True]*bombs + [False]*(6-bombs)
+            random.shuffle(state)
+            g["bombs"] = bombs
+            g["state"] = state
+            
+            await q.edit_message_caption(
+                caption=f"BOOM 🔥 BE CAREFUL !!\n\nFind the safe box! (Mines: {bombs})",
+                reply_markup=build_mine_keyboard(gkey, bombs, active=True)
+            )
+            
+        elif action == "play":
+            state = g["state"]
+            is_bomb = state[val]
+            cid = str(q.message.chat_id)
+            uid = g["uid"]
+            name = g["name"]
+            
+            if is_bomb:
+                delta = -5
+                res_text = f"BOOM 🔥 BE CAREFUL !!\nYou hit a mine! Lost 5 Points."
+            else:
+                delta = 5
+                res_text = f"✅ SAFE!\nYou won 5 Points!"
+                
+            new_sc = update_score(cid, uid, name, delta)
+            asyncio.create_task(async_supabase_upsert(cid, uid, name, new_sc))
+            
+            await q.edit_message_caption(
+                caption=f"{res_text}\nNew Balance: {new_sc:,} Points",
+                reply_markup=build_mine_keyboard(gkey, g["bombs"], active=False, revealed=True, state=state)
+            )
+            del mine_games[gkey]
+            
+        elif action == "noop":
+            await q.answer("Game already over!")
+            
+    except Exception as e: logger.error(f"[Mine Callback] {e}")
+
+# ══════════════════════════════════════════════════════
 #  /gm — Group Message with Attendance
 # ══════════════════════════════════════════════════════
-def _build_gm_text(users: list) -> str:
-    """Build /gm message with attendance."""
+def _build_gm_caption(users: list, date_str: str) -> str:
     lines = [
-        "DEAR GROUP MEMBERS PLEASE GIVE DAILY ATTENDANCE 🥱",
-        "",
-        "📸 DAILY ATTENDANCE RECORD",
-        f"(Date: {datetime.now().strftime('%d %b %Y, %H:%M')})",
-        "",
+        "📸 DAILY ATTENDANCE\n",
+        "🥱 Dear Members, please mark your attendance!\n",
+        f"📅 {date_str}",
+        f"👥 Present: {len(users)}\n",
+        "━━━━━━━━━━━━━━━━━━━━\n"
     ]
-    if not users:
-        lines.append("_No attendance yet_")
-    else:
-        for i, user in enumerate(users, 1):
-            name = user.get("name", "?")[:20]
-            utime = user.get("time", "")
-            lines.append(f"👤 {i}. *{name}*  [ {utime} ]")
-    lines.append("\n┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛")
+    for i, user in enumerate(users, 1):
+        lines.append(f"{i}. {user['name']} • {user['time']}")
+    lines.append("\n━━━━━━━━━━━━━━━━━━━━\n")
+    lines.append("🔥 Check in daily to maintain your streak!")
+    lines.append("🎯 Press the GM button below to mark attendance.")
     return "\n".join(lines)
 
 def _build_gm_keyboard(cid: str) -> InlineKeyboardMarkup:
@@ -821,19 +954,21 @@ def _build_gm_keyboard(cid: str) -> InlineKeyboardMarkup:
     ]])
 
 async def gm_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Owner sends /gm to start attendance."""
     if not u.message: return
     try:
         if not is_owner(u.effective_user.id if u.effective_user else 0):
             await u.message.reply_text("🚫 Owner only."); return
 
         cid = str(u.effective_chat.id)
-        msg = await u.message.reply_text(
-            _build_gm_text([]),
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=_build_gm_keyboard(cid))
+        date_str = datetime.now().strftime("%d %b %Y")
         
-        gm_tracker[cid] = (msg.message_id, [])
+        msg = await u.message.reply_photo(
+            photo=GM_IMAGE_URL,
+            caption=_build_gm_caption([], date_str),
+            reply_markup=_build_gm_keyboard(cid)
+        )
+        
+        gm_tracker[cid] = (msg.message_id, [], date_str)
         gm_msg_lock[cid] = asyncio.Lock()
         
         bot_status["message_count"] += 1
@@ -841,11 +976,9 @@ async def gm_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         logger.error(f"[gm] {e}")
 
 async def gm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle GM button clicks."""
     q = update.callback_query
     if not q: return
     try:
-        await q.answer()
         parts = q.data.split(":")
         if len(parts) != 3 or parts[0] != "gm": return
         cid = parts[2]
@@ -858,34 +991,29 @@ async def gm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.answer("⏰ GM expired", show_alert=True)
                 return
             
-            msg_id, users = gm_tracker[cid]
+            msg_id, users, date_str = gm_tracker[cid]
             user = q.from_user
             user_id = str(user.id)
             utime = datetime.now().strftime("%H:%M")
             
-            # Check if already present
             if any(uu.get("id") == user_id for uu in users):
                 await q.answer(f"✅ Already marked at {[u.get('time') for u in users if u.get('id')==user_id][0]}", show_alert=True)
                 return
             
-            # Add user
             users.append({"id": user_id, "name": (user.first_name or "User")[:20], "time": utime})
-            gm_tracker[cid] = (msg_id, users)
+            gm_tracker[cid] = (msg_id, users, date_str)
             
-            # Update score
             cid_str = str(q.message.chat_id)
-            new_score = update_score(cid_str, user_id, (user.first_name or "User")[:20], +15)
+            new_score = update_score(cid_str, user_id, (user.first_name or "User")[:20], +50)
             asyncio.create_task(async_supabase_upsert(cid_str, user_id, (user.first_name or "User")[:20], new_score))
             
-            # Edit message
             try:
-                await context.bot.edit_message_text(
+                await context.bot.edit_message_caption(
                     chat_id=q.message.chat_id,
                     message_id=msg_id,
-                    text=_build_gm_text(users),
-                    parse_mode=ParseMode.MARKDOWN,
+                    caption=_build_gm_caption(users, date_str),
                     reply_markup=_build_gm_keyboard(cid))
-                await q.answer(f"✅ GM marked! +15 pts")
+                await q.answer("Attendance Marked!", show_alert=False) # Silent 50 points
             except Exception as e:
                 logger.debug(f"[GM Edit] {e}")
                 
@@ -916,10 +1044,9 @@ async def cleanup_expired_games():
             game_timers.pop(gkey, None); del ttt_games[gkey]
 
 # ══════════════════════════════════════════════════════
-#  TIMER for TTT (SINGLE SHARED TIMER)
+#  TIMER for TTT
 # ══════════════════════════════════════════════════════
 async def run_game_timer(c: ContextTypes.DEFAULT_TYPE, gkey: str):
-    """Single shared timer for both players."""
     try:
         while True:
             await asyncio.sleep(3)
@@ -933,7 +1060,6 @@ async def run_game_timer(c: ContextTypes.DEFAULT_TYPE, gkey: str):
             if not msg_id: return
             
             if td["remaining"] <= 0:
-                # Timeout: current player loses
                 loser_uid = str(g["x_id"]) if g["turn"] == "X" else str(g["o_id"])
                 loser_name = g["x_name"] if g["turn"] == "X" else g["o_name"]
                 winner_uid = str(g["o_id"]) if g["turn"] == "X" else str(g["x_id"])
@@ -1045,12 +1171,12 @@ def ttt_build_text(g: dict) -> str:
         sl = f"🎯 *{cur}'s Turn* {sym}\n⏱ `{tsec}`"
     elif status == "timeout":
         loser = g["x_name"] if g["turn"] == "X" else g["o_name"]
-        sl = f"⏰ *Time Up!*\n🏆 *{g.get('winner_name','')}* Wins!  +10 pts\n📉 *{loser}* Loses -10 pts"
+        sl = f"⏰ *Time Up!*\n🏆 *{g.get('winner_name','')}* Wins!  +10 Points\n📉 *{loser}* Loses -10 Points"
     elif status == "draw":
         sl = "🤝 *Draw!*"
     else:
         loser = g["o_name"] if g.get("winner_name") == g["x_name"] else g["x_name"]
-        sl = f"🏆 *{g.get('winner_name','')}* Wins!  +10 pts\n📉 *{loser}* Loses -10 pts"
+        sl = f"🏆 *{g.get('winner_name','')}* Wins!  +10 Points\n📉 *{loser}* Loses -10 Points"
     
     return (
         f"🎮 *TIC TAC TOE*\n━━━━━━━━━━━━━━\n"
@@ -1059,13 +1185,11 @@ def ttt_build_text(g: dict) -> str:
     )
 
 def _ready_keyboard(gkey: str) -> InlineKeyboardMarkup:
-    """READY button for PvP."""
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("READY 🔥", callback_data=f"ttt_ready:{gkey}")
     ]])
 
 def _ready_text(g: dict) -> str:
-    """Status text for waiting on READY."""
     x_name = g["x_name"]
     o_name = g["o_name"]
     x_ready = g.get("x_ready", False)
@@ -1091,7 +1215,6 @@ async def tictac_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         uid_a = str(ua.id); name_a = (ua.first_name or "Player")[:20]
         vs_bot = True; user_b_id = None; name_b = "🤖 Bot"
         
-        # Check for PvP
         if u.message.reply_to_message and u.message.reply_to_message.from_user:
             rb = u.message.reply_to_message.from_user
             if not rb.is_bot:
@@ -1110,14 +1233,11 @@ async def tictac_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             "x_ready": False, "o_ready": False,
         }
         
-        # Send appropriate message
         if vs_bot:
-            # vs Bot: start immediately
             msg = await u.message.reply_text(ttt_build_text(g),
                 parse_mode=ParseMode.MARKDOWN, reply_markup=ttt_build_keyboard(board))
             g["status"] = "playing"
         else:
-            # PvP: wait for READY
             gkey_temp = f"{cid}:temp_{int(time.time())}"
             msg = await u.message.reply_text(_ready_text(g),
                 parse_mode=ParseMode.MARKDOWN, reply_markup=_ready_keyboard(gkey_temp))
@@ -1142,7 +1262,6 @@ async def tictac_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         bot_status["error_count"] += 1
 
 async def ttt_ready_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle READY button press."""
     q = update.callback_query
     if not q: return
     try:
@@ -1167,7 +1286,6 @@ async def ttt_ready_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await q.answer("❌ Not in game!", show_alert=True); return
         
         if g["x_ready"] and g["o_ready"]:
-            # Both ready: start game
             g["status"] = "playing"
             game_timers[gkey] = {"remaining": TIMER_DURATION}
             await q.edit_message_text(
@@ -1177,7 +1295,6 @@ async def ttt_ready_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             asyncio.create_task(run_game_timer(context, gkey))
             await q.answer("✅ Game started!")
         else:
-            # Still waiting
             await q.edit_message_text(
                 text=_ready_text(g),
                 parse_mode=ParseMode.MARKDOWN,
@@ -1187,7 +1304,6 @@ async def ttt_ready_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logger.error(f"[ttt_ready] {e}")
 
 async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle game moves."""
     q = update.callback_query
     if not q: return
     try:
@@ -1212,7 +1328,6 @@ async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if g["turn"] == "O" and not g["vs_bot"] and not valid_o:
             await q.answer("❌ Not in game!" if not is_part else "Not your turn!", show_alert=True); return
         
-        # Reset timer on move
         if gkey in game_timers:
             game_timers[gkey]["remaining"] = TIMER_DURATION
         
@@ -1301,12 +1416,13 @@ async def start_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     try:
         text = (
             "✨✨✨✨✨✨✨✨✨✨✨✨✨✨\n"
-            "     🐱 BELUGA BOT v7.2 🐱\n"
+            "     🐱 BELUGA BOT v7.3 🐱\n"
             "✨✨✨✨✨✨✨✨✨✨✨✨✨✨\n\n"
             "🚀 *Level Up!*\n\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             "🎮 *GAMES*\n"
-            "`/tictac` — Tic Tac Toe (PvP)\n\n"
+            "`/tictac` — Tic Tac Toe (PvP)\n"
+            "`/mine` — Mine Sweeper\n\n"
             "🧠 *BRAIN*\n"
             "`/quiz` — Trivia\n"
             "`/search` — Smart Search\n\n"
@@ -1322,11 +1438,39 @@ async def start_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             "🎬 YT/Instagram auto-download\n\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "🔥 *READY?* 🔥\n"
-            "_+10 win, -10 loss, +15 GM_"
+            "_+10 win, -10 loss, +50 GM_"
         )
         await u.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
         bot_status["message_count"] += 1
     except Exception as e: logger.error(f"[start] {e}")
+
+# ══════════════════════════════════════════════════════
+#  CV PHOTO HANDLER (Vision)
+# ══════════════════════════════════════════════════════
+async def photo_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not u.message or not u.message.photo: return
+    try:
+        caption = (u.message.caption or "").lower()
+        if "beluga" not in caption: return
+        
+        await c.bot.send_chat_action(u.effective_chat.id, "typing")
+        
+        photo_file = await u.message.photo[-1].get_file()
+        file_url = photo_file.file_path
+        
+        loop = asyncio.get_running_loop()
+        res = await asyncio.wait_for(
+            loop.run_in_executor(None, _groq_vision_sync, 
+            "You are Beluga, a sassy smart 2-year-old cat. Describe the image creatively.", 
+            file_url, caption), timeout=25)
+            
+        if res:
+            await u.message.reply_text(res)
+        else:
+            await u.message.reply_text("Hmm, my cat eyes can't quite see that right now! 🐾")
+        bot_status["message_count"] += 1
+    except Exception as e:
+        logger.error(f"[photo_handler] {e}")
 
 # ══════════════════════════════════════════════════════
 #  MONITOR
@@ -1348,26 +1492,30 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
         db.setdefault("counts",{})[cid] = db["counts"].get(cid, 0) + 1
         if db["counts"][cid] % 6 == 0:
             await safe_react(c.bot, u.effective_chat.id, u.message.message_id)
-        text = (u.message.text or "").strip()
+        
+        text = (u.message.text or u.message.caption or "").strip()
         text_low = text.lower()
+        
         media_m = _MEDIA_RE.search(text)
         if media_m:
             asyncio.create_task(download_and_send(u, c, media_m.group(0)))
-        beluga = "beluga" in text_low
+            
+        beluga = "beluga" in text_low or (c.bot.username.lower() in text_low)
         reply_me = (u.message.reply_to_message and u.message.reply_to_message.from_user and
                     u.message.reply_to_message.from_user.id == c.bot.id)
         mention = any("beluga" in text_low[e.offset:e.offset+e.length]
-                      for e in (u.message.entities or []) if e.type == "mention")
-        if beluga or reply_me or mention:
+                      for e in (u.message.entities or u.message.caption_entities or []) if e.type == "mention")
+                      
+        if text and (beluga or reply_me or mention):
             try:
                 await c.bot.send_chat_action(u.effective_chat.id, "typing")
                 emoji = await ai_emoji(text)
                 await safe_react(c.bot, u.effective_chat.id, u.message.message_id, emoji)
                 reply = await ai(CHAT_PROMPT, text, "Meow! 🐾")
                 await u.message.reply_text(reply)
-                # Send random sticker from pack
                 await send_random_sticker(c.bot, u.effective_chat.id)
             except Exception as e: logger.error(f"[monitor/chat] {e}")
+            
         bot_status["message_count"] += 1
         bot_status["last_update"] = datetime.now()
     except Exception as e:
@@ -1375,10 +1523,9 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
         bot_status["error_count"] += 1
 
 # ══════════════════════════════════════════════════════
-#  ERROR HANDLER (ADVANCED)
+#  ERROR HANDLER
 # ══════════════════════════════════════════════════════
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    """Advanced error handling with recovery strategies."""
     err = context.error
     if isinstance(err, (NetworkError, TimedOut)):
         logger.debug(f"[Net Error] {type(err).__name__}")
@@ -1395,7 +1542,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         bot_status["running"] = False
         return
     
-    # Unhandled errors
     logger.error("=" * 60)
     logger.error(f"UNHANDLED ERROR: {type(err).__name__}")
     logger.error("=" * 60)
@@ -1409,14 +1555,14 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════
 async def main():
     logger.info("=" * 60)
-    logger.info("🐱  BELUGA BOT  v7.2.0  — PRODUCTION")
+    logger.info("🐱  BELUGA BOT  v7.3.0  — PRODUCTION")
     logger.info(f"   PORT={HTTP_PORT}  |  OWNER_ID={OWNER_ID}")
     logger.info(f"   SUPABASE={'✅' if SUPABASE_URL and SUPABASE_KEY else '❌'}")
     logger.info("=" * 60)
     
     http_runner = await start_http(HTTP_PORT)
     await asyncio.sleep(0.3)
-    logger.info("✅ Beluga v7.2.0 is LIVE 🐱")
+    logger.info("✅ Beluga v7.3.0 is LIVE 🐱")
     
     loop = asyncio.get_running_loop()
     app = TGApp.builder().token(BOT_TOKEN).build()
@@ -1431,15 +1577,19 @@ async def main():
     app.add_handler(CommandHandler(["pump","dump"], pump_dump_handler))
     app.add_handler(CommandHandler("gm", gm_handler))
     app.add_handler(CommandHandler("tictac", tictac_handler))
+    app.add_handler(CommandHandler("mine", mine_handler))
     
     # Callbacks
     app.add_handler(CallbackQueryHandler(ttt_ready_callback, pattern=r"^ttt_ready:"))
     app.add_handler(CallbackQueryHandler(ttt_callback, pattern=r"^ttt:"))
     app.add_handler(CallbackQueryHandler(gm_callback, pattern=r"^gm:"))
+    app.add_handler(CallbackQueryHandler(mine_callback, pattern=r"^mine:"))
     
     # Polls & Messages
     app.add_handler(PollAnswerHandler(poll_answer_handler))
+    app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, monitor))
+    app.add_handler(InlineQueryHandler(inline_query_handler))
     
     # Error handler
     app.add_error_handler(error_handler)
