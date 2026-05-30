@@ -1,22 +1,26 @@
 {
   "scores": {
     "-1003610983854": {
-      "6906297572": {
-        "name": "Cool Alien",
-        "user_id": 6906297572,
-        "score": 50
-      },
-      "6416423386": {
-        "name": "OLD MAN",
-        "user_id": 6416423386,
+      "713493029": {
+        "name": "\u1d21\u026a\u1d1b\u1d04\u029c\u1d07\u0280",
+        "user_id": 713493029,
         "score": 10
-      },
-      "5932866905": {
-        "name": "\u2014\u26e9\ufe0f",
-        "user_id": 5932866905,
-        "score": 0
       }
     }
   },
-  "weekly": {}
+  "weekly": {
+    "-1003610983854": {
+      "top3": [
+        {
+          "name": "Cool Alien",
+          "score": 50
+        },
+        {
+          "name": "OLD MAN",
+          "score": 30
+        }
+      ],
+      "week_label": "30 May 2026"
+    }
+  }
 }
