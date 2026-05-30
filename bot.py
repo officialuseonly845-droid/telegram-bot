@@ -1,8 +1,10 @@
 import os, logging, random, json, asyncio, requests, re
 import urllib.parse, traceback, sys, hashlib, time, tempfile, shutil
+import base64
 from datetime import datetime, timedelta
 from typing import Optional
 from aiohttp import web
+import aiohttp
 
 from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -21,8 +23,11 @@ logger = logging.getLogger("Beluga")
 # ══════════════════════════════════════════════════════
 #  CONFIG
 # ══════════════════════════════════════════════════════
-SUPABASE_URL   = os.environ.get("SUPABASE_URL", "").strip()
-SUPABASE_KEY   = os.environ.get("SUPABASE_KEY", "").strip()
+GITHUB_TOKEN   = os.environ.get("GITHUB_TOKEN", "").strip()
+GITHUB_REPO    = os.environ.get("GITHUB_REPO", "").strip()
+GITHUB_BRANCH  = os.environ.get("GITHUB_BRANCH", "main").strip()
+GITHUB_FILE    = "beluga_db.json"
+
 OR_KEY         = os.environ.get("OPENROUTER_API_KEY", "")
 GROQ_KEY       = os.environ.get("GROQ_API_KEY", "")
 BOT_TOKEN      = os.environ.get("BOT_TOKEN", "")
@@ -42,7 +47,7 @@ bot_status = {
 quiz_cooldown: dict[str, dict[str, float]] = {}
 active_polls:  dict[str, dict]             = {}
 spam_tracker:  dict[int, list]             = {}
-db:            dict                        = {}
+db:            dict                        = {"scores": {}, "weekly": {}}
 ttt_games:     dict[str, dict]             = {}
 mine_games:    dict[str, dict]             = {}  
 user_in_game:  dict[str, str]              = {}
@@ -54,129 +59,68 @@ gm_msg_lock:   dict[str, asyncio.Lock]     = {}
 GAME_TIMEOUT   = 300
 TIMER_DURATION = 60
 _dl_tracker:   dict[str, list]             = {}
-LB_IMAGE_URL = "https://i.postimg.cc/P5THW6RQ/file-00000000bce4720b905dc2e04c58fa80.png"
+db_needs_sync  = False
+
+LB_IMAGE_URL   = "https://i.postimg.cc/P5THW6RQ/file-00000000bce4720b905dc2e04c58fa80.png"
 MINE_IMAGE_URL = "https://i.postimg.cc/hjCftW5b/file-0000000079a071fa95971d3b70015fc0.png"
-GM_IMAGE_URL   = "https://i.postimg.cc/CzTyg7TW/file.png"
+GM_IMAGE_URL   = "https://i.postimg.cc/CzTyg7TW/image.png"
 
 # ══════════════════════════════════════════════════════
-#  SUPABASE FUNCTIONS
+#  GITHUB DB FUNCTIONS
 # ══════════════════════════════════════════════════════
-def _sb_headers():
-    return {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": "application/json",
-        "Prefer": "resolution=merge-duplicates" 
-    }
-
-def supabase_upsert_user(chat_id: str, user_id: str, name: str, score: int) -> bool:
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return False
+def github_load_db():
+    if not GITHUB_TOKEN or not GITHUB_REPO: return
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE}?ref={GITHUB_BRANCH}"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
     try:
-        payload = {
-            "chat_id": str(chat_id),
-            "user_id": str(user_id),
-            "name": str(name),
-            "score": int(score),
-            "updated_at": datetime.utcnow().isoformat(),
-        }
-        r = requests.post(
-            f"{SUPABASE_URL}/rest/v1/users",
-            headers=_sb_headers(),
-            json=payload,
-            timeout=10,
-        )
-        return r.status_code in (200, 201, 204)
-    except Exception as e:
-        logger.debug(f"[SB Upsert] {e}")
-    return False
-
-def supabase_get_leaderboard(chat_id: str) -> list:
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return []
-    try:
-        r = requests.get(
-            f"{SUPABASE_URL}/rest/v1/users?chat_id=eq.{chat_id}&order=score.desc&limit=10",
-            headers=_sb_headers(),
-            timeout=10,
-        )
+        r = requests.get(url, headers=headers, timeout=10)
         if r.status_code == 200:
-            return r.json()
-    except Exception as e:
-        logger.debug(f"[SB Get LB] {e}")
-    return []
+            content_b64 = r.json().get("content", "")
+            if content_b64:
+                content_str = base64.b64decode(content_b64).decode("utf-8")
+                data = json.loads(content_str)
+                db.update(data)
+                logger.info("✅ GitHub DB Loaded Operation Status: Successful")
+    except Exception as e: logger.error(f"[GitHub Load] {e}")
 
-def supabase_reset_scores(chat_id: str) -> bool:
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return False
+def github_sync_db():
+    if not GITHUB_TOKEN or not GITHUB_REPO: return
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE}"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+    
+    sha = None
     try:
-        r = requests.patch(
-            f"{SUPABASE_URL}/rest/v1/users?chat_id=eq.{chat_id}",
-            headers=_sb_headers(),
-            json={"score": 0},
-            timeout=10,
-        )
-        return r.status_code in (200, 204)
-    except Exception as e:
-        logger.debug(f"[SB Reset] {e}")
-    return False
+        r = requests.get(url + f"?ref={GITHUB_BRANCH}", headers=headers, timeout=10)
+        if r.status_code == 200: sha = r.json().get("sha")
+    except Exception: pass
+    
+    try:
+        content_str = json.dumps({"scores": db.get("scores", {}), "weekly": db.get("weekly", {})}, indent=2)
+        content_b64 = base64.b64encode(content_str.encode("utf-8")).decode("utf-8")
+        payload = {"message": "Update Leaderboard Operation Progress", "content": content_b64, "branch": GITHUB_BRANCH}
+        if sha: payload["sha"] = sha
+        requests.put(url, headers=headers, json=payload, timeout=15)
+        logger.info("✅ GitHub DB Sync Operation Status: Successful")
+    except Exception as e: logger.error(f"[GitHub Sync] {e}")
 
-def supabase_save_weekly_winners(chat_id: str, top3: list, week_label: str) -> bool:
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return False
-    try:
-        payload = {
-            "chat_id": chat_id,
-            "top3_json": json.dumps(top3),
-            "week_label": week_label,
-            "saved_at": datetime.utcnow().isoformat(),
-        }
-        r = requests.post(
-            f"{SUPABASE_URL}/rest/v1/weekly_winners",
-            headers=_sb_headers(),
-            json=payload,
-            timeout=10,
-        )
-        return r.status_code in (200, 201)
-    except Exception as e:
-        logger.debug(f"[SB Weekly] {e}")
-    return False
-
-def supabase_get_last_weekly(chat_id: str) -> dict:
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return {}
-    try:
-        r = requests.get(
-            f"{SUPABASE_URL}/rest/v1/weekly_winners?chat_id=eq.{chat_id}&order=saved_at.desc&limit=1",
-            headers=_sb_headers(),
-            timeout=10,
-        )
-        if r.status_code == 200:
-            data = r.json()
-            if data and len(data) > 0:
-                row = data[0]
-                return {
-                    "top3": json.loads(row.get("top3_json", "[]")),
-                    "week_label": row.get("week_label", ""),
-                }
-    except Exception as e:
-        logger.debug(f"[SB Get Weekly] {e}")
-    return {}
-
-async def async_supabase_upsert(chat_id: str, user_id: str, name: str, score: int):
-    loop = asyncio.get_running_loop()
-    try:
-        await loop.run_in_executor(None, supabase_upsert_user, chat_id, user_id, name, score)
-    except Exception as e:
-        logger.debug(f"[Async SB] {e}")
+async def periodic_github_sync():
+    global db_needs_sync
+    while True:
+        await asyncio.sleep(30)
+        if db_needs_sync:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, github_sync_db)
+            db_needs_sync = False
 
 def update_score(cid: str, uid: str, name: str, delta: int) -> int:
+    global db_needs_sync
     db.setdefault("scores", {}).setdefault(cid, {})
     e = db["scores"][cid].get(uid, {"name": name, "user_id": int(uid) if uid.lstrip("-").isdigit() else 0, "score": 0})
     e["name"]    = name
     e["user_id"] = int(uid) if uid.lstrip("-").isdigit() else 0
     e["score"]   = max(0, e["score"] + delta)
     db["scores"][cid][uid] = e
+    db_needs_sync = True
     return e["score"]
 
 def is_owner(uid: int) -> bool:
@@ -191,7 +135,7 @@ async def _health(req):
         "Operation Status": "Healthy", "uptime_seconds": up,
         "running": bot_status["running"],
         "messages": bot_status["message_count"],
-        "version": "7.3.0",
+        "version": "7.4.0",
     }, status=200)
 
 async def _ping(req):
@@ -201,8 +145,8 @@ async def _stats(req):
     up = (datetime.now() - bot_status["start_time"]).total_seconds()
     return web.json_response({
         "uptime_hours": round(up/3600, 2),
-        "messages": bot_status["message_count"],
-        "errors": bot_status["error_count"],
+        "Operation Statistics Messages": bot_status["message_count"],
+        "Operation Error Count": bot_status["error_count"],
     }, status=200)
 
 async def start_http(port: int):
@@ -264,21 +208,49 @@ CHAT_PROMPT = (
     "Keep replies short (1-3 sentences), witty and conversational."
 )
 
-def _groq_sync(system: str, user: str, max_tok: int = 400) -> Optional[str]:
+async def _groq_async(system: str, user: str, max_tok: int = 400) -> Optional[str]:
     if not GROQ_KEY: return None
     bot_status["api_calls"] += 1
     try:
-        r = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
-            json={"model": "llama-3.3-70b-versatile",
-                  "messages": [{"role":"system","content":system},{"role":"user","content":user}],
-                  "max_tokens": max_tok}, timeout=12)
-        if r.status_code == 200:
-            return r.json()["choices"][0]["message"]["content"].strip()
-        bot_status["failed_apis"] += 1
-    except Exception as e:
-        logger.debug(f"[Groq] {e}"); bot_status["failed_apis"] += 1
+        async with aiohttp.ClientSession() as session:
+            payload = {
+                "model": "llama-3.3-70b-versatile",
+                "messages": [{"role":"system","content":system},{"role":"user","content":user}],
+                "max_tokens": max_tok
+            }
+            async with session.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
+                json=payload, timeout=12
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    return data["choices"][0]["message"]["content"].strip()
+                bot_status["failed_apis"] += 1
+    except Exception as e: logger.debug(f"Groq async error: {e}"); bot_status["failed_apis"] += 1
+    return None
+
+async def _or_async(system: str, user: str, max_tok: int = 400) -> Optional[str]:
+    if not OR_KEY: return None
+    bot_status["api_calls"] += 1
+    try:
+        async with aiohttp.ClientSession() as session:
+            payload = {
+                "model": "meta-llama/llama-3.3-70b-instruct:free",
+                "messages": [{"role":"system","content":system},{"role":"user","content":user}],
+                "max_tokens": max_tok
+            }
+            async with session.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OR_KEY}", "Content-Type": "application/json",
+                         "HTTP-Referer": "https://t.me/BelugaBot", "X-Title": "BelugaBot"},
+                json=payload, timeout=12
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    return data["choices"][0]["message"]["content"].strip()
+                bot_status["failed_apis"] += 1
+    except Exception as e: logger.debug(f"OR async error: {e}"); bot_status["failed_apis"] += 1
     return None
 
 def _groq_vision_sync(system: str, image_url: str, prompt: str) -> Optional[str]:
@@ -306,42 +278,26 @@ def _groq_vision_sync(system: str, image_url: str, prompt: str) -> Optional[str]
         logger.debug(f"[Groq Vision] {e}"); bot_status["failed_apis"] += 1
     return None
 
-def _or_sync(system: str, user: str, max_tok: int = 400) -> Optional[str]:
-    if not OR_KEY: return None
-    bot_status["api_calls"] += 1
-    try:
-        r = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OR_KEY}", "Content-Type": "application/json",
-                     "HTTP-Referer": "https://t.me/BelugaBot", "X-Title": "BelugaBot"},
-            json={"model": "meta-llama/llama-3.3-70b-instruct:free",
-                  "messages": [{"role":"system","content":system},{"role":"user","content":user}],
-                  "max_tokens": max_tok}, timeout=12)
-        if r.status_code == 200:
-            return r.json()["choices"][0]["message"]["content"].strip()
-        bot_status["failed_apis"] += 1
-    except Exception as e:
-        logger.debug(f"[OR] {e}"); bot_status["failed_apis"] += 1
-    return None
-
 async def ai(system: str, user: str, fallback: str = "Meow! 🐾", max_tok: int = 400) -> str:
-    loop = asyncio.get_running_loop()
     hint = lang_hint(user)
-    for fn in [_groq_sync, _or_sync]:
-        try:
-            res = await asyncio.wait_for(loop.run_in_executor(None, fn, system, hint, max_tok), timeout=14)
-            if res: return res
-        except Exception: pass
+    try:
+        res = await asyncio.wait_for(_groq_async(system, hint, max_tok), timeout=14)
+        if res: return res
+    except Exception: pass
+
+    try:
+        res = await asyncio.wait_for(_or_async(system, hint, max_tok), timeout=14)
+        if res: return res
+    except Exception: pass
+    
     return fallback
 
 async def ai_emoji(text: str) -> str:
-    loop = asyncio.get_running_loop()
     try:
-        r = await asyncio.wait_for(
-            loop.run_in_executor(None, _groq_sync,
-                "Output ONE emoji matching emotion. ONLY the emoji.", f"Text: '{text[:60]}'", 10), timeout=6)
-        if r:
-            found = re.findall(r"[^\w\s,.:!?'\"\(\)\-]+", r)
+        res = await asyncio.wait_for(
+            _groq_async("Output ONE emoji matching emotion. ONLY the emoji.", f"Text: '{text[:60]}'", 10), timeout=6)
+        if res:
+            found = re.findall(r"[^\w\s,.:!?'\"\(\)\-]+", res)
             if found: return found[0][0]
     except Exception: pass
     return "😼"
@@ -349,7 +305,7 @@ async def ai_emoji(text: str) -> str:
 # ══════════════════════════════════════════════════════
 #  WIKIPEDIA + GOOGLE
 # ══════════════════════════════════════════════════════
-WIKI_UA = {"User-Agent": "BelugaBot/7.3"}
+WIKI_UA = {"User-Agent": "BelugaBot/7.4"}
 G_HDR   = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
            "Accept-Language": "en-US,en;q=0.9"}
 
@@ -445,8 +401,9 @@ def _ydl_download(url: str, outdir: str) -> dict:
         result["error"] = "yt_dlp not installed"
         return result
 
+    # 4K Quality extraction configured for Telegram's 50MB Bot Limit
     ydl_opts = {
-        "format": "best[filesize<45M]/best",
+        "format": "bestvideo[height<=2160][ext=mp4][filesize<45M]+bestaudio[ext=m4a]/best[height<=2160][filesize<45M]/best[filesize<45M]",
         "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
         "quiet": True,
         "no_warnings": True,
@@ -605,7 +562,6 @@ def mark_quiz(cid: str, question: str):
     quiz_cooldown[cid][q_hash(question)] = time.time() + 3600
 
 async def gen_quiz(topic: str, cid: str) -> Optional[dict]:
-    loop = asyncio.get_running_loop()
     for _ in range(2):
         try:
             raw = await ai("Trivia master. Output ONLY raw JSON.",
@@ -635,7 +591,7 @@ async def quiz_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         cid = str(u.effective_chat.id); cid_i = u.effective_chat.id
         await safe_react(c.bot, cid_i, u.message.message_id, "💡")
         await c.bot.send_chat_action(cid_i, "typing")
-        sm = await u.message.reply_text("🎲 Quiz Generation Operation In Progress…")
+        sm = await u.message.reply_text("🎲 Quiz Generation Operation Progress Initiated…")
         qdata = await gen_quiz(topic, cid)
         try: await sm.delete()
         except Exception: pass
@@ -668,8 +624,7 @@ async def poll_answer_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         if not info or not ans.option_ids or ans.option_ids[0] != info["correct_index"]: return
         cid = str(info["chat_id"]); uid = str(ans.user.id)
         name = (ans.user.first_name or "?")[:30]
-        new_score = update_score(cid, uid, name, +10)
-        asyncio.create_task(async_supabase_upsert(cid, uid, name, new_score))
+        update_score(cid, uid, name, +10)
         logger.info(f"[Quiz] {name}: +10 Points")
     except Exception as e: logger.debug(f"[poll] {e}")
 
@@ -682,19 +637,10 @@ async def lb_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message: return
     try:
         cid = str(u.effective_chat.id)
-        loop = asyncio.get_running_loop()
-
-        lb = await asyncio.wait_for(
-            loop.run_in_executor(None, supabase_get_leaderboard, cid), timeout=10)
-        lw = await asyncio.wait_for(
-            loop.run_in_executor(None, supabase_get_last_weekly, cid), timeout=10)
-
-        if not lb:
-            local_scores = db.get("scores", {}).get(cid, {})
-            if local_scores:
-                lb = sorted(local_scores.values(), key=lambda x: x.get("score", 0), reverse=True)
-                for entry in lb:
-                    asyncio.create_task(async_supabase_upsert(cid, str(entry.get("user_id")), entry.get("name","Unknown"), entry.get("score",0)))
+        
+        local_scores = db.get("scores", {}).get(cid, {})
+        lb = sorted(local_scores.values(), key=lambda x: x.get("score", 0), reverse=True)
+        lw = db.get("weekly", {}).get(cid, {})
 
         lines = []
         if lw and lw.get("top3"):
@@ -709,7 +655,7 @@ async def lb_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         lines.append("╚════════════════════════════╝\n")
 
         if not lb:
-            lines.append("📊 No scores yet!")
+            lines.append("📊 Leaderboard Operation Progress: No scores yet!")
         else:
             for i, e in enumerate(lb[:10]):
                 m = MEDALS[i] if i < len(MEDALS) else f"{i+1}."
@@ -732,29 +678,22 @@ async def lb_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     except Exception as e: logger.error(f"[Leaderboard] {e}", exc_info=True)
 
 async def nw_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    global db_needs_sync
     if not u.message: return
     try:
         if not is_owner(u.effective_user.id if u.effective_user else 0):
             await u.message.reply_text("🚫 Owner only."); return
 
         cid = str(u.effective_chat.id)
-        loop = asyncio.get_running_loop()
-
-        lb = await asyncio.wait_for(
-            loop.run_in_executor(None, supabase_get_leaderboard, cid), timeout=10)
-        
-        if not lb:
-            local_scores = db.get("scores", {}).get(cid, {})
-            if local_scores:
-                lb = sorted(local_scores.values(), key=lambda x: x.get("score", 0), reverse=True)
+        local_scores = db.get("scores", {}).get(cid, {})
+        lb = sorted(local_scores.values(), key=lambda x: x.get("score", 0), reverse=True)
 
         top3 = [{"name": e.get("name","?"), "score": e.get("score",0)} for e in (lb or [])[:3]]
         wk_label = datetime.now().strftime("%d %b %Y")
 
-        await asyncio.wait_for(
-            loop.run_in_executor(None, supabase_save_weekly_winners, cid, top3, wk_label), timeout=10)
-        await asyncio.wait_for(
-            loop.run_in_executor(None, supabase_reset_scores, cid), timeout=10)
+        db.setdefault("weekly", {})[cid] = {"top3": top3, "week_label": wk_label}
+        db["scores"][cid] = {}
+        db_needs_sync = True
 
         announce = [
             "🏆🎉 *NEW WEEK!* 🎉🏆",
@@ -790,7 +729,6 @@ async def pump_dump_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         cid = str(u.effective_chat.id)
         
         new_sc = update_score(cid, str(target.id), (target.first_name or "User")[:30], delta)
-        asyncio.create_task(async_supabase_upsert(cid, str(target.id), (target.first_name or "User")[:30], new_sc))
         
         emoji = "🚀" if cmd == "pump" else "📉"
         sign = "+" if delta > 0 else ""
@@ -841,11 +779,11 @@ def mine_build_text(g: dict, rem: int) -> str:
     if g.get("status") == "timeout":
         return f"⏰ *Time Up!*\n\nOperation Status: Terminated due to inactivity. Lost -5 Points."
     elif g.get("status") == "lost":
-        return f"BOOM 🔥 BE CAREFUL !!\n\nYou hit a mine! Lost -5 Points."
+        return f"BOOM 🔥 BE CAREFUL !!\n\nOperation Status: Terminated (Mine Hit!). Lost -5 Points."
     elif g.get("status") == "won":
-        return f"🎉 *VICTORY!*\n\nYou successfully uncovered all {total_safe} safe boxes without hitting a mine! Won +10 Points."
+        return f"🎉 *VICTORY!*\n\nOperation Status: Completed Successfully! All {total_safe} safe boxes uncovered! Won +10 Points."
     else:
-        return f"BOOM 🔥 BE CAREFUL !!\n\nFind all safe boxes!\n💣 Mines Count: {bombs}\n💎 Found Status: {opened_count}/{total_safe}\n⏱ Time Remaining: `{rem}` seconds"
+        return f"BOOM 🔥 BE CAREFUL !!\n\nFind all safe boxes!\n💣 Mines Count: {bombs}\n💎 Operation Progress: {opened_count}/{total_safe}\n⏱ Time Remaining: `{rem}` seconds"
 
 async def mine_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message: return
@@ -888,7 +826,6 @@ async def run_mine_timer(c: ContextTypes.DEFAULT_TYPE, gkey: str):
                 uid = g["uid"]
                 name = g["name"]
                 new_sc = update_score(cid_s, uid, name, -5)
-                asyncio.create_task(async_supabase_upsert(cid_s, uid, name, new_sc))
                 
                 try:
                     await c.bot.edit_message_caption(
@@ -963,10 +900,9 @@ async def mine_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if is_bomb:
                 g["status"] = "lost"
                 new_sc = update_score(cid, uid, name, -5)
-                asyncio.create_task(async_supabase_upsert(cid, uid, name, new_sc))
                 
                 await q.edit_message_caption(
-                    caption=mine_build_text(g, 0) + f"\n\nOperation Status: Terminated\nNew Balance: {new_sc:,} Points",
+                    caption=mine_build_text(g, 0) + f"\n\nNew Balance: {new_sc:,} Points",
                     parse_mode=ParseMode.MARKDOWN,
                     reply_markup=build_mine_keyboard(gkey, g["bombs"], active=False, revealed=True, state=state)
                 )
@@ -983,10 +919,9 @@ async def mine_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if opened_count == total_safe:
                     g["status"] = "won"
                     new_sc = update_score(cid, uid, name, +10)
-                    asyncio.create_task(async_supabase_upsert(cid, uid, name, new_sc))
                     
                     await q.edit_message_caption(
-                        caption=mine_build_text(g, 0) + f"\n\nOperation Status: Completed Successfully\nNew Balance: {new_sc:,} Points",
+                        caption=mine_build_text(g, 0) + f"\n\nNew Balance: {new_sc:,} Points",
                         parse_mode=ParseMode.MARKDOWN,
                         reply_markup=build_mine_keyboard(gkey, g["bombs"], active=False, revealed=True, state=state)
                     )
@@ -1022,7 +957,7 @@ def _build_gm_caption(users: list, date_str: str) -> str:
         lines.append(f"{i}. {user['name']} • {user['time']}")
     lines.append("\n━━━━━━━━━━━━━━━━━━━━\n")
     lines.append("🔥 Check in daily to maintain your operational streak!")
-    lines.append("🎯 Press the GM button below to update Progress Status.")
+    lines.append("🎯 Press the GM button below to update Attendance Operation Progress.")
     return "\n".join(lines)
 
 def _build_gm_keyboard(cid: str) -> InlineKeyboardMarkup:
@@ -1088,8 +1023,7 @@ async def gm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             gm_tracker[cid] = (msg_id, users, date_str)
             
             cid_str = str(q.message.chat_id)
-            new_score = update_score(cid_str, user_id, (user.first_name or "User")[:20], +50)
-            asyncio.create_task(async_supabase_upsert(cid_str, user_id, (user.first_name or "User")[:20], new_score))
+            update_score(cid_str, user_id, (user.first_name or "User")[:20], +50)
             
             try:
                 if q.message.photo:
@@ -1100,7 +1034,7 @@ async def gm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await context.bot.edit_message_text(
                         chat_id=q.message.chat_id, message_id=msg_id,
                         text=_build_gm_caption(users, date_str), reply_markup=_build_gm_keyboard(cid))
-                await q.answer("Attendance Progress Updated!", show_alert=False)
+                await q.answer("Attendance Operation Progress Updated!", show_alert=False)
             except Exception as e:
                 logger.debug(f"[GM Edit Layout Failure] {e}")
                 
@@ -1164,10 +1098,8 @@ async def run_game_timer(c: ContextTypes.DEFAULT_TYPE, gkey: str):
                 
                 cid_s = str(cid)
                 if not g["vs_bot"]:
-                    n1 = update_score(cid_s, winner_uid, winner_name, +10)
-                    n2 = update_score(cid_s, loser_uid, loser_name, -10)
-                    asyncio.create_task(async_supabase_upsert(cid_s, winner_uid, winner_name, n1))
-                    asyncio.create_task(async_supabase_upsert(cid_s, loser_uid, loser_name, n2))
+                    update_score(cid_s, winner_uid, winner_name, +10)
+                    update_score(cid_s, loser_uid, loser_name, -10)
                 
                 release_player(str(g["x_id"]))
                 release_player(str(g["o_id"]))
@@ -1257,12 +1189,12 @@ def ttt_build_text(g: dict) -> str:
         sl = f"🎯 *{cur}'s Turn* {sym}\n⏱ `{tsec}`"
     elif status == "timeout":
         loser = g["x_name"] if g["turn"] == "X" else g["o_name"]
-        sl = f"⏰ *Time Up!*\n🏆 *{g.get('winner_name','')}* Wins!  +10 Points\n📉 *{loser}* Loses -10 Points"
+        sl = f"⏰ *Operation Status: Terminated (Time Up)!*\n🏆 *{g.get('winner_name','')}* Wins!  +10 Points\n📉 *{loser}* Loses -10 Points"
     elif status == "draw":
-        sl = "🤝 *Draw!*"
+        sl = "🤝 *Operation Status: Completed (Draw)!*"
     else:
         loser = g["o_name"] if g.get("winner_name") == g["x_name"] else g["x_name"]
-        sl = f"🏆 *{g.get('winner_name','')}* Wins!  +10 Points\n📉 *{loser}* Loses -10 Points"
+        sl = f"🏆 *Operation Status: Completed Successfully!*\n*{g.get('winner_name','')}* Wins!  +10 Points\n📉 *{loser}* Loses -10 Points"
     
     return (
         f"🎮 *TIC TAC TOE*\n━━━━━━━━━━━━━━\n"
@@ -1361,7 +1293,7 @@ async def ttt_ready_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         g = ttt_games.get(gkey)
         
         if not g or g.get("status") != "waiting":
-            await q.answer("Game not ready", show_alert=True); return
+            await q.answer("Operation Status: Not ready", show_alert=True); return
         
         uid = str(q.from_user.id)
         if uid == str(g["x_id"]):
@@ -1379,7 +1311,7 @@ async def ttt_ready_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=ttt_build_keyboard(g["board"]))
             asyncio.create_task(run_game_timer(context, gkey))
-            await q.answer("✅ Game started!")
+            await q.answer("✅ Operation Status: Started!")
         else:
             await q.edit_message_text(
                 text=_ready_text(g),
@@ -1399,8 +1331,8 @@ async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cid, mid = q.message.chat_id, q.message.message_id
         gkey = game_key(mid, cid); g = ttt_games.get(gkey)
         
-        if not g: await q.answer("⏰ Expired.", show_alert=True); return
-        if g["status"] != "playing": await q.answer("Not playing!", show_alert=True); return
+        if not g: await q.answer("⏰ Operation Status: Expired.", show_alert=True); return
+        if g["status"] != "playing": await q.answer("Operation Status: Not playing!", show_alert=True); return
         if action == "noop": await q.answer("Taken!", show_alert=True); return
         
         uid = str(q.from_user.id)
@@ -1429,13 +1361,10 @@ async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 g["status"] = "win"; g["winner_name"] = wname
                 cid_s = str(cid)
                 if not g["vs_bot"]:
-                    n1 = update_score(cid_s, wuid, wname, +10)
-                    n2 = update_score(cid_s, luid, lname, -10)
-                    asyncio.create_task(async_supabase_upsert(cid_s, wuid, wname, n1))
-                    asyncio.create_task(async_supabase_upsert(cid_s, luid, lname, n2))
+                    update_score(cid_s, wuid, wname, +10)
+                    update_score(cid_s, luid, lname, -10)
                 elif ws == TTT_X:
-                    n1 = update_score(cid_s, wuid, wname, +10)
-                    asyncio.create_task(async_supabase_upsert(cid_s, wuid, wname, n1))
+                    update_score(cid_s, wuid, wname, +10)
             else:
                 g["status"] = "draw"
             game_timers.pop(gkey, None)
@@ -1497,7 +1426,7 @@ async def start_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     try:
         text = (
             "✨✨✨✨✨✨✨✨✨✨✨✨✨✨\n"
-            "     🐱 BELUGA BOT v7.3 🐱\n"
+            "     🐱 BELUGA BOT v7.4 🐱\n"
             "✨✨✨✨✨✨✨✨✨✨✨✨✨✨\n\n"
             "🚀 *Level Up!*\n\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -1579,7 +1508,7 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
             
         bot_username = bot_status.get("username", "")
         
-        # Trigger Conditions
+        # Trigger Conditions for AI Logic 
         contains_beluga = "beluga" in text_low
         contains_username = (bot_username in text_low) if bot_username else False
         is_reply_to_bot = (u.message.reply_to_message and u.message.reply_to_message.from_user and
@@ -1591,7 +1520,6 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 emoji = await ai_emoji(text)
                 await safe_react(c.bot, u.effective_chat.id, u.message.message_id, emoji)
                 
-                # Fetch AI generated text from API endpoints
                 reply = await ai(CHAT_PROMPT, text, "Meow! 🐾")
                 await u.message.reply_text(reply)
             except Exception as e: logger.error(f"[monitor/chat] {e}")
@@ -1622,8 +1550,10 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 #  MAIN
 # ══════════════════════════════════════════════════════
 async def main():
-    logger.info("🐱  BELUGA BOT  v7.3.0  — PRODUCTION")
+    logger.info("🐱  BELUGA BOT  v7.4.0  — PRODUCTION")
     
+    # Initialize logic
+    github_load_db()
     http_runner = await start_http(HTTP_PORT)
     await asyncio.sleep(0.3)
     
@@ -1682,9 +1612,15 @@ async def main():
             await cleanup_expired_games()
     
     cleanup_task = asyncio.create_task(periodic_cleanup())
+    sync_task = asyncio.create_task(periodic_github_sync())
+    
     await stop_evt.wait()
     
     cleanup_task.cancel()
+    sync_task.cancel()
+    if db_needs_sync:
+        github_sync_db()
+        
     bot_status["running"] = False
     
     for fn in [app.updater.stop, app.stop, app.shutdown, http_runner.cleanup]:
