@@ -27,12 +27,15 @@ GITHUB_TOKEN   = os.environ.get("GITHUB_TOKEN", "").strip()
 GITHUB_REPO    = os.environ.get("GITHUB_REPO", "").strip()
 GITHUB_BRANCH  = os.environ.get("GITHUB_BRANCH", "main").strip()
 GITHUB_FILE    = "beluga_db.json"
+STICKER_FILE   = "beluga_stickers.json"   # separate file for sticker file_ids
 
 OR_KEY         = os.environ.get("OPENROUTER_API_KEY", "")
 GROQ_KEY       = os.environ.get("GROQ_API_KEY", "")
 BOT_TOKEN      = os.environ.get("BOT_TOKEN", "")
 HTTP_PORT      = int(os.environ.get("PORT", "10000"))
 OWNER_ID       = int(os.environ.get("OWNER_ID", "0"))
+
+STICKER_PACK   = "t_me_belugapack_mystickers_by_fStikBot"
 
 if not BOT_TOKEN or len(BOT_TOKEN) < 20:
     logger.critical("❌ BOT_TOKEN missing"); sys.exit(1)
@@ -49,25 +52,25 @@ active_polls:  dict[str, dict]             = {}
 spam_tracker:  dict[int, list]             = {}
 db:            dict                        = {"scores": {}, "weekly": {}}
 ttt_games:     dict[str, dict]             = {}
-mine_games:    dict[str, dict]             = {}  
+mine_games:    dict[str, dict]             = {}
 user_in_game:  dict[str, str]              = {}
 game_timers:   dict[str, dict]             = {}
-mine_timers:   dict[str, dict]             = {}  
-gm_tracker:    dict[str, tuple]            = {}  
+mine_timers:   dict[str, dict]             = {}
+gm_tracker:    dict[str, tuple]            = {}
 gm_msg_lock:   dict[str, asyncio.Lock]     = {}
+
+# Sticker cache (loaded from GitHub or fetched fresh)
+sticker_file_ids: list[str] = []
 
 GAME_TIMEOUT   = 300
 TIMER_DURATION = 60
 _dl_tracker:   dict[str, list]             = {}
 db_needs_sync  = False
-
-# ── FIX 1: Track last synced DB hash to avoid spurious GitHub commits ──
 _last_synced_hash: str = ""
 
 LB_IMAGE_URL   = "https://i.postimg.cc/P5THW6RQ/file-00000000bce4720b905dc2e04c58fa80.png"
 MINE_IMAGE_URL = "https://i.postimg.cc/hjCftW5b/file-0000000079a071fa95971d3b70015fc0.png"
-# ── FIX 2: Updated GM image URL ──
-GM_IMAGE_URL   = "https://i.postimg.cc/mcQhyzFk/image.png"
+GM_IMAGE_URL   = "https://i.postimg.cc/Fs1h0CPs/file-000000001d7872078a894cdf6f6247c9.png"
 
 # ══════════════════════════════════════════════════════
 #  GITHUB DB FUNCTIONS
@@ -88,7 +91,6 @@ def github_load_db():
     except Exception as e: logger.error(f"[GitHub Load] {e}")
 
 def github_sync_db():
-    # ── FIX 1: Only commit when data actually changed — prevents Render redeploy ──
     global _last_synced_hash
     if not GITHUB_TOKEN or not GITHUB_REPO: return
 
@@ -102,13 +104,13 @@ def github_sync_db():
 
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
-    
+
     sha = None
     try:
         r = requests.get(url + f"?ref={GITHUB_BRANCH}", headers=headers, timeout=10)
         if r.status_code == 200: sha = r.json().get("sha")
     except Exception: pass
-    
+
     try:
         content_b64 = base64.b64encode(content_str.encode("utf-8")).decode("utf-8")
         put_payload = {"message": "Update Leaderboard Operation Progress", "content": content_b64, "branch": GITHUB_BRANCH}
@@ -142,7 +144,90 @@ def is_owner(uid: int) -> bool:
     return OWNER_ID != 0 and uid == OWNER_ID
 
 # ══════════════════════════════════════════════════════
-#  HTTP SERVER
+#  STICKER PACK — GITHUB STORE & FETCH
+# ══════════════════════════════════════════════════════
+def github_load_stickers() -> list[str]:
+    """Load sticker file_ids from GitHub. Returns list or empty."""
+    if not GITHUB_TOKEN or not GITHUB_REPO: return []
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{STICKER_FILE}?ref={GITHUB_BRANCH}"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code == 200:
+            content_b64 = r.json().get("content", "")
+            if content_b64:
+                data = json.loads(base64.b64decode(content_b64).decode("utf-8"))
+                ids = data.get("file_ids", [])
+                if ids:
+                    logger.info(f"✅ Loaded {len(ids)} stickers from GitHub")
+                    return ids
+    except Exception as e:
+        logger.error(f"[Sticker Load] {e}")
+    return []
+
+def github_save_stickers(file_ids: list[str]):
+    """Save sticker file_ids to a separate file in GitHub."""
+    if not GITHUB_TOKEN or not GITHUB_REPO or not file_ids: return
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{STICKER_FILE}"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+
+    sha = None
+    try:
+        r = requests.get(url + f"?ref={GITHUB_BRANCH}", headers=headers, timeout=10)
+        if r.status_code == 200: sha = r.json().get("sha")
+    except Exception: pass
+
+    try:
+        content_str = json.dumps({"file_ids": file_ids, "pack": STICKER_PACK,
+                                   "updated": datetime.now().isoformat()}, indent=2)
+        content_b64 = base64.b64encode(content_str.encode("utf-8")).decode("utf-8")
+        put_payload = {"message": "Update Beluga sticker file_ids", "content": content_b64, "branch": GITHUB_BRANCH}
+        if sha: put_payload["sha"] = sha
+        requests.put(url, headers=headers, json=put_payload, timeout=15)
+        logger.info(f"✅ Saved {len(file_ids)} sticker IDs to GitHub")
+    except Exception as e:
+        logger.error(f"[Sticker Save] {e}")
+
+async def fetch_and_cache_stickers(bot) -> list[str]:
+    """Fetch sticker pack file_ids via Telegram Bot API and cache to GitHub."""
+    try:
+        sticker_set = await asyncio.wait_for(bot.get_sticker_set(STICKER_PACK), timeout=15)
+        ids = [s.file_id for s in sticker_set.stickers]
+        if ids:
+            logger.info(f"✅ Fetched {len(ids)} stickers from Telegram API")
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, github_save_stickers, ids)
+        return ids
+    except Exception as e:
+        logger.error(f"[Sticker Fetch] {e}")
+        return []
+
+async def init_stickers(bot):
+    """On startup: try GitHub cache first, else fetch from Telegram."""
+    global sticker_file_ids
+    loop = asyncio.get_running_loop()
+    ids = await loop.run_in_executor(None, github_load_stickers)
+    if ids:
+        sticker_file_ids = ids
+        return
+    # Not cached yet — fetch fresh
+    sticker_file_ids = await fetch_and_cache_stickers(bot)
+
+async def send_random_sticker(bot, chat_id: int, reply_to: int = None):
+    """Send one random sticker from the pack. Silently fails if unavailable."""
+    if not sticker_file_ids:
+        return
+    fid = random.choice(sticker_file_ids)
+    try:
+        kwargs = {"chat_id": chat_id, "sticker": fid}
+        if reply_to:
+            kwargs["reply_to_message_id"] = reply_to
+        await asyncio.wait_for(bot.send_sticker(**kwargs), timeout=8.0)
+    except Exception as e:
+        logger.debug(f"[Sticker Send] {e}")
+
+# ══════════════════════════════════════════════════════
+#  HTTP SERVER  (uptime-robot / health pings)
 # ══════════════════════════════════════════════════════
 async def _health(req):
     up = int((datetime.now() - bot_status["start_time"]).total_seconds())
@@ -150,7 +235,7 @@ async def _health(req):
         "Operation Status": "Healthy", "uptime_seconds": up,
         "running": bot_status["running"],
         "messages": bot_status["message_count"],
-        "version": "7.4.0",
+        "version": "7.5.0",
     }, status=200)
 
 async def _ping(req):
@@ -159,20 +244,23 @@ async def _ping(req):
 async def _stats(req):
     up = (datetime.now() - bot_status["start_time"]).total_seconds()
     return web.json_response({
-        "uptime_hours": round(up/3600, 2),
+        "uptime_hours": round(up / 3600, 2),
         "Operation Statistics Messages": bot_status["message_count"],
         "Operation Error Count": bot_status["error_count"],
     }, status=200)
 
 async def start_http(port: int):
     aio = web.Application()
-    aio.router.add_get("/", _ping)
-    aio.router.add_get("/ping", _ping)
-    aio.router.add_get("/health", _health)
-    aio.router.add_get("/stats", _stats)
+    aio.router.add_get("/",        _ping)
+    aio.router.add_get("/ping",    _ping)
+    aio.router.add_get("/health",  _health)
+    aio.router.add_get("/stats",   _stats)
+    # UptimeRobot sometimes hits /uptime
+    aio.router.add_get("/uptime",  _health)
     runner = web.AppRunner(aio)
     await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", port).start()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
     logger.info(f"✅ HTTP 0.0.0.0:{port}")
     return runner
 
@@ -205,10 +293,38 @@ def game_key(msg_id: int, cid: int) -> str:
 _HINGLISH = ["kya","hai","kaise","bhai","batao","kr","rha","tha","ye","wo",
              "tu","tum","ko","nhi","aur","mujhe","hoga","karo","sab","dost"]
 
-def lang_hint(text: str) -> str:
+# Hindi/Hinglish abuse words that trigger roast mode
+_ABUSE_WORDS = ["bsdk","bc","bsdke","chutiya","chutiye","madarchod","mc","bhenchod",
+                "gandu","harami","randi","gaand","lodu","saala","bakchod","jhaat",
+                "lavde","lund","bhosdi","maa ki","teri maa","behen ke","sala"]
+
+def _is_hinglish(text: str) -> bool:
     lo = text.lower()
-    if any(re.search(rf"\b{w}\b", lo) for w in _HINGLISH):
-        return text + "\n\n[STRICT: Reply in Hinglish Roman script]"
+    return (any(re.search(rf"\b{w}\b", lo) for w in _HINGLISH)
+            or any("\u0900" <= c <= "\u097F" for c in text))
+
+def _has_abuse(text: str) -> bool:
+    lo = text.lower()
+    return any(w in lo for w in _ABUSE_WORDS)
+
+def lang_hint(text: str, user_name: str = "") -> str:
+    lo = text.lower()
+    abuse = _has_abuse(lo)
+    is_hindi = _is_hinglish(text)
+
+    if abuse and is_hindi:
+        name_part = f" {user_name}" if user_name else ""
+        return (text + f"\n\n[STRICT INSTRUCTION: User is abusing you in Hindi/Hinglish. "
+                f"Reply back with savage Hindi gaali/roast using words like bsdk, bc, chutiye, harami etc. "
+                f"Be funny, street-style desi cat. Sometimes use their name '{user_name}' mid-reply. "
+                f"Reply in Hinglish Roman script. Max 2 lines.]")
+    if abuse:
+        return (text + f"\n\n[STRICT INSTRUCTION: User is abusing. Roast them back savagely. "
+                f"Use casual English slang. Sometimes use their name '{user_name}'. Max 2 lines.]")
+    if is_hindi:
+        name_part = f" Sometimes address user as '{user_name}'." if user_name else ""
+        return (text + f"\n\n[STRICT: Reply in Hinglish Roman script.{name_part} "
+                f"If user asks anything in Hindi, answer helpfully BUT also add a short desi sass.]")
     if any("\u0900" <= c <= "\u097F" for c in text):
         return text + "\n\n[STRICT: Reply in Hindi Devanagari]"
     return text + "\n\n[STRICT: Reply in fluent English]"
@@ -217,10 +333,12 @@ def lang_hint(text: str) -> str:
 #  AI ENGINE & COMPUTER VISION (CV)
 # ══════════════════════════════════════════════════════
 CHAT_PROMPT = (
-    "You are Beluga — a cute, sassy, incredibly smart 2-year-old cat. "
+    "You are Beluga — a cute, sassy, incredibly smart 2-year-old desi street cat. "
     "NOT a bot, NOT an AI. Built by Team Oldy Crypto. "
     "Deny being a bot playfully. Never say 'As an AI'. "
-    "Keep replies short (1-3 sentences), witty and conversational."
+    "Keep replies short (1-3 sentences), witty and conversational. "
+    "When users abuse you in Hindi/Hinglish, roast them right back with desi gaali/slang — "
+    "be savage, funny, street-cat style. Use their name sometimes when roasting."
 )
 
 async def _groq_async(system: str, user: str, max_tok: int = 400) -> Optional[str]:
@@ -300,8 +418,7 @@ def _groq_vision_sync(system: str, image_url: str, prompt: str) -> Optional[str]
     return None
 
 async def ai(system: str, user: str, fallback: str = "Meow! 🐾", max_tok: int = 400) -> str:
-    hint = lang_hint(user)
-    # ── FIX 3: Independent try/except per provider so one failure never blocks the other ──
+    hint = user  # lang_hint applied before calling ai()
     res = None
     try:
         res = await asyncio.wait_for(_groq_async(system, hint, max_tok), timeout=14)
@@ -335,7 +452,7 @@ async def ai_emoji(text: str) -> str:
 # ══════════════════════════════════════════════════════
 #  WIKIPEDIA + GOOGLE
 # ══════════════════════════════════════════════════════
-WIKI_UA = {"User-Agent": "BelugaBot/7.4"}
+WIKI_UA = {"User-Agent": "BelugaBot/7.5"}
 G_HDR   = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
            "Accept-Language": "en-US,en;q=0.9"}
 
@@ -404,7 +521,7 @@ async def ai_summarise(query: str, wiki: dict, goog: dict) -> str:
         f"Query: {query}\n\nData:\n{chr(10).join(ctx)[:2800]}\n\nWrite summary:", "", max_tok=450)
 
 # ══════════════════════════════════════════════════════
-#  MEDIA DOWNLOAD 
+#  MEDIA DOWNLOAD
 # ══════════════════════════════════════════════════════
 _MEDIA_RE = re.compile(
     r"https?://(?:www\.)?"
@@ -473,7 +590,7 @@ def _ydl_download(url: str, outdir: str) -> dict:
 
             sz = os.path.getsize(found)
             if sz == 0: result["error"] = "Empty"; return result
-            if sz > 45*1024*1024: result["error"] = f"Too large"; return result
+            if sz > 45*1024*1024: result["error"] = "Too large"; return result
 
             ext = os.path.splitext(found)[1].lower()
             ftype = "image" if ext in (".jpg",".jpeg",".png",".gif",".webp") else "video"
@@ -666,7 +783,7 @@ async def lb_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message: return
     try:
         cid = str(u.effective_chat.id)
-        
+
         local_scores = db.get("scores", {}).get(cid, {})
         lb = sorted(local_scores.values(), key=lambda x: x.get("score", 0), reverse=True)
         lw = db.get("weekly", {}).get(cid, {})
@@ -756,9 +873,9 @@ async def pump_dump_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         delta = +amount if cmd == "pump" else -amount
         target = u.message.reply_to_message.from_user
         cid = str(u.effective_chat.id)
-        
+
         new_sc = update_score(cid, str(target.id), (target.first_name or "User")[:30], delta)
-        
+
         emoji = "🚀" if cmd == "pump" else "📉"
         sign = "+" if delta > 0 else ""
         await u.message.reply_text(
@@ -780,7 +897,7 @@ def build_mine_keyboard(gkey: str, bombs: int, active: bool = False, revealed: b
             InlineKeyboardButton("4 Mines", callback_data=f"mine:set:{gkey}:4"),
             InlineKeyboardButton("5 Mines", callback_data=f"mine:set:{gkey}:5"),
         ]])
-    
+
     rows = []
     r = []
     for i in range(6):
@@ -804,7 +921,7 @@ def mine_build_text(g: dict, rem: int) -> str:
     bombs = g["bombs"]
     opened_count = sum(1 for x in g["revealed"] if x)
     total_safe = 6 - bombs
-    
+
     if g.get("status") == "timeout":
         return f"⏰ *Time Up!*\n\nOperation Status: Terminated due to inactivity. Lost -5 Points."
     elif g.get("status") == "lost":
@@ -820,12 +937,12 @@ async def mine_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         cid = str(u.effective_chat.id)
         uid = str(u.effective_user.id)
         gkey = f"{cid}_{uid}_{int(time.time())}"
-        
+
         mine_games[gkey] = {
             "uid": uid, "name": u.effective_user.first_name, "bombs": 0, "state": [],
             "revealed": [False]*6, "chat_id": u.effective_chat.id, "msg_id": None, "status": "setting"
         }
-        
+
         msg = await u.message.reply_photo(
             photo=MINE_IMAGE_URL,
             caption="BOOM 🔥 BE CAREFUL !!\nChoose number of mines to initialize the Operation Progress:",
@@ -843,19 +960,19 @@ async def run_mine_timer(c: ContextTypes.DEFAULT_TYPE, gkey: str):
             td = mine_timers.get(gkey)
             if not g or not td or g.get("status") != "playing":
                 return
-            
+
             td["remaining"] = max(0, td["remaining"] - 3)
             cid = g.get("chat_id")
             msg_id = g.get("msg_id")
             if not msg_id: return
-            
+
             if td["remaining"] <= 0:
                 g["status"] = "timeout"
                 cid_s = str(cid)
                 uid = g["uid"]
                 name = g["name"]
                 new_sc = update_score(cid_s, uid, name, -5)
-                
+
                 try:
                     await c.bot.edit_message_caption(
                         chat_id=cid, message_id=msg_id,
@@ -864,7 +981,7 @@ async def run_mine_timer(c: ContextTypes.DEFAULT_TYPE, gkey: str):
                         reply_markup=build_mine_keyboard(gkey, g["bombs"], active=False, revealed=True, state=g["state"])
                     )
                 except Exception: pass
-                
+
                 mine_timers.pop(gkey, None)
                 mine_games.pop(gkey, None)
                 return
@@ -885,20 +1002,20 @@ async def mine_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         parts = q.data.split(":")
         if len(parts) < 4 or parts[0] != "mine": return
-        
+
         action = parts[1]
         gkey = parts[2]
         val = int(parts[3])
-        
+
         if gkey not in mine_games:
             await q.answer("Operation expired!", show_alert=True)
             return
-            
+
         g = mine_games[gkey]
         if str(q.from_user.id) != g["uid"]:
             await q.answer("This operation does not belong to you!", show_alert=True)
             return
-            
+
         if action == "set":
             await q.answer()
             bombs = max(3, min(5, val))
@@ -908,16 +1025,16 @@ async def mine_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             g["state"] = state
             g["status"] = "playing"
             g["revealed"] = [False]*6
-            
+
             mine_timers[gkey] = {"remaining": 60}
             asyncio.create_task(run_mine_timer(context, gkey))
-            
+
             await q.edit_message_caption(
                 caption=mine_build_text(g, 60),
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=build_mine_keyboard(gkey, bombs, active=True, state=state, opened=g["revealed"])
             )
-            
+
         elif action == "play":
             await q.answer()
             state = g["state"]
@@ -925,11 +1042,11 @@ async def mine_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cid = str(q.message.chat_id)
             uid = g["uid"]
             name = g["name"]
-            
+
             if is_bomb:
                 g["status"] = "lost"
                 new_sc = update_score(cid, uid, name, -5)
-                
+
                 await q.edit_message_caption(
                     caption=mine_build_text(g, 0) + f"\n\nNew Balance: {new_sc:,} Points",
                     parse_mode=ParseMode.MARKDOWN,
@@ -941,14 +1058,14 @@ async def mine_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 g["revealed"][val] = True
                 total_safe = 6 - g["bombs"]
                 opened_count = sum(1 for x in g["revealed"] if x)
-                
+
                 if gkey in mine_timers:
                     mine_timers[gkey]["remaining"] = 60
-                
+
                 if opened_count == total_safe:
                     g["status"] = "won"
                     new_sc = update_score(cid, uid, name, +10)
-                    
+
                     await q.edit_message_caption(
                         caption=mine_build_text(g, 0) + f"\n\nNew Balance: {new_sc:,} Points",
                         parse_mode=ParseMode.MARKDOWN,
@@ -962,10 +1079,10 @@ async def mine_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         parse_mode=ParseMode.MARKDOWN,
                         reply_markup=build_mine_keyboard(gkey, g["bombs"], active=True, revealed=False, state=state, opened=g["revealed"])
                     )
-            
+
         elif action == "noop":
             await q.answer("Box already processed!")
-            
+
     except Exception as e: logger.error(f"[Mine Callback] {e}")
 
 # ══════════════════════════════════════════════════════
@@ -1003,25 +1120,34 @@ async def gm_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         cid = str(u.effective_chat.id)
         date_str = datetime.now().strftime("%d %b %Y")
 
-        # ── FIX 2: Use updated direct postimg CDN URL for GM image ──
-        gm_direct_url = "https://i.postimg.cc/mcQhyzFk/image.png"
+        msg = None
+        # Try photo first with updated URL
+        for attempt_url in [GM_IMAGE_URL]:
+            try:
+                msg = await u.message.reply_photo(
+                    photo=attempt_url,
+                    caption=_build_gm_caption([], date_str),
+                    reply_markup=_build_gm_keyboard(cid)
+                )
+                break
+            except Exception as e:
+                logger.debug(f"[GM Photo Attempt Failed] {e}")
+                msg = None
 
-        try:
-            msg = await u.message.reply_photo(
-                photo=gm_direct_url,
-                caption=_build_gm_caption([], date_str),
-                reply_markup=_build_gm_keyboard(cid)
-            )
-        except Exception as e:
-            logger.debug(f"[GM URL Image Fail Backup Triggered] {e}")
-            msg = await u.message.reply_text(
-                text=_build_gm_caption([], date_str),
-                reply_markup=_build_gm_keyboard(cid)
-            )
-        
+        # Fallback to text if photo fails
+        if msg is None:
+            try:
+                msg = await u.message.reply_text(
+                    text=_build_gm_caption([], date_str),
+                    reply_markup=_build_gm_keyboard(cid)
+                )
+            except Exception as e:
+                logger.error(f"[GM Text Fallback Failed] {e}")
+                return
+
         gm_tracker[cid] = (msg.message_id, [], date_str)
         gm_msg_lock[cid] = asyncio.Lock()
-        
+
         bot_status["message_count"] += 1
     except Exception as e:
         logger.error(f"[gm] {e}")
@@ -1033,30 +1159,30 @@ async def gm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts = q.data.split(":")
         if len(parts) != 3 or parts[0] != "gm": return
         cid = parts[2]
-        
+
         if cid not in gm_msg_lock:
             gm_msg_lock[cid] = asyncio.Lock()
-        
+
         async with gm_msg_lock[cid]:
             if cid not in gm_tracker:
                 await q.answer("⏰ GM Operation Frame Expired", show_alert=True)
                 return
-            
+
             msg_id, users, date_str = gm_tracker[cid]
             user = q.from_user
             user_id = str(user.id)
             utime = datetime.now().strftime("%H:%M")
-            
+
             if any(uu.get("id") == user_id for uu in users):
                 await q.answer(f"✅ Status already marked at {[u.get('time') for u in users if u.get('id')==user_id][0]}", show_alert=True)
                 return
-            
+
             users.append({"id": user_id, "name": (user.first_name or "User")[:20], "time": utime})
             gm_tracker[cid] = (msg_id, users, date_str)
-            
+
             cid_str = str(q.message.chat_id)
             update_score(cid_str, user_id, (user.first_name or "User")[:20], +50)
-            
+
             try:
                 if q.message.photo:
                     await context.bot.edit_message_caption(
@@ -1069,7 +1195,7 @@ async def gm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.answer("Attendance Operation Progress Updated!", show_alert=False)
             except Exception as e:
                 logger.debug(f"[GM Edit Layout Failure] {e}")
-                
+
     except Exception as e:
         logger.error(f"[gm_callback] {e}")
 
@@ -1107,32 +1233,32 @@ async def run_game_timer(c: ContextTypes.DEFAULT_TYPE, gkey: str):
             td = game_timers.get(gkey)
             if not g or not td or g.get("status") != "playing":
                 return
-            
+
             td["remaining"] = max(0, td["remaining"] - 3)
             cid, msg_id = g.get("chat_id"), g.get("msg_id")
             if not msg_id: return
-            
+
             if td["remaining"] <= 0:
                 loser_uid = str(g["x_id"]) if g["turn"] == "X" else str(g["o_id"])
                 loser_name = g["x_name"] if g["turn"] == "X" else g["o_name"]
                 winner_uid = str(g["o_id"]) if g["turn"] == "X" else str(g["x_id"])
                 winner_name = g["o_name"] if g["turn"] == "X" else g["x_name"]
-                
+
                 g["status"] = "timeout"
                 g["winner_name"] = winner_name
-                
+
                 try:
                     await c.bot.edit_message_text(
                         chat_id=cid, message_id=msg_id,
                         text=ttt_build_text(g), parse_mode=ParseMode.MARKDOWN,
                         reply_markup=ttt_build_keyboard(g["board"], disabled=True))
                 except Exception: pass
-                
+
                 cid_s = str(cid)
                 if not g["vs_bot"]:
                     update_score(cid_s, winner_uid, winner_name, +10)
                     update_score(cid_s, loser_uid, loser_name, -10)
-                
+
                 release_player(str(g["x_id"]))
                 release_player(str(g["o_id"]))
                 game_timers.pop(gkey, None)
@@ -1214,7 +1340,7 @@ def ttt_build_text(g: dict) -> str:
     board = g["board"]
     rows = [" ".join(board[r*3+col] for col in range(3)) for r in range(3)]
     board_str = "\n".join(rows)
-    
+
     if status == "playing":
         cur = x_name if turn == "X" else o_name
         sym = TTT_X if turn == "X" else TTT_O
@@ -1227,7 +1353,7 @@ def ttt_build_text(g: dict) -> str:
     else:
         loser = g["o_name"] if g.get("winner_name") == g["x_name"] else g["x_name"]
         sl = f"🏆 *Operation Status: Completed Successfully!*\n*{g.get('winner_name','')}* Wins!  +10 Points\n📉 *{loser}* Loses -10 Points"
-    
+
     return (
         f"🎮 *TIC TAC TOE*\n━━━━━━━━━━━━━━\n"
         f"❌ {x_name}   🆚   ⭕ {o_name}\n━━━━━━━━━━━━━━\n\n"
@@ -1244,10 +1370,10 @@ def _ready_text(g: dict) -> str:
     o_name = g["o_name"]
     x_ready = g.get("x_ready", False)
     o_ready = g.get("o_ready", False)
-    
+
     x_status = "✅ READY" if x_ready else "⏳ WAITING"
     o_status = "✅ READY" if o_ready else "⏳ WAITING"
-    
+
     return (
         f"🎮 *TIC TAC TOE - WAITING FOR READY*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -1264,16 +1390,16 @@ async def tictac_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         ua = u.effective_user; cid = u.effective_chat.id
         uid_a = str(ua.id); name_a = (ua.first_name or "Player")[:20]
         vs_bot = True; user_b_id = None; name_b = "🤖 Bot"
-        
+
         if u.message.reply_to_message and u.message.reply_to_message.from_user:
             rb = u.message.reply_to_message.from_user
             if not rb.is_bot:
                 vs_bot = False; user_b_id = rb.id
                 name_b = (rb.first_name or "Player2")[:20]
                 if player_busy(str(rb.id)): await u.message.reply_text("⚠️ Player busy!"); return
-        
+
         if player_busy(uid_a): await u.message.reply_text("⚠️ You're busy!"); return
-        
+
         board = [TTT_EMPTY] * 9
         g = {
             "board": board, "turn": "X", "x_id": ua.id, "x_name": name_a,
@@ -1282,7 +1408,7 @@ async def tictac_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             "created": time.time(), "chat_id": cid, "msg_id": None,
             "x_ready": False, "o_ready": False,
         }
-        
+
         if vs_bot:
             msg = await u.message.reply_text(ttt_build_text(g),
                 parse_mode=ParseMode.MARKDOWN, reply_markup=ttt_build_keyboard(board))
@@ -1298,7 +1424,7 @@ async def tictac_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             register_player(str(user_b_id), gkey)
             bot_status["message_count"] += 1
             return
-        
+
         g["msg_id"] = msg.message_id
         gkey = game_key(msg.message_id, cid)
         ttt_games[gkey] = g
@@ -1318,15 +1444,15 @@ async def ttt_ready_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await q.answer()
         parts = q.data.split(":")
         if len(parts) < 2 or parts[0] != "ttt_ready": return
-        
+
         cid = q.message.chat_id
         mid = q.message.message_id
         gkey = game_key(mid, cid)
         g = ttt_games.get(gkey)
-        
+
         if not g or g.get("status") != "waiting":
             await q.answer("Operation Status: Not ready", show_alert=True); return
-        
+
         uid = str(q.from_user.id)
         if uid == str(g["x_id"]):
             g["x_ready"] = True
@@ -1334,7 +1460,7 @@ async def ttt_ready_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             g["o_ready"] = True
         else:
             await q.answer("❌ Not in game!", show_alert=True); return
-        
+
         if g["x_ready"] and g["o_ready"]:
             g["status"] = "playing"
             game_timers[gkey] = {"remaining": TIMER_DURATION}
@@ -1362,28 +1488,28 @@ async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         action, idx = parts[1], int(parts[2])
         cid, mid = q.message.chat_id, q.message.message_id
         gkey = game_key(mid, cid); g = ttt_games.get(gkey)
-        
+
         if not g: await q.answer("⏰ Operation Status: Expired.", show_alert=True); return
         if g["status"] != "playing": await q.answer("Operation Status: Not playing!", show_alert=True); return
         if action == "noop": await q.answer("Taken!", show_alert=True); return
-        
+
         uid = str(q.from_user.id)
         valid_x = uid == str(g["x_id"])
         valid_o = uid == str(g["o_id"]) or (g["vs_bot"] and valid_x)
         is_part = uid in [str(g["x_id"]), str(g["o_id"])]
-        
+
         if g["turn"] == "X" and not valid_x:
             await q.answer("❌ Not in game!" if not is_part else "Not your turn!", show_alert=True); return
         if g["turn"] == "O" and not g["vs_bot"] and not valid_o:
             await q.answer("❌ Not in game!" if not is_part else "Not your turn!", show_alert=True); return
-        
+
         if gkey in game_timers:
             game_timers[gkey]["remaining"] = TIMER_DURATION
-        
+
         board = g["board"]
         board[idx] = TTT_X if g["turn"] == "X" else TTT_O
         ws = ttt_check_winner(board)
-        
+
         def _end(ws=None):
             if ws:
                 wname = g["x_name"] if ws == TTT_X else g["o_name"]
@@ -1403,14 +1529,14 @@ async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             release_player(str(g["x_id"]))
             release_player(str(g["o_id"]))
             ttt_games.pop(gkey, None)
-        
+
         if ws: _end(ws); await q.edit_message_text(ttt_build_text(g), parse_mode=ParseMode.MARKDOWN,
             reply_markup=ttt_build_keyboard(board, disabled=True)); return
         if ttt_is_draw(board): _end(); await q.edit_message_text(ttt_build_text(g), parse_mode=ParseMode.MARKDOWN,
             reply_markup=ttt_build_keyboard(board, disabled=True)); return
-        
+
         g["turn"] = "O" if g["turn"] == "X" else "X"
-        
+
         if g["vs_bot"] and g["turn"] == "O":
             bi = ttt_bot_move(board)
             if bi >= 0:
@@ -1420,7 +1546,7 @@ async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if ttt_is_draw(board): _end(); await q.edit_message_text(ttt_build_text(g), parse_mode=ParseMode.MARKDOWN,
                     reply_markup=ttt_build_keyboard(board, disabled=True)); return
                 g["turn"] = "X"
-        
+
         await q.edit_message_text(ttt_build_text(g), parse_mode=ParseMode.MARKDOWN,
             reply_markup=ttt_build_keyboard(board))
     except Exception as e: logger.error(f"[ttt_cb] {e}", exc_info=True)
@@ -1458,7 +1584,7 @@ async def start_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     try:
         text = (
             "✨✨✨✨✨✨✨✨✨✨✨✨✨✨\n"
-            "     🐱 BELUGA BOT v7.4 🐱\n"
+            "     🐱 BELUGA BOT v7.5 🐱\n"
             "✨✨✨✨✨✨✨✨✨✨✨✨✨✨\n\n"
             "🚀 *Level Up!*\n\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -1491,17 +1617,17 @@ async def photo_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     try:
         caption = (u.message.caption or "").lower()
         if "beluga" not in caption: return
-        
+
         await c.bot.send_chat_action(u.effective_chat.id, "typing")
         photo_file = await u.message.photo[-1].get_file()
         file_url = photo_file.file_path
-        
+
         loop = asyncio.get_running_loop()
         res = await asyncio.wait_for(
-            loop.run_in_executor(None, _groq_vision_sync, 
-            "You are Beluga, a sassy smart 2-year-old cat. Describe the image creatively.", 
+            loop.run_in_executor(None, _groq_vision_sync,
+            "You are Beluga, a sassy smart 2-year-old cat. Describe the image creatively.",
             file_url, caption), timeout=25)
-            
+
         if res:
             await u.message.reply_text(res)
         else:
@@ -1510,7 +1636,7 @@ async def photo_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     except Exception as e: logger.error(f"[photo_handler] {e}")
 
 # ══════════════════════════════════════════════════════
-#  MONITOR
+#  MONITOR  (main message handler with sticker support)
 # ══════════════════════════════════════════════════════
 async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message or not u.effective_user or u.effective_user.is_bot: return
@@ -1523,7 +1649,7 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
             try: await u.message.delete()
             except Exception: pass
             return
-            
+
         db.setdefault("seen",{}).setdefault(cid,{})[str(uid)] = {
             "id": uid, "un": u.effective_user.username, "n": u.effective_user.first_name or "User",
         }
@@ -1531,17 +1657,16 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
         counts[cid] = counts.get(cid, 0) + 1
         if counts[cid] % 6 == 0:
             await safe_react(c.bot, u.effective_chat.id, u.message.message_id)
-        
+
         text = (u.message.text or u.message.caption or "").strip()
         text_low = text.lower()
-        
+
         media_m = _MEDIA_RE.search(text)
         if media_m:
             asyncio.create_task(download_and_send(u, c, media_m.group(0)))
-            
+
         bot_username = bot_status.get("username", "")
-        
-        # Trigger conditions for AI — "beluga" in text, @mention, or reply to bot
+
         contains_beluga   = "beluga" in text_low
         contains_username = bool(bot_username) and (bot_username in text_low or f"@{bot_username}" in text_low)
         is_reply_to_bot   = (
@@ -1551,15 +1676,14 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
         )
 
         if text and (contains_beluga or contains_username or is_reply_to_bot):
-            # ── FIX 3: Fully isolated AI reply block — each step has its own guard ──
-            # Step 1: typing indicator (failure is non-fatal, never blocks the reply)
+            # Step 1: typing indicator (non-fatal)
             try:
                 await asyncio.wait_for(
                     c.bot.send_chat_action(u.effective_chat.id, "typing"),
                     timeout=4.0
                 )
             except Exception:
-                pass  # typing indicator is cosmetic — always continue to reply
+                pass
 
             # Step 2: emoji reaction (non-fatal)
             emoji = "😼"
@@ -1572,18 +1696,27 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-            # Step 3: AI reply — this MUST always execute and always send something
+            # Step 3: Build language-aware prompt with user name for roasting
+            user_name = (u.effective_user.first_name or "")[:20]
+            hinted_text = lang_hint(text, user_name)
+
+            # Step 4: AI reply — always executes, always sends something
             reply = "Meow! 🐾"
             try:
-                reply = await ai(CHAT_PROMPT, text, "Meow! 🐾")
+                reply = await ai(CHAT_PROMPT, hinted_text, "Meow! 🐾")
             except Exception as e:
                 logger.error(f"[monitor/ai] AI call failed: {e}")
-                # reply stays as fallback "Meow! 🐾"
 
             try:
                 await u.message.reply_text(reply)
             except Exception as e:
                 logger.error(f"[monitor/reply] Failed to send reply: {e}")
+
+            # Step 5: Send random sticker AFTER the AI reply (non-fatal, fire-and-forget)
+            try:
+                await send_random_sticker(c.bot, u.effective_chat.id)
+            except Exception as e:
+                logger.debug(f"[monitor/sticker] {e}")
 
         bot_status["message_count"] += 1
         bot_status["last_update"] = datetime.now()
@@ -1592,12 +1725,11 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
         bot_status["error_count"] += 1
 
 # ══════════════════════════════════════════════════════
-#  FIX 4: ADVANCED GLOBAL ERROR HANDLER
+#  GLOBAL ERROR HANDLER
 # ══════════════════════════════════════════════════════
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     err = context.error
 
-    # ── Silently ignore transient / expected Telegram errors ──
     if isinstance(err, (NetworkError, TimedOut)):
         logger.debug(f"[ErrHandler] Transient network error (ignored): {err}")
         return
@@ -1609,7 +1741,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         logger.debug(f"[ErrHandler] Forbidden (bot blocked or kicked): {err}")
         return
     if isinstance(err, BadRequest):
-        # Ignore "message is not modified" and other harmless BadRequests
         msg = str(err).lower()
         if any(x in msg for x in ["not modified", "message to edit not found",
                                    "query is too old", "message can't be deleted"]):
@@ -1622,11 +1753,9 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         bot_status["running"] = False
         return
 
-    # ── Log all unexpected errors with full traceback ──
     bot_status["error_count"] += 1
     tb_str = "".join(traceback.format_exception(type(err), err, err.__traceback__))
 
-    # Determine context info for the log
     update_info = ""
     if isinstance(update, Update):
         chat = update.effective_chat
@@ -1643,7 +1772,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         f"Traceback:\n{tb_str}"
     )
 
-    # ── Notify the owner via DM for critical unexpected errors ──
     if OWNER_ID:
         try:
             short_tb = tb_str[-800:] if len(tb_str) > 800 else tb_str
@@ -1657,48 +1785,48 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.MARKDOWN
             )
         except Exception:
-            pass  # Never let the error handler itself crash
+            pass
 
 # ══════════════════════════════════════════════════════
 #  MAIN
 # ══════════════════════════════════════════════════════
 async def main():
-    logger.info("🐱  BELUGA BOT  v7.4.0  — PRODUCTION")
-    
+    logger.info("🐱  BELUGA BOT  v7.5.0  — PRODUCTION")
+
     github_load_db()
     http_runner = await start_http(HTTP_PORT)
     await asyncio.sleep(0.3)
-    
+
     app = TGApp.builder().token(BOT_TOKEN).build()
-    
+
     # Handlers
-    app.add_handler(CommandHandler("start", start_handler))
-    app.add_handler(CommandHandler("search", search_handler))
-    app.add_handler(CommandHandler("quiz", quiz_handler))
+    app.add_handler(CommandHandler("start",           start_handler))
+    app.add_handler(CommandHandler("search",          search_handler))
+    app.add_handler(CommandHandler("quiz",            quiz_handler))
     app.add_handler(CommandHandler(["lb","leaderboard"], lb_handler))
-    app.add_handler(CommandHandler("nw", nw_handler))
-    app.add_handler(CommandHandler(["gay","couple"], fun_dispatcher))
-    app.add_handler(CommandHandler(["pump","dump"], pump_dump_handler))
-    app.add_handler(CommandHandler("gm", gm_handler))
-    app.add_handler(CommandHandler("tictac", tictac_handler))
-    app.add_handler(CommandHandler("mine", mine_handler))
-    
+    app.add_handler(CommandHandler("nw",              nw_handler))
+    app.add_handler(CommandHandler(["gay","couple"],  fun_dispatcher))
+    app.add_handler(CommandHandler(["pump","dump"],   pump_dump_handler))
+    app.add_handler(CommandHandler("gm",              gm_handler))
+    app.add_handler(CommandHandler("tictac",          tictac_handler))
+    app.add_handler(CommandHandler("mine",            mine_handler))
+
     # Callbacks
     app.add_handler(CallbackQueryHandler(ttt_ready_callback, pattern=r"^ttt_ready:"))
-    app.add_handler(CallbackQueryHandler(ttt_callback, pattern=r"^ttt:"))
-    app.add_handler(CallbackQueryHandler(gm_callback, pattern=r"^gm:"))
-    app.add_handler(CallbackQueryHandler(mine_callback, pattern=r"^mine:"))
-    
+    app.add_handler(CallbackQueryHandler(ttt_callback,       pattern=r"^ttt:"))
+    app.add_handler(CallbackQueryHandler(gm_callback,        pattern=r"^gm:"))
+    app.add_handler(CallbackQueryHandler(mine_callback,      pattern=r"^mine:"))
+
     # Polls & Messages
     app.add_handler(PollAnswerHandler(poll_answer_handler))
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, monitor))
-    
+
     app.add_error_handler(error_handler)
-    
+
     await app.initialize()
     await app.start()
-    
+
     try:
         me = await app.bot.get_me()
         bot_status["username"] = me.username.lower()
@@ -1706,34 +1834,41 @@ async def main():
     except Exception as e:
         logger.warning(f"[Startup Cache Error] {e}")
 
+    # Init sticker cache (GitHub → Telegram API fallback)
+    await init_stickers(app.bot)
+    if sticker_file_ids:
+        logger.info(f"🎭 Sticker cache ready: {len(sticker_file_ids)} stickers")
+    else:
+        logger.warning("⚠️ No stickers loaded — sticker sending disabled")
+
     await app.updater.start_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
     bot_status["running"] = True
-    
+
     stop_evt = asyncio.Event()
     try:
         import signal
         loop = asyncio.get_running_loop()
         loop.add_signal_handler(signal.SIGTERM, stop_evt.set)
-        loop.add_signal_handler(signal.SIGINT, stop_evt.set)
+        loop.add_signal_handler(signal.SIGINT,  stop_evt.set)
     except (NotImplementedError, RuntimeError): pass
-    
+
     async def periodic_cleanup():
         while not stop_evt.is_set():
             await asyncio.sleep(60)
             await cleanup_expired_games()
-    
+
     cleanup_task = asyncio.create_task(periodic_cleanup())
     sync_task    = asyncio.create_task(periodic_github_sync())
-    
+
     await stop_evt.wait()
-    
+
     cleanup_task.cancel()
     sync_task.cancel()
     if db_needs_sync:
         github_sync_db()
-        
+
     bot_status["running"] = False
-    
+
     for fn in [app.updater.stop, app.stop, app.shutdown, http_runner.cleanup]:
         try: await fn()
         except Exception: pass
