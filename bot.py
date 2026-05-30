@@ -61,9 +61,13 @@ TIMER_DURATION = 60
 _dl_tracker:   dict[str, list]             = {}
 db_needs_sync  = False
 
+# ── FIX 1: Track last synced DB hash to avoid spurious GitHub commits ──
+_last_synced_hash: str = ""
+
 LB_IMAGE_URL   = "https://i.postimg.cc/P5THW6RQ/file-00000000bce4720b905dc2e04c58fa80.png"
 MINE_IMAGE_URL = "https://i.postimg.cc/hjCftW5b/file-0000000079a071fa95971d3b70015fc0.png"
-GM_IMAGE_URL   = "https://i.postimg.cc/CzTyg7TW/image.png"
+# ── FIX 2: Updated GM image URL ──
+GM_IMAGE_URL   = "https://i.postimg.cc/mcQhyzFk/image.png"
 
 # ══════════════════════════════════════════════════════
 #  GITHUB DB FUNCTIONS
@@ -84,7 +88,18 @@ def github_load_db():
     except Exception as e: logger.error(f"[GitHub Load] {e}")
 
 def github_sync_db():
+    # ── FIX 1: Only commit when data actually changed — prevents Render redeploy ──
+    global _last_synced_hash
     if not GITHUB_TOKEN or not GITHUB_REPO: return
+
+    payload_data = {"scores": db.get("scores", {}), "weekly": db.get("weekly", {})}
+    content_str  = json.dumps(payload_data, indent=2, sort_keys=True)
+    current_hash = hashlib.md5(content_str.encode()).hexdigest()
+
+    if current_hash == _last_synced_hash:
+        logger.debug("[GitHub Sync] No data change — skipping commit")
+        return
+
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
     
@@ -95,11 +110,11 @@ def github_sync_db():
     except Exception: pass
     
     try:
-        content_str = json.dumps({"scores": db.get("scores", {}), "weekly": db.get("weekly", {})}, indent=2)
         content_b64 = base64.b64encode(content_str.encode("utf-8")).decode("utf-8")
-        payload = {"message": "Update Leaderboard Operation Progress", "content": content_b64, "branch": GITHUB_BRANCH}
-        if sha: payload["sha"] = sha
-        requests.put(url, headers=headers, json=payload, timeout=15)
+        put_payload = {"message": "Update Leaderboard Operation Progress", "content": content_b64, "branch": GITHUB_BRANCH}
+        if sha: put_payload["sha"] = sha
+        requests.put(url, headers=headers, json=put_payload, timeout=15)
+        _last_synced_hash = current_hash
         logger.info("✅ GitHub DB Sync Operation Status: Successful")
     except Exception as e: logger.error(f"[GitHub Sync] {e}")
 
@@ -221,13 +236,16 @@ async def _groq_async(system: str, user: str, max_tok: int = 400) -> Optional[st
             async with session.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
-                json=payload, timeout=12
+                json=payload, timeout=aiohttp.ClientTimeout(total=12)
             ) as r:
                 if r.status == 200:
                     data = await r.json()
                     return data["choices"][0]["message"]["content"].strip()
                 bot_status["failed_apis"] += 1
-    except Exception as e: logger.debug(f"Groq async error: {e}"); bot_status["failed_apis"] += 1
+                logger.warning(f"[Groq] HTTP {r.status}")
+    except Exception as e:
+        logger.debug(f"Groq async error: {e}")
+        bot_status["failed_apis"] += 1
     return None
 
 async def _or_async(system: str, user: str, max_tok: int = 400) -> Optional[str]:
@@ -244,13 +262,16 @@ async def _or_async(system: str, user: str, max_tok: int = 400) -> Optional[str]
                 "https://openrouter.ai/api/v1/chat/completions",
                 headers={"Authorization": f"Bearer {OR_KEY}", "Content-Type": "application/json",
                          "HTTP-Referer": "https://t.me/BelugaBot", "X-Title": "BelugaBot"},
-                json=payload, timeout=12
+                json=payload, timeout=aiohttp.ClientTimeout(total=12)
             ) as r:
                 if r.status == 200:
                     data = await r.json()
                     return data["choices"][0]["message"]["content"].strip()
                 bot_status["failed_apis"] += 1
-    except Exception as e: logger.debug(f"OR async error: {e}"); bot_status["failed_apis"] += 1
+                logger.warning(f"[OpenRouter] HTTP {r.status}")
+    except Exception as e:
+        logger.debug(f"OR async error: {e}")
+        bot_status["failed_apis"] += 1
     return None
 
 def _groq_vision_sync(system: str, image_url: str, prompt: str) -> Optional[str]:
@@ -280,16 +301,25 @@ def _groq_vision_sync(system: str, image_url: str, prompt: str) -> Optional[str]
 
 async def ai(system: str, user: str, fallback: str = "Meow! 🐾", max_tok: int = 400) -> str:
     hint = lang_hint(user)
+    # ── FIX 3: Independent try/except per provider so one failure never blocks the other ──
+    res = None
     try:
         res = await asyncio.wait_for(_groq_async(system, hint, max_tok), timeout=14)
-        if res: return res
-    except Exception: pass
+    except Exception as e:
+        logger.debug(f"[AI] Groq failed: {e}")
+
+    if res:
+        return res
 
     try:
         res = await asyncio.wait_for(_or_async(system, hint, max_tok), timeout=14)
-        if res: return res
-    except Exception: pass
-    
+    except Exception as e:
+        logger.debug(f"[AI] OpenRouter failed: {e}")
+
+    if res:
+        return res
+
+    logger.warning("[AI] Both providers failed — returning fallback")
     return fallback
 
 async def ai_emoji(text: str) -> str:
@@ -401,7 +431,6 @@ def _ydl_download(url: str, outdir: str) -> dict:
         result["error"] = "yt_dlp not installed"
         return result
 
-    # 4K Quality extraction configured for Telegram's 50MB Bot Limit
     ydl_opts = {
         "format": "bestvideo[height<=2160][ext=mp4][filesize<45M]+bestaudio[ext=m4a]/best[height<=2160][filesize<45M]/best[filesize<45M]",
         "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
@@ -973,10 +1002,13 @@ async def gm_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
         cid = str(u.effective_chat.id)
         date_str = datetime.now().strftime("%d %b %Y")
-        
+
+        # ── FIX 2: Use updated direct postimg CDN URL for GM image ──
+        gm_direct_url = "https://i.postimg.cc/mcQhyzFk/image.png"
+
         try:
             msg = await u.message.reply_photo(
-                photo=GM_IMAGE_URL,
+                photo=gm_direct_url,
                 caption=_build_gm_caption([], date_str),
                 reply_markup=_build_gm_keyboard(cid)
             )
@@ -1508,22 +1540,50 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
             
         bot_username = bot_status.get("username", "")
         
-        # Trigger Conditions for AI Logic 
-        contains_beluga = "beluga" in text_low
-        contains_username = (bot_username in text_low) if bot_username else False
-        is_reply_to_bot = (u.message.reply_to_message and u.message.reply_to_message.from_user and
-                           u.message.reply_to_message.from_user.id == c.bot.id)
-                      
+        # Trigger conditions for AI — "beluga" in text, @mention, or reply to bot
+        contains_beluga   = "beluga" in text_low
+        contains_username = bool(bot_username) and (bot_username in text_low or f"@{bot_username}" in text_low)
+        is_reply_to_bot   = (
+            u.message.reply_to_message is not None
+            and u.message.reply_to_message.from_user is not None
+            and u.message.reply_to_message.from_user.id == c.bot.id
+        )
+
         if text and (contains_beluga or contains_username or is_reply_to_bot):
+            # ── FIX 3: Fully isolated AI reply block — each step has its own guard ──
+            # Step 1: typing indicator (failure is non-fatal, never blocks the reply)
             try:
-                await c.bot.send_chat_action(u.effective_chat.id, "typing")
+                await asyncio.wait_for(
+                    c.bot.send_chat_action(u.effective_chat.id, "typing"),
+                    timeout=4.0
+                )
+            except Exception:
+                pass  # typing indicator is cosmetic — always continue to reply
+
+            # Step 2: emoji reaction (non-fatal)
+            emoji = "😼"
+            try:
                 emoji = await ai_emoji(text)
+            except Exception:
+                pass
+            try:
                 await safe_react(c.bot, u.effective_chat.id, u.message.message_id, emoji)
-                
+            except Exception:
+                pass
+
+            # Step 3: AI reply — this MUST always execute and always send something
+            reply = "Meow! 🐾"
+            try:
                 reply = await ai(CHAT_PROMPT, text, "Meow! 🐾")
+            except Exception as e:
+                logger.error(f"[monitor/ai] AI call failed: {e}")
+                # reply stays as fallback "Meow! 🐾"
+
+            try:
                 await u.message.reply_text(reply)
-            except Exception as e: logger.error(f"[monitor/chat] {e}")
-            
+            except Exception as e:
+                logger.error(f"[monitor/reply] Failed to send reply: {e}")
+
         bot_status["message_count"] += 1
         bot_status["last_update"] = datetime.now()
     except Exception as e:
@@ -1531,20 +1591,72 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
         bot_status["error_count"] += 1
 
 # ══════════════════════════════════════════════════════
-#  ERROR HANDLER
+#  FIX 4: ADVANCED GLOBAL ERROR HANDLER
 # ══════════════════════════════════════════════════════
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     err = context.error
-    if isinstance(err, (NetworkError, TimedOut)): return
+
+    # ── Silently ignore transient / expected Telegram errors ──
+    if isinstance(err, (NetworkError, TimedOut)):
+        logger.debug(f"[ErrHandler] Transient network error (ignored): {err}")
+        return
     if isinstance(err, RetryAfter):
+        logger.warning(f"[ErrHandler] Rate limited — retrying after {err.retry_after}s")
         await asyncio.sleep(err.retry_after + 1)
         return
-    if isinstance(err, (Forbidden, BadRequest)): return
+    if isinstance(err, Forbidden):
+        logger.debug(f"[ErrHandler] Forbidden (bot blocked or kicked): {err}")
+        return
+    if isinstance(err, BadRequest):
+        # Ignore "message is not modified" and other harmless BadRequests
+        msg = str(err).lower()
+        if any(x in msg for x in ["not modified", "message to edit not found",
+                                   "query is too old", "message can't be deleted"]):
+            logger.debug(f"[ErrHandler] Benign BadRequest (ignored): {err}")
+            return
+        logger.warning(f"[ErrHandler] BadRequest: {err}")
+        return
     if isinstance(err, InvalidToken):
+        logger.critical("[ErrHandler] ❌ InvalidToken — shutting down")
         bot_status["running"] = False
         return
-    
+
+    # ── Log all unexpected errors with full traceback ──
     bot_status["error_count"] += 1
+    tb_str = "".join(traceback.format_exception(type(err), err, err.__traceback__))
+
+    # Determine context info for the log
+    update_info = ""
+    if isinstance(update, Update):
+        chat = update.effective_chat
+        user = update.effective_user
+        update_info = (
+            f" | update_id={update.update_id}"
+            f" | chat={chat.id if chat else 'N/A'}({getattr(chat, 'type', '?')})"
+            f" | user={user.id if user else 'N/A'}(@{getattr(user, 'username', '?')})"
+        )
+
+    logger.error(
+        f"[ErrHandler] Unhandled exception{update_info}\n"
+        f"Handler: {context.error.__class__.__name__}: {err}\n"
+        f"Traceback:\n{tb_str}"
+    )
+
+    # ── Notify the owner via DM for critical unexpected errors ──
+    if OWNER_ID:
+        try:
+            short_tb = tb_str[-800:] if len(tb_str) > 800 else tb_str
+            await context.bot.send_message(
+                chat_id=OWNER_ID,
+                text=(
+                    f"⚠️ *Beluga Bot Error*\n\n"
+                    f"`{err.__class__.__name__}: {str(err)[:200]}`\n\n"
+                    f"```\n{short_tb}\n```"
+                ),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception:
+            pass  # Never let the error handler itself crash
 
 # ══════════════════════════════════════════════════════
 #  MAIN
@@ -1552,7 +1664,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 async def main():
     logger.info("🐱  BELUGA BOT  v7.4.0  — PRODUCTION")
     
-    # Initialize logic
     github_load_db()
     http_runner = await start_http(HTTP_PORT)
     await asyncio.sleep(0.3)
@@ -1587,7 +1698,6 @@ async def main():
     await app.initialize()
     await app.start()
     
-    # Fetch and cache Username on startup frame cleanly
     try:
         me = await app.bot.get_me()
         bot_status["username"] = me.username.lower()
@@ -1612,7 +1722,7 @@ async def main():
             await cleanup_expired_games()
     
     cleanup_task = asyncio.create_task(periodic_cleanup())
-    sync_task = asyncio.create_task(periodic_github_sync())
+    sync_task    = asyncio.create_task(periodic_github_sync())
     
     await stop_evt.wait()
     
