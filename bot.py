@@ -1527,8 +1527,9 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
         db.setdefault("seen",{}).setdefault(cid,{})[str(uid)] = {
             "id": uid, "un": u.effective_user.username, "n": u.effective_user.first_name or "User",
         }
-        db.setdefault("counts",{})[cid] = db["counts"].get(cid, 0) + 1
-        if db["counts"][cid] % 6 == 0:
+        counts = db.setdefault("counts", {})
+        counts[cid] = counts.get(cid, 0) + 1
+        if counts[cid] % 6 == 0:
             await safe_react(c.bot, u.effective_chat.id, u.message.message_id)
         
         text = (u.message.text or u.message.caption or "").strip()
