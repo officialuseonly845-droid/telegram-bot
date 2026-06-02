@@ -5,8 +5,9 @@ from datetime import datetime, timedelta
 from typing import Optional
 from aiohttp import web
 import aiohttp
+from bs4 import BeautifulSoup
 
-from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
     Application as TGApp, CommandHandler, ContextTypes,
     MessageHandler, PollAnswerHandler, CallbackQueryHandler, filters
@@ -484,7 +485,6 @@ async def search_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         cid = u.effective_chat.id
         await safe_react(c.bot, cid, u.message.message_id, "🔍")
         
-        # Edited to use single message replacement & full form status
         sm = await u.message.reply_text("🔎 *Web Search*\n\nOperation: Initialization\nProgress: Gathering sources...", parse_mode=ParseMode.MARKDOWN)
         await c.bot.send_chat_action(cid, "typing")
         loop = asyncio.get_running_loop()
@@ -526,7 +526,6 @@ async def bananalogic_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
         await safe_react(c.bot, cid, u.message.message_id, "🍌")
         
-        # Edit single message with full forms
         sm = await u.message.reply_text(
             "🍌 *BananaLogic*\n\nOperation: Search Sequence\nProgress: Scraping the web...", 
             parse_mode=ParseMode.MARKDOWN)
@@ -690,6 +689,137 @@ async def download_and_send(u: Update, c: ContextTypes.DEFAULT_TYPE, url: str):
     finally: shutil.rmtree(tmpdir, ignore_errors=True)
 
 # ══════════════════════════════════════════════════════
+#  /news — CBS News Scraper & Browser
+# ══════════════════════════════════════════════════════
+def scrape_cbs_news_list() -> list[dict]:
+    url = "https://www.cbsnews.com/latest/rss/main"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    articles = []
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code == 200:
+            soup = BeautifulSoup(r.content, "xml")
+            items = soup.find_all("item")
+            for item in items:
+                title = item.find("title")
+                link = item.find("link")
+                media = item.find("media:content") or item.find("enclosure")
+                img_url = media.get("url", "") if media else ""
+                
+                if not img_url:
+                    desc = item.find("description")
+                    if desc:
+                        desc_soup = BeautifulSoup(desc.text, "html.parser")
+                        img = desc_soup.find("img")
+                        if img: img_url = img.get("src", "")
+                        
+                if title and title.text.strip():
+                    articles.append({
+                        "title": title.text.strip(),
+                        "link": link.text.strip() if link else "https://www.cbsnews.com",
+                        "image": img_url or "https://www.cbsnews.com/fly/bundles/cbsnewscore/images/core/cbsnews-logo.png"
+                    })
+                if len(articles) >= 15:
+                    break
+    except Exception as e:
+        logger.error(f"[News Scraper RSS] {e}")
+        
+    if not articles:
+        try:
+            r = requests.get("https://www.cbsnews.com/", headers=headers, timeout=10)
+            if r.status_code == 200:
+                soup = BeautifulSoup(r.content, "html.parser")
+                elements = soup.find_all("article")
+                for el in elements:
+                    title_el = el.find(["h1", "h2", "h3", "h4", "span"], class_=lambda c: c and "title" in c.lower())
+                    img_el = el.find("img")
+                    title_text = title_el.text.strip() if title_el else ""
+                    img_url = img_el.get("src") or img_el.get("data-src") if img_el else ""
+                    if title_text and len(title_text) > 15:
+                        articles.append({
+                            "title": title_text,
+                            "link": "https://www.cbsnews.com",
+                            "image": img_url or "https://www.cbsnews.com/fly/bundles/cbsnewscore/images/core/cbsnews-logo.png"
+                        })
+                    if len(articles) >= 15:
+                        break
+        except Exception as e:
+            logger.error(f"[News Scraper HTML] {e}")
+    return articles
+
+def _news_keyboard(index: int, total: int) -> InlineKeyboardMarkup:
+    prev_idx = (index - 1) % total
+    next_idx = (index + 1) % total
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🟩 ◀️ BACK", callback_data=f"news:nav:{prev_idx}"),
+        InlineKeyboardButton(f"📰 {index+1}/{total}", callback_data="news:noop"),
+        InlineKeyboardButton("NEXT ▶️ 🟩", callback_data=f"news:nav:{next_idx}")
+    ]])
+
+async def news_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not u.message: return
+    cid = u.effective_chat.id
+    await safe_react(c.bot, cid, u.message.message_id, "📰")
+    
+    sm = await u.message.reply_text(
+        "📰 *CBS News Browser*\n\nOperation: News Retrieval\nProgress: Fetching fresh headlines...", 
+        parse_mode=ParseMode.MARKDOWN
+    )
+    
+    loop = asyncio.get_running_loop()
+    articles = await loop.run_in_executor(None, scrape_cbs_news_list)
+    
+    if not articles:
+        await sm.edit_text("😿 Unable to load latest news from CBS News right now.", parse_mode=ParseMode.MARKDOWN)
+        return
+        
+    c.user_data["news_list"] = articles
+    
+    try: await sm.delete()
+    except Exception: pass
+        
+    art = articles[0]
+    caption = f"📰 *CBS NEWS* • *TOP STORIES*\n\n{art['title']}\n\n🔗 [Read Full Article]({art['link']})"
+    await u.message.reply_photo(
+        photo=art["image"],
+        caption=caption,
+        reply_markup=_news_keyboard(0, len(articles)),
+        parse_mode=ParseMode.MARKDOWN
+    )
+    bot_status["message_count"] += 1
+
+async def news_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q: return
+    try:
+        try: await q.answer()
+        except Exception: pass
+        
+        parts = q.data.split(":")
+        if len(parts) != 3 or parts[1] == "noop": return
+        
+        index = int(parts[2])
+        articles = context.user_data.get("news_list")
+        if not articles:
+            loop = asyncio.get_running_loop()
+            articles = await loop.run_in_executor(None, scrape_cbs_news_list)
+            if not articles: return
+            context.user_data["news_list"] = articles
+            
+        index = index % len(articles)
+        art = articles[index]
+        caption = f"📰 *CBS NEWS* • *TOP STORIES*\n\n{art['title']}\n\n🔗 [Read Full Article]({art['link']})"
+        
+        await q.edit_message_media(
+            media=InputMediaPhoto(media=art["image"], caption=caption, parse_mode=ParseMode.MARKDOWN),
+            reply_markup=_news_keyboard(index, len(articles))
+        )
+    except Exception as e:
+        logger.error(f"[news_callback] {e}")
+
+# ══════════════════════════════════════════════════════
 #  QUIZ
 # ══════════════════════════════════════════════════════
 QUIZ_TOPICS = ["deep ocean biology","quantum mechanics","human brain","solar system",
@@ -800,7 +930,7 @@ async def lb_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 m = MEDALS[i] if i < len(MEDALS) else f"{i+1}."
                 lines.append(f"{m} {e.get('name','Unknown')[:18]:<18} {e.get('score',0):>6,} pts")
         lines += ["\n━━━━━━━━━━━━━━━━━━━━",
-                  "➕ +10 quiz/win  ➖ -10 loss  ⭐ +50 GM"]
+                  "➕ +10 quiz/ttt · +700 mine  ➖ -10 loss  ⭐ +50 GM"]
         text = "\n".join(lines)
         try:
             await u.message.reply_photo(photo=LB_IMAGE_URL, caption=text, parse_mode=ParseMode.MARKDOWN)
@@ -898,7 +1028,7 @@ def mine_build_text(g: dict, rem: int) -> str:
     elif status == "lost":
         return "💥 *BOOM!* You hit a mine!\n\nLost *-5 pts*."
     elif status == "won":
-        return f"🎉 *YOU WIN!*\n\nAll {total_safe} safe boxes found! Won *+10 pts*."
+        return f"🎉 *YOU WIN!*\n\nAll {total_safe} safe boxes found! Won *+700 pts*."
     else:
         return (f"💣 *MINESWEEPER*\n\n"
                 f"Find all safe boxes! Avoid the mines.\n"
@@ -973,7 +1103,6 @@ async def mine_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q: return
     try:
-        # Prevent spinning wheels immediately
         try: await q.answer()
         except Exception: pass
 
@@ -1048,7 +1177,7 @@ async def mine_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if opened_count >= total_safe:
                     g["status"] = "won"
                     mine_timers.pop(gkey, None)
-                    new_sc = update_score(cid, g["uid"], g["name"], +10)
+                    new_sc = update_score(cid, g["uid"], g["name"], +700) # Updated to +700 points
                     try:
                         await q.edit_message_caption(
                             caption=mine_build_text(g, 0) + f"\n\nBalance: *{new_sc:,} pts*",
@@ -1409,7 +1538,6 @@ async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q: return
     try:
-        # Answer immediately to prevent spinning wheel glitch
         try: await q.answer()
         except Exception: pass
 
@@ -1421,12 +1549,7 @@ async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         gkey = game_key(mid, cid)
         g = ttt_games.get(gkey)
 
-        if not g:
-            return
-        if g["status"] != "playing":
-            return
-        if action == "noop":
-            return
+        if not g or g["status"] != "playing" or action == "noop": return
 
         uid = str(q.from_user.id)
         valid_x = uid == str(g["x_id"])
@@ -1441,8 +1564,7 @@ async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         board = g["board"]
-        if board[idx] != TTT_EMPTY:
-            return 
+        if board[idx] != TTT_EMPTY: return 
 
         if gkey in game_timers:
             game_timers[gkey]["remaining"] = TIMER_DURATION
@@ -1487,7 +1609,6 @@ async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         g["turn"] = "O" if g["turn"] == "X" else "X"
 
-        # Bot move
         if g["vs_bot"] and g["turn"] == "O":
             bi = ttt_bot_move(board)
             if bi >= 0:
@@ -1513,10 +1634,8 @@ async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(ttt_build_text(g), parse_mode=ParseMode.MARKDOWN,
                 reply_markup=ttt_build_keyboard(board))
         except BadRequest as e:
-            if "not modified" not in str(e).lower():
-                logger.debug(f"[ttt edit] {e}")
-        except Exception as e:
-            logger.debug(f"[ttt edit] {e}")
+            if "not modified" not in str(e).lower(): logger.debug(f"[ttt edit] {e}")
+        except Exception as e: logger.debug(f"[ttt edit] {e}")
 
     except Exception as e: logger.error(f"[ttt_cb] {e}", exc_info=True)
 
@@ -1560,7 +1679,8 @@ async def start_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             "🎮 *GAMES*\n"
             "`/tictac` — Tic Tac Toe (PvP or vs Bot)\n"
             "`/mine` — Minesweeper\n\n"
-            "🧠 *SEARCH*\n"
+            "🧠 *SEARCH & NEWS*\n"
+            "`/news` — CBS News Browser 📰\n"
             "`/quiz` — Trivia Quiz\n"
             "`/search` — Web Search\n"
             "`/bananalogic` — Ask me anything! 🍌\n\n"
@@ -1572,7 +1692,7 @@ async def start_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             "👑 *GROUP*\n"
             "`/gm` — Daily Attendance (Owner)\n\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "🔥 *Scoring:* +10 win · -10 loss · +50 GM\n"
+            "🔥 *Scoring:* +10 win · -10 loss · +50 GM · +700 mine\n"
             "_Just mention me to chat anytime!_ 🐾"
         )
         await u.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
@@ -1651,18 +1771,13 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
             except Exception: pass
 
             reply = "Meow! 🐾"
-            try:
-                reply = await ai(CHAT_PROMPT, text, "Meow! 🐾")
-            except Exception as e:
-                logger.error(f"[monitor/ai] {e}")
+            try: reply = await ai(CHAT_PROMPT, text, "Meow! 🐾")
+            except Exception as e: logger.error(f"[monitor/ai] {e}")
 
-            try:
-                await u.message.reply_text(reply)
-            except Exception as e:
-                logger.error(f"[monitor/reply] {e}")
+            try: await u.message.reply_text(reply)
+            except Exception as e: logger.error(f"[monitor/reply] {e}")
 
-            try:
-                await send_random_sticker(c.bot, u.effective_chat.id)
+            try: await send_random_sticker(c.bot, u.effective_chat.id)
             except Exception: pass
 
         bot_status["message_count"] += 1
@@ -1676,13 +1791,11 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     err = context.error
-    if isinstance(err, (NetworkError, TimedOut)):
-        logger.debug(f"[Err] Transient: {err}"); return
+    if isinstance(err, (NetworkError, TimedOut)): return
     if isinstance(err, RetryAfter):
         logger.warning(f"[Err] Rate limit, retry after {err.retry_after}s")
         await asyncio.sleep(err.retry_after + 1); return
-    if isinstance(err, Forbidden):
-        logger.debug(f"[Err] Forbidden: {err}"); return
+    if isinstance(err, Forbidden): return
     if isinstance(err, BadRequest):
         msg = str(err).lower()
         if any(x in msg for x in ["not modified","message to edit not found",
@@ -1731,11 +1844,13 @@ async def main():
     app.add_handler(CommandHandler("gm",                  gm_handler))
     app.add_handler(CommandHandler("tictac",              tictac_handler))
     app.add_handler(CommandHandler("mine",                mine_handler))
+    app.add_handler(CommandHandler("news",                news_handler))
 
     app.add_handler(CallbackQueryHandler(ttt_ready_callback, pattern=r"^ttt_ready:"))
     app.add_handler(CallbackQueryHandler(ttt_callback,       pattern=r"^ttt:"))
     app.add_handler(CallbackQueryHandler(gm_callback,        pattern=r"^gm:"))
     app.add_handler(CallbackQueryHandler(mine_callback,      pattern=r"^mine:"))
+    app.add_handler(CallbackQueryHandler(news_callback,      pattern=r"^news:"))
 
     app.add_handler(PollAnswerHandler(poll_answer_handler))
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
