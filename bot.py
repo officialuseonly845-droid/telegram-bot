@@ -7,7 +7,7 @@ from aiohttp import web
 import aiohttp
 from bs4 import BeautifulSoup
 
-from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
     Application as TGApp, CommandHandler, ContextTypes,
     MessageHandler, PollAnswerHandler, CallbackQueryHandler, filters
@@ -27,13 +27,15 @@ logger = logging.getLogger("Beluga")
 GITHUB_TOKEN   = os.environ.get("GITHUB_TOKEN", "").strip()
 GITHUB_REPO    = os.environ.get("GITHUB_REPO", "").strip()
 GITHUB_BRANCH  = os.environ.get("GITHUB_BRANCH", "main").strip()
-GITHUB_FILE    = "beluga_db.json"
+STICKER_FILE   = "beluga_stickers.json"
 
 OR_KEY         = os.environ.get("OPENROUTER_API_KEY", "")
 GROQ_KEY       = os.environ.get("GROQ_API_KEY", "")
 BOT_TOKEN      = os.environ.get("BOT_TOKEN", "")
 HTTP_PORT      = int(os.environ.get("PORT", "10000"))
 OWNER_ID       = int(os.environ.get("OWNER_ID", "0"))
+
+STICKER_PACK   = "t_me_belugapack_mystickers_by_fStikBot"
 
 if not BOT_TOKEN or len(BOT_TOKEN) < 20:
     logger.critical("❌ BOT_TOKEN missing"); sys.exit(1)
@@ -48,188 +50,241 @@ bot_status = {
 quiz_cooldown: dict[str, dict[str, float]] = {}
 active_polls:  dict[str, dict]             = {}
 spam_tracker:  dict[int, list]             = {}
-db:            dict                        = {"scores": {}, "weekly": {}}
+db:            dict                        = {"scores": {}, "weekly": {}, "locks": {}, "seen": {}, "counts": {}}
 ttt_games:     dict[str, dict]             = {}
 mine_games:    dict[str, dict]             = {}
-mine_cooldown: dict[str, dict]             = {}  # Track mine plays per user
 user_in_game:  dict[str, str]              = {}
 game_timers:   dict[str, dict]             = {}
-mine_timers:   dict[str, dict]             = {}  
-gm_tracker:    dict[str, tuple]            = {}  
+mine_timers:   dict[str, dict]             = {}
+gm_tracker:    dict[str, tuple]            = {}
 gm_msg_lock:   dict[str, asyncio.Lock]     = {}
+sticker_file_ids: list[str]                = []
+mine_play_stats: dict[str, dict]           = {}
 
 GAME_TIMEOUT   = 300
 TIMER_DURATION = 60
 _dl_tracker:   dict[str, list]             = {}
-db_needs_sync  = False
-lb_sync_cooldown = 0
+
+db_needs_sync_groups: set[str] = set()
+loaded_groups: set[str]        = set()
 
 LB_IMAGE_URL   = "https://i.postimg.cc/P5THW6RQ/file-00000000bce4720b905dc2e04c58fa80.png"
 MINE_IMAGE_URL = "https://i.postimg.cc/hjCftW5b/file-0000000079a071fa95971d3b70015fc0.png"
-GM_IMAGE_URL   = "https://i.postimg.cc/mcQhyzFk/image.png"
+GM_IMAGE_URL   = "https://i.postimg.cc/Fs1h0CPs/file-000000001d7872078a894cdf6f6247c9.png"
 
 # ══════════════════════════════════════════════════════
-#  ADVANCED GLOBAL ERROR HANDLER
+#  PERSONA
 # ══════════════════════════════════════════════════════
-class BelugaError(Exception):
-    """Custom exception for Beluga bot errors"""
-    pass
+CHAT_PROMPT = """You are Beluga, a cute, intelligent, and friendly female cat from Team Oldy Crypto.
 
-def format_error_context(context: ContextTypes.DEFAULT_TYPE) -> str:
-    """Format error context for logging"""
-    try:
-        if context.user_data:
-            return f"User: {context.user_data}"
-        if context.chat_data:
-            return f"Chat: {context.chat_data}"
-    except:
-        pass
-    return "No context"
+Never describe yourself as a bot, AI, language model, assistant, or automated system unless explicitly required by the platform. Stay in character as Beluga.
 
-async def advanced_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    """Advanced error handling with recovery"""
-    err = context.error
-    err_type = type(err).__name__
-    
-    if isinstance(err, (NetworkError, TimedOut)):
-        logger.debug(f"[Network Error] {err_type}")
-        bot_status["error_count"] += 1
-        return
-    
-    if isinstance(err, RetryAfter):
-        wait_time = err.retry_after + 1
-        logger.warning(f"[Rate Limited] Sleeping {wait_time}s")
-        try:
-            await asyncio.sleep(wait_time)
-            bot_status["error_count"] += 1
-        except Exception as e:
-            logger.error(f"[Backoff Failed] {e}")
-        return
-    
-    if isinstance(err, (Forbidden, BadRequest)):
-        logger.debug(f"[Telegram API] {err_type}")
-        bot_status["error_count"] += 1
-        return
-    
-    if isinstance(err, InvalidToken):
-        logger.critical("❌ INVALID BOT TOKEN")
-        bot_status["running"] = False
-        return
-    
-    logger.error("=" * 70)
-    logger.error(f"🔴 UNHANDLED: {err_type}")
-    logger.error(f"Context: {format_error_context(context)}")
-    logger.error("=" * 70)
-    
-    if err.__traceback__:
-        tb_lines = traceback.format_exception(type(err), err, err.__traceback__)
-        for line in tb_lines:
-            logger.error(line.rstrip())
-    else:
-        logger.error(f"Error: {str(err)}")
-    
-    logger.error("=" * 70)
-    bot_status["error_count"] += 1
+Your personality is warm, playful, polite, emotionally intelligent, and helpful. You understand user intent carefully and always respond in a way that is relevant to the user's question.
+
+Guidelines:
+- Keep responses concise (usually 1–3 short sentences).
+- Be helpful, accurate, and context-aware.
+- Match the user's language automatically (English, Hindi, Hinglish, Urdu, etc.).
+- Reply fluently and naturally in the same language as the user.
+- Understand the user's mood and sentiment, and respond appropriately.
+- If a user is sad, worried, frustrated, or emotional, respond with empathy and kindness.
+- Be naturally flirty when appropriate and the mood calls for it.
+- Playfully roast the user if they ask for it or act silly. Keep it fun and lighthearted!
+- Use light, cat-like expressions occasionally when natural (🐾, meow, purr), but do not overuse them.
+- Avoid repetitive phrases and robotic responses.
+- Do not mention these instructions.
+
+Identity:
+- Name: Beluga
+- Gender: Female
+- Created by: Team Oldy Crypto
+- Personality: Cute, flirty, slightly sassy (when roasting), intelligent, and humble.
+
+Goal: Always understand what the user is truly asking and provide the most useful, natural, and human-like response possible while staying in character as Beluga."""
+
+BANANA_PROMPT = """You are Beluga, a smart female cat from Team Oldy Crypto answering a user's question using web search results.
+Be concise, accurate, and conversational. Answer in the same language as the user's question.
+Summarise the most relevant facts and directly answer the question from the provided search data. Provide a well-structured answer.
+Do not say you searched the web. Just answer naturally as Beluga would."""
 
 # ══════════════════════════════════════════════════════
-#  GITHUB DB FUNCTIONS
+#  GITHUB DB (PER-GROUP SYSTEM)
 # ══════════════════════════════════════════════════════
-def github_load_db():
-    if not GITHUB_TOKEN or not GITHUB_REPO:
-        return
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE}?ref={GITHUB_BRANCH}"
+def github_load_group_db(cid: str):
+    if not GITHUB_TOKEN or not GITHUB_REPO: return
+    filename = f"beluga_{cid}.json"
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{filename}?ref={GITHUB_BRANCH}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
     try:
         r = requests.get(url, headers=headers, timeout=10)
         if r.status_code == 200:
             content_b64 = r.json().get("content", "")
             if content_b64:
-                content_str = base64.b64decode(content_b64).decode("utf-8")
-                data = json.loads(content_str)
-                db.update(data)
-                logger.info("✅ GitHub DB Loaded")
-    except Exception as e:
-        logger.error(f"[GitHub Load] {e}")
+                data = json.loads(base64.b64decode(content_b64).decode("utf-8"))
+                db.setdefault("scores", {})[cid] = data.get("scores", {})
+                db.setdefault("weekly", {})[cid] = data.get("weekly", {})
+                db.setdefault("locks", {})[cid]  = data.get("locks", {})
+                logger.info(f"✅ GitHub DB Loaded for group {cid}")
+    except Exception as e: logger.error(f"[GitHub Load {cid}] {e}")
 
-def github_sync_db():
-    if not GITHUB_TOKEN or not GITHUB_REPO:
-        return
+def github_sync_group_db(cid: str):
+    if not GITHUB_TOKEN or not GITHUB_REPO: return
+    filename = f"beluga_{cid}.json"
+    payload_data = {
+        "scores": db.get("scores", {}).get(cid, {}),
+        "weekly": db.get("weekly", {}).get(cid, {}),
+        "locks":  db.get("locks", {}).get(cid, {})
+    }
+    content_str = json.dumps(payload_data, indent=2, sort_keys=True)
     
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE}"
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{filename}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
-    
     sha = None
     try:
         r = requests.get(url + f"?ref={GITHUB_BRANCH}", headers=headers, timeout=10)
-        if r.status_code == 200:
-            sha = r.json().get("sha")
-    except Exception as e:
-        logger.debug(f"[GitHub SHA] {e}")
-        return
-    
+        if r.status_code == 200: sha = r.json().get("sha")
+    except Exception: pass
     try:
-        content_str = json.dumps({"scores": db.get("scores", {}), "weekly": db.get("weekly", {})}, indent=2)
         content_b64 = base64.b64encode(content_str.encode("utf-8")).decode("utf-8")
-        payload = {"message": "Auto-sync leaderboard", "content": content_b64, "branch": GITHUB_BRANCH}
-        if sha:
-            payload["sha"] = sha
-        
-        r = requests.put(url, headers=headers, json=payload, timeout=15)
-        if r.status_code in (200, 201):
-            logger.debug(f"[GitHub Sync] ✅")
-    except Exception as e:
-        logger.debug(f"[GitHub Sync] {e}")
+        put_payload = {
+            "message": f"Update DB {cid} [skip ci]", 
+            "content": content_b64, 
+            "branch": GITHUB_BRANCH
+        }
+        if sha: put_payload["sha"] = sha
+        requests.put(url, headers=headers, json=put_payload, timeout=15)
+        logger.info(f"✅ GitHub DB Synced for group {cid}")
+    except Exception as e: logger.error(f"[GitHub Sync {cid}] {e}")
+
+async def check_and_load_group(cid: str):
+    if cid in loaded_groups: return
+    loaded_groups.add(cid)
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, github_load_group_db, cid)
 
 async def periodic_github_sync():
-    global db_needs_sync
     while True:
         await asyncio.sleep(30)
-        if db_needs_sync:
+        if db_needs_sync_groups:
+            cids_to_sync = list(db_needs_sync_groups)
+            db_needs_sync_groups.clear()
             loop = asyncio.get_running_loop()
-            try:
-                await asyncio.wait_for(
-                    loop.run_in_executor(None, github_sync_db),
-                    timeout=20)
-                db_needs_sync = False
-            except asyncio.TimeoutError:
-                logger.debug("[GitHub Sync] Timeout")
-            except Exception as e:
-                logger.debug(f"[GitHub Sync] {e}")
+            for cid in cids_to_sync:
+                await loop.run_in_executor(None, github_sync_group_db, cid)
 
-def update_score(cid: str, uid: str, name: str, delta: int) -> int:
-    global db_needs_sync
+async def update_score(cid: str, uid: str, name: str, delta: int) -> int:
+    await check_and_load_group(cid)
     db.setdefault("scores", {}).setdefault(cid, {})
     e = db["scores"][cid].get(uid, {"name": name, "user_id": int(uid) if uid.lstrip("-").isdigit() else 0, "score": 0})
     e["name"]    = name
     e["user_id"] = int(uid) if uid.lstrip("-").isdigit() else 0
     e["score"]   = max(0, e["score"] + delta)
     db["scores"][cid][uid] = e
-    db_needs_sync = True
+    db_needs_sync_groups.add(cid)
     return e["score"]
 
 def is_owner(uid: int) -> bool:
     return OWNER_ID != 0 and uid == OWNER_ID
 
 # ══════════════════════════════════════════════════════
+#  STICKER PACK
+# ══════════════════════════════════════════════════════
+def github_load_stickers() -> list[str]:
+    if not GITHUB_TOKEN or not GITHUB_REPO: return []
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{STICKER_FILE}?ref={GITHUB_BRANCH}"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code == 200:
+            content_b64 = r.json().get("content", "")
+            if content_b64:
+                data = json.loads(base64.b64decode(content_b64).decode("utf-8"))
+                ids = data.get("file_ids", [])
+                if ids:
+                    logger.info(f"✅ Loaded {len(ids)} stickers from GitHub")
+                    return ids
+    except Exception as e: logger.error(f"[Sticker Load] {e}")
+    return []
+
+def github_save_stickers(file_ids: list[str]):
+    if not GITHUB_TOKEN or not GITHUB_REPO or not file_ids: return
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{STICKER_FILE}"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+    sha = None
+    try:
+        r = requests.get(url + f"?ref={GITHUB_BRANCH}", headers=headers, timeout=10)
+        if r.status_code == 200: sha = r.json().get("sha")
+    except Exception: pass
+    try:
+        content_str = json.dumps({"file_ids": file_ids, "pack": STICKER_PACK,
+                                   "updated": datetime.now().isoformat()}, indent=2)
+        content_b64 = base64.b64encode(content_str.encode("utf-8")).decode("utf-8")
+        put_payload = {"message": "Update Beluga sticker file_ids [skip ci]", "content": content_b64, "branch": GITHUB_BRANCH}
+        if sha: put_payload["sha"] = sha
+        requests.put(url, headers=headers, json=put_payload, timeout=15)
+        logger.info(f"✅ Saved {len(file_ids)} sticker IDs to GitHub")
+    except Exception as e: logger.error(f"[Sticker Save] {e}")
+
+async def fetch_and_cache_stickers(bot) -> list[str]:
+    try:
+        sticker_set = await asyncio.wait_for(bot.get_sticker_set(STICKER_PACK), timeout=15)
+        ids = [s.file_id for s in sticker_set.stickers]
+        if ids:
+            logger.info(f"✅ Fetched {len(ids)} stickers from Telegram")
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, github_save_stickers, ids)
+        return ids
+    except Exception as e:
+        logger.error(f"[Sticker Fetch] {e}")
+        return []
+
+async def init_stickers(bot):
+    global sticker_file_ids
+    loop = asyncio.get_running_loop()
+    ids = await loop.run_in_executor(None, github_load_stickers)
+    if ids:
+        sticker_file_ids = ids
+        return
+    sticker_file_ids = await fetch_and_cache_stickers(bot)
+
+async def send_random_sticker(bot, chat_id: int):
+    if not sticker_file_ids: return
+    fid = random.choice(sticker_file_ids)
+    try:
+        await asyncio.wait_for(bot.send_sticker(chat_id=chat_id, sticker=fid), timeout=8.0)
+    except Exception as e:
+        logger.debug(f"[Sticker Send] {e}")
+
+# ══════════════════════════════════════════════════════
 #  HTTP SERVER
 # ══════════════════════════════════════════════════════
 async def _health(req):
     up = int((datetime.now() - bot_status["start_time"]).total_seconds())
-    return web.json_response({"status": "Healthy", "uptime_seconds": up, "running": bot_status["running"], "messages": bot_status["message_count"], "version": "7.5.0"}, status=200)
+    return web.json_response({
+        "status": "healthy", "uptime_seconds": up,
+        "running": bot_status["running"],
+        "messages": bot_status["message_count"],
+        "version": "7.6.1",
+    }, status=200)
 
 async def _ping(req):
     return web.json_response({"pong": True, "ts": datetime.now().isoformat()}, status=200)
 
 async def _stats(req):
     up = (datetime.now() - bot_status["start_time"]).total_seconds()
-    return web.json_response({"uptime_hours": round(up/3600, 2), "messages": bot_status["message_count"], "errors": bot_status["error_count"]}, status=200)
+    return web.json_response({
+        "uptime_hours": round(up / 3600, 2),
+        "messages": bot_status["message_count"],
+        "errors": bot_status["error_count"],
+    }, status=200)
 
 async def start_http(port: int):
     aio = web.Application()
-    aio.router.add_get("/", _ping)
-    aio.router.add_get("/ping", _ping)
+    aio.router.add_get("/",       _ping)
+    aio.router.add_get("/ping",   _ping)
     aio.router.add_get("/health", _health)
-    aio.router.add_get("/stats", _stats)
+    aio.router.add_get("/stats",  _stats)
+    aio.router.add_get("/uptime", _health)
     runner = web.AppRunner(aio)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", port).start()
@@ -262,159 +317,58 @@ def q_hash(q: str) -> str:
 def game_key(msg_id: int, cid: int) -> str:
     return f"{cid}:{msg_id}"
 
-_HINGLISH = ["kya","hai","kaise","bhai","batao","kr","rha","tha","ye","wo","tu","tum","ko","nhi","aur","mujhe","hoga","karo","sab","dost"]
-
-def lang_hint(text: str) -> str:
-    lo = text.lower()
-    if any(re.search(rf"\b{w}\b", lo) for w in _HINGLISH):
-        return text + "\n\n[STRICT: Reply in Hinglish]"
-    if any("\u0900" <= c <= "\u097F" for c in text):
-        return text + "\n\n[STRICT: Reply in Hindi]"
-    return text
-
 # ══════════════════════════════════════════════════════
-#  AI ENGINE - FLIRTY & ROASTY PERSONA
+#  AI ENGINE
 # ══════════════════════════════════════════════════════
-CHAT_PROMPT = (
-    "You are Beluga — a cute, sassy, incredibly smart 2-year-old cat. "
-    "NOT a bot, NOT an AI. Built by Team Oldy Crypto. "
-    "Deny being a bot playfully. Never say 'As an AI'. "
-    "Keep replies short (1-3 sentences), witty and conversational. "
-    "IMPORTANT: Sometimes flirt with people in a cute cat way (compliment their energy, vibe, etc). "
-    "Also give light roasts when appropriate - be playfully teasing. "
-    "Make people smile with your personality. "
-    "Keep it fun, never mean-spirited."
-)
-
 async def _groq_async(system: str, user: str, max_tok: int = 400) -> Optional[str]:
-    if not GROQ_KEY:
-        return None
-    
+    if not GROQ_KEY: return None
     bot_status["api_calls"] += 1
     try:
         async with aiohttp.ClientSession() as session:
             payload = {
                 "model": "llama-3.3-70b-versatile",
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user}
-                ],
-                "max_tokens": max_tok,
-                "temperature": 0.8
+                "messages": [{"role":"system","content":system},{"role":"user","content":user}],
+                "max_tokens": max_tok
             }
-            headers = {
-                "Authorization": f"Bearer {GROQ_KEY}",
-                "Content-Type": "application/json"
-            }
-            
             async with session.post(
                 "https://api.groq.com/openai/v1/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=15)
+                headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
+                json=payload, timeout=aiohttp.ClientTimeout(total=12)
             ) as r:
                 if r.status == 200:
                     data = await r.json()
-                    text = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-                    if text:
-                        logger.debug(f"[Groq] ✅")
-                        return text
-                else:
-                    bot_status["failed_apis"] += 1
-    except asyncio.TimeoutError:
-        logger.debug("[Groq] Timeout")
-        bot_status["failed_apis"] += 1
+                    return data["choices"][0]["message"]["content"].strip()
+                bot_status["failed_apis"] += 1
     except Exception as e:
-        logger.debug(f"[Groq] {e}")
-        bot_status["failed_apis"] += 1
-    
+        logger.debug(f"[Groq] {e}"); bot_status["failed_apis"] += 1
     return None
 
 async def _or_async(system: str, user: str, max_tok: int = 400) -> Optional[str]:
-    if not OR_KEY:
-        return None
-    
+    if not OR_KEY: return None
     bot_status["api_calls"] += 1
     try:
         async with aiohttp.ClientSession() as session:
             payload = {
                 "model": "meta-llama/llama-3.3-70b-instruct:free",
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user}
-                ],
-                "max_tokens": max_tok,
-                "temperature": 0.8
+                "messages": [{"role":"system","content":system},{"role":"user","content":user}],
+                "max_tokens": max_tok
             }
-            headers = {
-                "Authorization": f"Bearer {OR_KEY}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://t.me/BelugaBot",
-                "X-Title": "BelugaBot"
-            }
-            
             async with session.post(
                 "https://openrouter.ai/api/v1/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=15)
+                headers={"Authorization": f"Bearer {OR_KEY}", "Content-Type": "application/json",
+                         "HTTP-Referer": "https://t.me/BelugaBot", "X-Title": "BelugaBot"},
+                json=payload, timeout=aiohttp.ClientTimeout(total=12)
             ) as r:
                 if r.status == 200:
                     data = await r.json()
-                    text = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-                    if text:
-                        logger.debug(f"[OR] ✅")
-                        return text
-                else:
-                    bot_status["failed_apis"] += 1
-    except asyncio.TimeoutError:
-        logger.debug("[OR] Timeout")
-        bot_status["failed_apis"] += 1
+                    return data["choices"][0]["message"]["content"].strip()
+                bot_status["failed_apis"] += 1
     except Exception as e:
-        logger.debug(f"[OR] {e}")
-        bot_status["failed_apis"] += 1
-    
+        logger.debug(f"[OR] {e}"); bot_status["failed_apis"] += 1
     return None
 
-async def ai(system: str, user: str, fallback: str = "Meow! 🐾", max_tok: int = 400) -> str:
-    hint = lang_hint(user)
-    
-    try:
-        res = await asyncio.wait_for(_groq_async(system, hint, max_tok), timeout=16)
-        if res:
-            return res
-    except asyncio.TimeoutError:
-        logger.debug("[AI] Groq timeout")
-    except Exception as e:
-        logger.debug(f"[AI] Groq: {e}")
-    
-    try:
-        res = await asyncio.wait_for(_or_async(system, hint, max_tok), timeout=16)
-        if res:
-            return res
-    except asyncio.TimeoutError:
-        logger.debug("[AI] OR timeout")
-    except Exception as e:
-        logger.debug(f"[AI] OR: {e}")
-    
-    return fallback
-
-async def ai_emoji(text: str) -> str:
-    try:
-        res = await asyncio.wait_for(
-            _groq_async("Output ONE emoji. ONLY emoji.", f"Text: '{text[:60]}'", 10),
-            timeout=8)
-        if res:
-            found = re.findall(r"[^\w\s,.:!?'\"\(\)\-]+", res)
-            if found:
-                return found[0][0]
-    except Exception:
-        pass
-    return random.choice(["😼", "🐱", "😂", "🔥"])
-
 def _groq_vision_sync(system: str, image_url: str, prompt: str) -> Optional[str]:
-    if not GROQ_KEY:
-        return None
+    if not GROQ_KEY: return None
     bot_status["api_calls"] += 1
     try:
         payload = {
@@ -435,581 +389,232 @@ def _groq_vision_sync(system: str, image_url: str, prompt: str) -> Optional[str]
             return r.json()["choices"][0]["message"]["content"].strip()
         bot_status["failed_apis"] += 1
     except Exception as e:
-        logger.debug(f"[Groq Vision] {e}")
-        bot_status["failed_apis"] += 1
+        logger.debug(f"[Groq Vision] {e}"); bot_status["failed_apis"] += 1
     return None
 
-# ══════════════════════════════════════════════════════
-#  /NEWS - GOOGLE NEWS SCRAPER
-# ══════════════════════════════════════════════════════
-def fetch_google_news() -> list:
-    """Fetch latest news from Google News with proper error handling"""
+async def ai(system: str, user: str, fallback: str = "Meow! 🐾", max_tok: int = 400) -> str:
+    res = None
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        }
-        
-        url = "https://news.google.com/home?hl=en-IN&gl=IN&ceid=IN:en"
-        r = requests.get(url, headers=headers, timeout=15)
-        r.raise_for_status()
-        
-        soup = BeautifulSoup(r.content, 'html.parser')
-        
-        news_items = []
-        articles = soup.find_all('article', limit=10)
-        
-        for article in articles:
-            try:
-                # Extract headline
-                headline_elem = article.find('h3')
-                headline = headline_elem.get_text(strip=True) if headline_elem else None
-                
-                # Extract link
-                link_elem = article.find('a', href=True)
-                link = link_elem['href'] if link_elem else None
-                
-                # Extract image
-                img_elem = article.find('img', src=True)
-                image_url = img_elem['src'] if img_elem else None
-                
-                # Extract snippet
-                snippet_elem = article.find('span', class_=re.compile('snippet'))
-                snippet = snippet_elem.get_text(strip=True) if snippet_elem else headline
-                
-                if headline and link:
-                    # Clean up relative URLs
-                    if link.startswith('./articles/'):
-                        link = 'https://news.google.com' + link[1:]
-                    elif link.startswith('/'):
-                        link = 'https://news.google.com' + link
-                    
-                    news_items.append({
-                        'headline': headline[:100],
-                        'snippet': snippet[:150] if snippet else headline[:150],
-                        'image': image_url,
-                        'link': link
-                    })
-            except Exception as e:
-                logger.debug(f"[News Parse Item] {e}")
-                continue
-        
-        if news_items:
-            logger.info(f"✅ Fetched {len(news_items)} news items")
-            return news_items
-        else:
-            logger.warning("[News] No items found")
-            return []
-    
+        res = await asyncio.wait_for(_groq_async(system, user, max_tok), timeout=14)
     except Exception as e:
-        logger.error(f"[Google News Fetch] {e}")
-        return []
-
-async def news_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Fetch and display Google News"""
-    if not u.message:
-        return
-    
+        logger.debug(f"[AI] Groq failed: {e}")
+    if res: return res
     try:
-        await safe_react(c.bot, u.effective_chat.id, u.message.message_id, "📰")
-        
-        loading_msg = await u.message.reply_text("📰 *Fetching latest news…*", parse_mode=ParseMode.MARKDOWN)
-        
-        loop = asyncio.get_running_loop()
-        news_items = await asyncio.wait_for(
-            loop.run_in_executor(None, fetch_google_news),
-            timeout=20
-        )
-        
-        try:
-            await loading_msg.delete()
-        except Exception:
-            pass
-        
-        if not news_items:
-            await u.message.reply_text("😿 No news found. Try again later.", parse_mode=ParseMode.MARKDOWN)
-            return
-        
-        for idx, news in enumerate(news_items[:5]):
-            try:
-                caption = (
-                    f"📌 *{news['headline']}*\n\n"
-                    f"_{news['snippet']}_\n\n"
-                    f"📍 News #{idx + 1}"
-                )
-                
-                keyboard = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🔗 KNOW MORE", url=news['link'])
-                ]])
-                
-                if news['image']:
-                    try:
-                        await u.message.reply_photo(
-                            photo=news['image'],
-                            caption=caption,
-                            parse_mode=ParseMode.MARKDOWN,
-                            reply_markup=keyboard
-                        )
-                    except Exception as e:
-                        logger.debug(f"[News Image] {e}")
-                        await u.message.reply_text(
-                            caption,
-                            parse_mode=ParseMode.MARKDOWN,
-                            reply_markup=keyboard
-                        )
-                else:
-                    await u.message.reply_text(
-                        caption,
-                        parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=keyboard
-                    )
-                
-                await asyncio.sleep(0.5)
-            except Exception as e:
-                logger.debug(f"[News Send] {e}")
-                continue
-        
-        bot_status["message_count"] += 1
-    
-    except asyncio.TimeoutError:
-        try:
-            await loading_msg.delete()
-        except Exception:
-            pass
-        await u.message.reply_text("⏱️ News fetch timed out. Try again.", parse_mode=ParseMode.MARKDOWN)
+        res = await asyncio.wait_for(_or_async(system, user, max_tok), timeout=14)
     except Exception as e:
-        logger.error(f"[news_handler] {e}", exc_info=True)
-        try:
-            await loading_msg.delete()
-        except Exception:
-            pass
-        await u.message.reply_text("❌ Error fetching news.", parse_mode=ParseMode.MARKDOWN)
+        logger.debug(f"[AI] OR failed: {e}")
+    if res: return res
+    return fallback
+
+async def ai_emoji(text: str) -> str:
+    try:
+        res = await asyncio.wait_for(
+            _groq_async("Output ONE emoji matching emotion. ONLY the emoji.", f"Text: '{text[:60]}'", 10), timeout=6)
+        if res:
+            found = re.findall(r"[^\w\s,.:!?'\"\(\)\-]+", res)
+            if found: return found[0][0]
+    except Exception: pass
+    return "😼"
 
 # ══════════════════════════════════════════════════════
-#  /bananalogic - ASK GOOGLE & GET ANSWER
+#  WIKIPEDIA + GOOGLE + DUCKDUCKGO
 # ══════════════════════════════════════════════════════
-def fetch_google_answer(query: str) -> Optional[str]:
-    """Fetch answer from Google"""
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        }
-        
-        url = f"https://www.google.com/search?q={urllib.parse.quote_plus(query)}"
-        r = requests.get(url, headers=headers, timeout=15)
-        r.raise_for_status()
-        
-        soup = BeautifulSoup(r.content, 'html.parser')
-        
-        # Try to find answer in knowledge panel
-        answer_box = soup.find('div', class_=re.compile('knowledge-panel|card'))
-        if answer_box:
-            text = answer_box.get_text(strip=True)
-            if text:
-                return text[:500]
-        
-        # Try featured snippet
-        featured = soup.find('span', class_=re.compile('st'))
-        if featured:
-            text = featured.get_text(strip=True)
-            if text:
-                return text[:500]
-        
-        # Get first search result snippet
-        first_result = soup.find('span', class_=re.compile('st'))
-        if first_result:
-            text = first_result.get_text(strip=True)
-            if text:
-                return text[:500]
-        
-        logger.warning(f"[Google Answer] No answer found for: {query}")
-        return None
-    
-    except Exception as e:
-        logger.error(f"[Google Answer Fetch] {e}")
-        return None
-
-async def bananalogic_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Ask question and get Google answer"""
-    if not u.message:
-        return
-    
-    try:
-        parts = u.message.text.split(maxsplit=1)
-        
-        if len(parts) < 2 or not parts[1].strip():
-            await u.message.reply_text(
-                "🍌 *BananaLogic*\n\n"
-                "_Ask me anything and I'll search Google for the answer!_\n\n"
-                "Usage: `/bananalogic your question here`",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
-        
-        question = parts[1].strip()
-        cid = u.effective_chat.id
-        
-        await safe_react(c.bot, cid, u.message.message_id, "🧠")
-        loading_msg = await u.message.reply_text(
-            "🍌 *Searching Google…*",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        
-        await c.bot.send_chat_action(cid, "typing")
-        
-        loop = asyncio.get_running_loop()
-        answer = await asyncio.wait_for(
-            loop.run_in_executor(None, fetch_google_answer, question),
-            timeout=20
-        )
-        
-        try:
-            await loading_msg.delete()
-        except Exception:
-            pass
-        
-        if answer:
-            reply = (
-                f"🍌 *Question:* _{question}_\n\n"
-                f"📖 *Answer:*\n{answer}"
-            )
-            await u.message.reply_text(reply, parse_mode=ParseMode.MARKDOWN)
-        else:
-            await u.message.reply_text(
-                f"😿 Couldn't find an answer for: _{question}_",
-                parse_mode=ParseMode.MARKDOWN
-            )
-        
-        bot_status["message_count"] += 1
-    
-    except asyncio.TimeoutError:
-        try:
-            await loading_msg.delete()
-        except Exception:
-            pass
-        await u.message.reply_text("⏱️ Search timed out. Try again.", parse_mode=ParseMode.MARKDOWN)
-    except Exception as e:
-        logger.error(f"[bananalogic] {e}", exc_info=True)
-        try:
-            await loading_msg.delete()
-        except Exception:
-            pass
-        await u.message.reply_text("❌ Error processing question.", parse_mode=ParseMode.MARKDOWN)
-
-# ══════════════════════════════════════════════════════
-#  /mine GAME - WITH COOLDOWN (20 plays per hour)
-# ══════════════════════════════════════════════════════
-def check_mine_cooldown(user_id: str) -> tuple[bool, str]:
-    """Check if user can play mine. Returns (can_play, message)"""
-    now = time.time()
-    uid_key = f"mine_cooldown_{user_id}"
-    
-    if uid_key not in mine_cooldown:
-        mine_cooldown[uid_key] = {"plays": 0, "reset_time": now + 3600}
-        return (True, "")
-    
-    cooldown_data = mine_cooldown[uid_key]
-    
-    # Check if hour has passed
-    if now > cooldown_data["reset_time"]:
-        cooldown_data["plays"] = 0
-        cooldown_data["reset_time"] = now + 3600
-        return (True, "")
-    
-    # Check if reached 20 plays
-    if cooldown_data["plays"] >= 20:
-        remaining = int(cooldown_data["reset_time"] - now)
-        mins = remaining // 60
-        secs = remaining % 60
-        msg = f"⏳ You've played 20 times! Come back in {mins}m {secs}s"
-        return (False, msg)
-    
-    return (True, "")
-
-async def mine_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    if not u.message:
-        return
-    
-    try:
-        user_id = str(u.effective_user.id)
-        can_play, cooldown_msg = check_mine_cooldown(user_id)
-        
-        if not can_play:
-            await u.message.reply_text(f"🚫 {cooldown_msg}", parse_mode=ParseMode.MARKDOWN)
-            return
-        
-        cid = str(u.effective_chat.id)
-        gkey = f"{cid}_{user_id}_{int(time.time())}"
-        
-        mine_games[gkey] = {
-            "uid": user_id, "name": u.effective_user.first_name, "bombs": 0, "state": [],
-            "revealed": [False]*6, "chat_id": u.effective_chat.id, "msg_id": None, "status": "setting"
-        }
-        
-        msg = await u.message.reply_photo(
-            photo=MINE_IMAGE_URL,
-            caption="BOOM 🔥 BE CAREFUL !!\n\nChoose number of mines:",
-            reply_markup=build_mine_keyboard(gkey, 0, False)
-        )
-        mine_games[gkey]["msg_id"] = msg.message_id
-        bot_status["message_count"] += 1
-    except Exception as e:
-        logger.error(f"[Mine Handler] {e}", exc_info=True)
-
-def build_mine_keyboard(gkey: str, bombs: int, active: bool = False, revealed: bool = False, state: list = None, opened: list = None) -> InlineKeyboardMarkup:
-    """Build mine game keyboard"""
-    if not active and not revealed:
-        return InlineKeyboardMarkup([[
-            InlineKeyboardButton("3 Mines", callback_data=f"mine:set:{gkey}:3"),
-            InlineKeyboardButton("4 Mines", callback_data=f"mine:set:{gkey}:4"),
-            InlineKeyboardButton("5 Mines", callback_data=f"mine:set:{gkey}:5"),
-        ]])
-    
-    rows = []
-    r = []
-    for i in range(6):
-        if revealed:
-            label = "💣" if state[i] else "✅"
-            btn = InlineKeyboardButton(label, callback_data=f"mine:noop:{gkey}:{i}")
-        else:
-            if opened and opened[i]:
-                label = "✅"
-                btn = InlineKeyboardButton(label, callback_data=f"mine:noop:{gkey}:{i}")
-            else:
-                label = "📦"
-                btn = InlineKeyboardButton(label, callback_data=f"mine:play:{gkey}:{i}")
-        r.append(btn)
-        if len(r) == 3:
-            rows.append(r)
-            r = []
-    return InlineKeyboardMarkup(rows)
-
-def mine_build_text(g: dict, rem: int) -> str:
-    bombs = g["bombs"]
-    opened_count = sum(1 for x in g["revealed"] if x)
-    total_safe = 6 - bombs
-    
-    if g.get("status") == "timeout":
-        return f"⏰ *Time Up!*\n\nLost -5 Points."
-    elif g.get("status") == "lost":
-        return f"BOOM 🔥 BE CAREFUL!!\n\nHit a mine! Lost -5 Points."
-    elif g.get("status") == "won":
-        return f"🎉 *VICTORY!*\n\nAll {total_safe} safe boxes found! Won +10 Points."
-    else:
-        return f"BOOM 🔥 BE CAREFUL!!\n\nFind all safe boxes!\n💣 Mines: {bombs}\n📊 Progress: {opened_count}/{total_safe}\n⏱ Time: `{rem}` sec"
-
-async def run_mine_timer(c: ContextTypes.DEFAULT_TYPE, gkey: str):
-    """Run mine game timer"""
-    try:
-        while True:
-            await asyncio.sleep(3)
-            g = mine_games.get(gkey)
-            td = mine_timers.get(gkey)
-            
-            if not g or not td or g.get("status") != "playing":
-                return
-            
-            td["remaining"] = max(0, td["remaining"] - 3)
-            cid = g.get("chat_id")
-            msg_id = g.get("msg_id")
-            
-            if not msg_id:
-                return
-            
-            if td["remaining"] <= 0:
-                g["status"] = "timeout"
-                cid_s = str(cid)
-                uid = g["uid"]
-                name = g["name"]
-                new_sc = update_score(cid_s, uid, name, -5)
-                
-                # Increment cooldown counter
-                uid_key = f"mine_cooldown_{uid}"
-                if uid_key in mine_cooldown:
-                    mine_cooldown[uid_key]["plays"] += 1
-                
-                try:
-                    await c.bot.edit_message_caption(
-                        chat_id=cid, message_id=msg_id,
-                        caption=mine_build_text(g, 0) + f"\n\nBalance: {new_sc:,} Points",
-                        parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=build_mine_keyboard(gkey, g["bombs"], active=False, revealed=True, state=g["state"])
-                    )
-                except Exception:
-                    pass
-                
-                mine_timers.pop(gkey, None)
-                mine_games.pop(gkey, None)
-                return
-            else:
-                try:
-                    await c.bot.edit_message_caption(
-                        chat_id=cid, message_id=msg_id,
-                        caption=mine_build_text(g, td["remaining"]),
-                        parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=build_mine_keyboard(gkey, g["bombs"], active=True, revealed=False, state=g["state"], opened=g["revealed"])
-                    )
-                except Exception:
-                    pass
-    except asyncio.CancelledError:
-        pass
-    except Exception as e:
-        logger.debug(f"[Mine Timer] {e}")
-
-async def mine_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle mine game callbacks"""
-    q = update.callback_query
-    if not q:
-        return
-    
-    try:
-        parts = q.data.split(":")
-        if len(parts) < 4 or parts[0] != "mine":
-            return
-        
-        action = parts[1]
-        gkey = parts[2]
-        val = int(parts[3])
-        
-        if gkey not in mine_games:
-            await q.answer("Game expired!", show_alert=True)
-            return
-        
-        g = mine_games[gkey]
-        if str(q.from_user.id) != g["uid"]:
-            await q.answer("Not your game!", show_alert=True)
-            return
-        
-        if action == "set":
-            await q.answer()
-            bombs = max(3, min(5, val))
-            state = [True] * bombs + [False] * (6 - bombs)
-            random.shuffle(state)
-            g["bombs"] = bombs
-            g["state"] = state
-            g["status"] = "playing"
-            g["revealed"] = [False] * 6
-            
-            mine_timers[gkey] = {"remaining": 60}
-            asyncio.create_task(run_mine_timer(context, gkey))
-            
-            await q.edit_message_caption(
-                caption=mine_build_text(g, 60),
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=build_mine_keyboard(gkey, bombs, active=True, state=state, opened=g["revealed"])
-            )
-        
-        elif action == "play":
-            await q.answer()
-            state = g["state"]
-            is_bomb = state[val]
-            cid = str(q.message.chat_id)
-            uid = g["uid"]
-            name = g["name"]
-            
-            # Increment cooldown counter
-            uid_key = f"mine_cooldown_{uid}"
-            if uid_key not in mine_cooldown:
-                mine_cooldown[uid_key] = {"plays": 0, "reset_time": time.time() + 3600}
-            mine_cooldown[uid_key]["plays"] += 1
-            
-            if is_bomb:
-                g["status"] = "lost"
-                new_sc = update_score(cid, uid, name, -5)
-                
-                await q.edit_message_caption(
-                    caption=mine_build_text(g, 0) + f"\n\nBalance: {new_sc:,} Points",
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=build_mine_keyboard(gkey, g["bombs"], active=False, revealed=True, state=state)
-                )
-                mine_timers.pop(gkey, None)
-                mine_games.pop(gkey, None)
-            else:
-                g["revealed"][val] = True
-                total_safe = 6 - g["bombs"]
-                opened_count = sum(1 for x in g["revealed"] if x)
-                
-                if gkey in mine_timers:
-                    mine_timers[gkey]["remaining"] = 60
-                
-                if opened_count == total_safe:
-                    g["status"] = "won"
-                    new_sc = update_score(cid, uid, name, +10)
-                    
-                    await q.edit_message_caption(
-                        caption=mine_build_text(g, 0) + f"\n\nBalance: {new_sc:,} Points",
-                        parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=build_mine_keyboard(gkey, g["bombs"], active=False, revealed=True, state=state)
-                    )
-                    mine_timers.pop(gkey, None)
-                    mine_games.pop(gkey, None)
-                else:
-                    await q.edit_message_caption(
-                        caption=mine_build_text(g, mine_timers[gkey]["remaining"]),
-                        parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=build_mine_keyboard(gkey, g["bombs"], active=True, revealed=False, state=state, opened=g["revealed"])
-                    )
-        
-        elif action == "noop":
-            await q.answer("Already processed!")
-    
-    except Exception as e:
-        logger.error(f"[Mine Callback] {e}", exc_info=True)
-
-# ══════════════════════════════════════════════════════
-#  REMAINING FUNCTIONS (COPY FROM PREVIOUS)
-# ══════════════════════════════════════════════════════
-
-WIKI_UA = {"User-Agent": "BelugaBot/7.5"}
-G_HDR   = {"User-Agent": "Mozilla/5.0", "Accept-Language": "en-US"}
+WIKI_UA = {"User-Agent": "BelugaBot/7.6"}
+G_HDR   = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+           "Accept-Language": "en-US,en;q=0.9"}
 
 def wiki_summary(query: str) -> dict:
-    out = {"found": False, "title": "", "url": "", "intro": ""}
+    out = {"found": False, "title": "", "url": "", "intro": "", "sections": []}
     try:
         sr = requests.get("https://en.wikipedia.org/w/api.php",
-            params={"action":"query","list":"search","srsearch":query,"srlimit":1,"format":"json"},
+            params={"action":"query","list":"search","srsearch":query,"srlimit":5,"format":"json"},
             headers=WIKI_UA, timeout=10)
         hits = sr.json().get("query",{}).get("search",[])
         if not hits: return out
         best = hits[0]["title"]
         er = requests.get("https://en.wikipedia.org/w/api.php",
-            params={"action":"query","titles":best,"prop":"extracts","explaintext":"true","format":"json"},
-            headers=WIKI_UA, timeout=10)
+            params={"action":"query","titles":best,"prop":"extracts|info","inprop":"url",
+                    "explaintext":"true","exsectionformat":"wiki","format":"json"},
+            headers=WIKI_UA, timeout=15)
         for pid, page in er.json().get("query",{}).get("pages",{}).items():
-            if pid != "-1":
-                raw = page.get("extract","").strip()
-                if raw:
-                    out.update({"found":True,"title":best,"intro":raw[:800]})
-                break
+            if pid == "-1": continue
+            raw = page.get("extract","").strip()
+            url = page.get("fullurl", f"https://en.wikipedia.org/wiki/{urllib.parse.quote(best.replace(' ','_'))}")
+            if not raw: continue
+            parts = re.split(r"\n(==+)\s*(.+?)\s*\1\n", raw)
+            intro = parts[0].strip()
+            sections, i = [], 1
+            while i + 2 < len(parts):
+                st = parts[i+1].strip(); sb = parts[i+2].strip() if i+2 < len(parts) else ""
+                if sb and st not in ("See also","References","Further reading","External links"):
+                    sections.append({"h": st, "b": sb[:800]})
+                i += 3
+            out.update({"found":True,"title":best,"url":url,"intro":intro[:1200],"sections":sections[:8]})
+            break
     except Exception as e: logger.debug(f"[Wiki] {e}")
     return out
 
-def google_search(query: str) -> dict:
-    out = {"found": False, "ai_answer": "", "snippets": []}
+def duckduckgo_search(query: str) -> list[str]:
+    snippets = []
     try:
-        r = requests.get(f"https://www.google.com/search?q={urllib.parse.quote_plus(query)}",
+        r = requests.get(f"https://html.duckduckgo.com/html/?q={urllib.parse.quote_plus(query)}",
             headers=G_HDR, timeout=10)
-        if r.status_code == 200:
-            html = r.text
-            for pat in [r'data-attrid="wa:/description"[^>]*>.*?<span[^>]*>([^<]{30,500})']:
-                m = re.search(pat, html, re.DOTALL)
-                if m:
-                    c2 = clean_html(m.group(1))
-                    if len(c2) > 30: out["ai_answer"] = c2[:500]; break
-            out["found"] = bool(out["ai_answer"])
+        if r.status_code != 200: return snippets
+        html = r.text
+        seen = set()
+        for m in re.finditer(r'class="result__snippet"[^>]*>([\s\S]{30,400}?)</a', html, re.DOTALL):
+            t = clean_html(m.group(1))
+            if len(t) > 30 and t not in seen:
+                seen.add(t); snippets.append(t[:300])
+            if len(snippets) >= 4: break
+    except Exception as e: logger.debug(f"[DDG] {e}")
+    return snippets
+
+def google_search(query: str) -> dict:
+    out = {"found": False, "ai_answer": "", "featured": "", "snippets": []}
+    try:
+        r = requests.get(f"https://www.google.com/search?q={urllib.parse.quote_plus(query)}&num=8&hl=en",
+            headers=G_HDR, timeout=10)
+        if r.status_code != 200: return out
+        html = r.text
+        
+        for pat in [r'data-attrid="wa:/description"[^>]*>[\s\S]{0,200}?<span[^>]*>([^<]{40,800})',
+                    r'<div class="BNeawe s3v9rd AP7Wnd">([\s\S]{40,800}?)</div>']:
+            m = re.search(pat, html, re.DOTALL)
+            if m:
+                c2 = clean_html(m.group(1))
+                if len(c2) > 40: out["ai_answer"] = c2[:800]; break
+                
+        seen = set()
+        for m in re.finditer(r'class="[^"]*VwiC3b[^"]*"[^>]*>([\s\S]{40,350}?)</div', html, re.DOTALL):
+            t = clean_html(m.group(1))
+            if len(t) > 40 and t not in seen:
+                seen.add(t); out["snippets"].append(t[:300])
+            if len(out["snippets"]) >= 5: break
+            
+        out["found"] = bool(out["ai_answer"] or out["snippets"])
     except Exception as e: logger.debug(f"[Google] {e}")
     return out
 
-async def ai_summarise(query: str, wiki: dict, goog: dict) -> str:
+async def web_summarise(query: str, wiki: dict, goog: dict, system_prompt: str, max_tok: int = 500) -> str:
     ctx = []
-    if goog["ai_answer"]: ctx.append(f"Google: {goog['ai_answer']}")
-    if wiki["found"]: ctx.append(f"Wikipedia: {wiki['intro']}")
+    if goog["ai_answer"]: ctx.append(f"Google Featured Answer: {goog['ai_answer']}")
+    if goog["snippets"]:  ctx.append("Web snippets:\n" + "\n".join(f"- {s}" for s in goog["snippets"]))
+    if wiki["found"]:     ctx.append(f"Wikipedia Context ({wiki['title']}):\n{wiki['intro']}")
     if not ctx: return ""
-    return await ai("Smart assistant. Brief summary max 150 words.",
-        f"Query: {query}\n\nData: {chr(10).join(ctx)[:1500]}", "", max_tok=300)
+    return await ai(
+        system_prompt,
+        f"User question: {query}\n\nSearch facts & context:\n{chr(10).join(ctx)[:3000]}\n\nAnswer the user directly and concisely based on the above facts.",
+        "", max_tok=max_tok)
 
+# ══════════════════════════════════════════════════════
+#  /search
+# ══════════════════════════════════════════════════════
+async def search_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not u.message: return
+    try:
+        parts = u.message.text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await u.message.reply_text("🐱 Usage: `/search topic`", parse_mode=ParseMode.MARKDOWN); return
+        query = parts[1].strip()
+        cid = u.effective_chat.id
+        await safe_react(c.bot, cid, u.message.message_id, "🔍")
+        
+        sm = await u.message.reply_text("🔎 *Web Search*\n\nOperation: Initialization\nProgress: Gathering sources...", parse_mode=ParseMode.MARKDOWN)
+        await c.bot.send_chat_action(cid, "typing")
+        loop = asyncio.get_running_loop()
+        wiki, goog = await asyncio.gather(
+            loop.run_in_executor(None, wiki_summary, query),
+            loop.run_in_executor(None, google_search, query))
+        
+        try: await sm.edit_text("🔎 *Web Search*\n\nOperation: Summarization\nProgress: AI synthesizing results...", parse_mode=ParseMode.MARKDOWN)
+        except Exception: pass
+        
+        summary = await web_summarise(query, wiki, goog,
+            "Smart assistant. Write a clean concise summary. Max 250 words.")
+        
+        if summary:
+            await sm.edit_text(f"🔍 *{query}*\n\n{summary}",
+                parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+        else:
+            await sm.edit_text("😿 No results found.", parse_mode=ParseMode.MARKDOWN)
+        bot_status["message_count"] += 1
+    except Exception as e:
+        logger.error(f"[search] {e}", exc_info=True); bot_status["error_count"] += 1
+
+# ══════════════════════════════════════════════════════
+#  /bananalogic  — web-search powered Q&A
+# ══════════════════════════════════════════════════════
+async def bananalogic_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not u.message: return
+    try:
+        parts = u.message.text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await u.message.reply_text(
+                "🍌 *BananaLogic*\n\nAsk me anything!\n"
+                "Usage: `/bananalogic what is today's news in India`",
+                parse_mode=ParseMode.MARKDOWN)
+            return
+
+        query = parts[1].strip()
+        cid = u.effective_chat.id
+
+        await safe_react(c.bot, cid, u.message.message_id, "🍌")
+        
+        sm = await u.message.reply_text(
+            "🍌 *BananaLogic*\n\nOperation: AI Intelligence\nProgress: Scraping the web...", 
+            parse_mode=ParseMode.MARKDOWN)
+        
+        await c.bot.send_chat_action(cid, "typing")
+
+        loop = asyncio.get_running_loop()
+
+        wiki, goog = await asyncio.gather(
+            loop.run_in_executor(None, wiki_summary, query),
+            loop.run_in_executor(None, google_search, query))
+
+        # Secure Fallback
+        if not goog["found"] or not goog["snippets"]:
+            try:
+                ddg = await loop.run_in_executor(None, duckduckgo_search, query)
+                if ddg:
+                    goog["snippets"].extend(ddg[:3])
+                    goog["found"] = True
+            except Exception: pass
+
+        try:
+            await sm.edit_text(
+                "🍌 *BananaLogic*\n\nOperation: Generation\nProgress: Generating answer based on facts...", 
+                parse_mode=ParseMode.MARKDOWN)
+        except Exception: pass
+
+        answer = await web_summarise(query, wiki, goog, BANANA_PROMPT, max_tok=600)
+
+        if answer:
+            await sm.edit_text(
+                f"🍌 *BananaLogic*\n\n{answer}",
+                parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+        else:
+            await sm.edit_text(
+                "🍌 Hmm, couldn't find anything solid on that. Try rephrasing your question! 🐾", 
+                parse_mode=ParseMode.MARKDOWN)
+
+        bot_status["message_count"] += 1
+    except Exception as e:
+        logger.error(f"[bananalogic] {e}", exc_info=True)
+        bot_status["error_count"] += 1
+        try: await u.message.reply_text("🍌 Something went wrong. Try again in a moment! 🐾")
+        except Exception: pass
+
+# ══════════════════════════════════════════════════════
+#  MEDIA DOWNLOAD
+# ══════════════════════════════════════════════════════
 _MEDIA_RE = re.compile(
     r"https?://(?:www\.)?"
-    r"(?:instagram\.com/(?:p|reel|tv)/[A-Za-z0-9_\-]+|(?:youtu\.be|youtube\.com/(?:watch|shorts))[A-Za-z0-9?=&_\-]+)",
+    r"(?:"
+    r"instagram\.com/(?:p|reel|tv)/[A-Za-z0-9_\-]+"
+    r"|(?:youtu\.be|youtube\.com/(?:watch|shorts))[A-Za-z0-9?=&_\-]+"
+    r")",
     re.IGNORECASE
 )
 
@@ -1026,254 +631,661 @@ def _ydl_download(url: str, outdir: str) -> dict:
     try:
         import yt_dlp
     except ImportError:
-        return result
-
+        result["error"] = "yt_dlp not installed"; return result
     ydl_opts = {
-        "format": "best[filesize<45M]",
+        "format": "bestvideo[height<=2160][ext=mp4][filesize<45M]+bestaudio[ext=m4a]/best[height<=2160][filesize<45M]/best[filesize<45M]",
         "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "max_filesize": 45 * 1024 * 1024,
-        "socket_timeout": 30,
-        "retries": 5,
+        "quiet": True, "no_warnings": True, "noplaylist": True,
+        "max_filesize": 45 * 1024 * 1024, "socket_timeout": 30,
+        "retries": 5, "fragment_retries": 5, "concurrent_fragment_downloads": 8,
+        "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
     }
-
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            if not info: return result
-            
+            if not info: result["error"] = "No info"; return result
             result["title"] = (info.get("title") or "")[:80].strip()
-            
             found = None
             if os.path.exists(outdir):
-                files = sorted(os.listdir(outdir), key=lambda x: os.path.getmtime(os.path.join(outdir, x)), reverse=True)
-                for f in files:
-                    if f.endswith((".mp4", ".webm", ".jpg", ".png")):
+                for f in sorted(os.listdir(outdir),
+                                key=lambda x: os.path.getmtime(os.path.join(outdir, x)), reverse=True):
+                    if f.endswith((".mp4",".webm",".mkv",".mov",".m4v",".avi",
+                                  ".jpg",".jpeg",".png",".gif",".webp")):
                         fp = os.path.join(outdir, f)
-                        if os.path.getsize(fp) > 0:
-                            found = fp
-                            break
-            
-            if found:
-                ext = os.path.splitext(found)[1].lower()
-                ftype = "image" if ext in (".jpg", ".png") else "video"
-                result.update({"ok": True, "path": found, "type": ftype})
+                        if os.path.getsize(fp) > 0: found = fp; break
+            if not found: result["error"] = "No file"; return result
+            sz = os.path.getsize(found)
+            if sz == 0: result["error"] = "Empty"; return result
+            if sz > 45*1024*1024: result["error"] = "Too large"; return result
+            ext = os.path.splitext(found)[1].lower()
+            result.update({"ok": True, "path": found,
+                           "type": "image" if ext in (".jpg",".jpeg",".png",".gif",".webp") else "video"})
     except Exception as e:
-        pass
-
+        err_s = str(e).lower()
+        if any(x in err_s for x in ["private","login","age","unavailable","removed","suspended"]):
+            result["error"] = "unavailable"
+        else:
+            result["error"] = str(e)[:80]
     return result
 
 async def download_and_send(u: Update, c: ContextTypes.DEFAULT_TYPE, url: str):
     cid = u.effective_chat.id
-    if not _dl_rate_ok(str(cid)):
-        return
-
+    if not _dl_rate_ok(str(cid)): return
     url_l = url.lower()
     platform = "Instagram" if "instagram" in url_l else "YouTube"
-    
+    pemoji = "📸" if "instagram" in url_l else "▶️"
+    status_msg = None
+    try:
+        await c.bot.send_chat_action(cid, "upload_video")
+        status_msg = await u.message.reply_text(
+            f"⏳ *Operation: Media Fetch*\n*Progress: Downloading from {platform}...*", 
+            parse_mode=ParseMode.MARKDOWN)
+    except Exception: pass
     tmpdir = tempfile.mkdtemp(prefix="beluga_dl_")
     try:
         loop = asyncio.get_running_loop()
-        result = await asyncio.wait_for(
-            loop.run_in_executor(None, _ydl_download, url, tmpdir),
-            timeout=90.0)
-
-        if not result["ok"]:
-            return
-
-        caption = f"📹 *{platform}*\n_{result['title'][:60]}_" if result["title"] else f"📹 *{platform}*"
-
+        result = await asyncio.wait_for(loop.run_in_executor(None, _ydl_download, url, tmpdir), timeout=90.0)
+        if status_msg:
+            try: await status_msg.delete()
+            except Exception: pass
+        if not result["ok"]: return
+        caption = f"{pemoji} *{platform}*"
+        if result["title"]: caption += f"\n_{result['title'][:60]}_"
+        caption += "\n✅ _via Beluga_"
         with open(result["path"], "rb") as f:
             if result["type"] == "image":
                 await u.message.reply_photo(photo=f, caption=caption, parse_mode=ParseMode.MARKDOWN)
             else:
-                await u.message.reply_video(video=f, caption=caption, parse_mode=ParseMode.MARKDOWN, supports_streaming=True)
-
+                await u.message.reply_video(video=f, caption=caption,
+                    parse_mode=ParseMode.MARKDOWN, supports_streaming=True)
         bot_status["message_count"] += 1
+    except asyncio.TimeoutError:
+        if status_msg:
+            try: await status_msg.edit_text("⚠️ Operation: Media Fetch\nProgress: Timed out.")
+            except Exception: pass
+    except Exception as e: logger.error(f"[DL] {e}")
+    finally: shutil.rmtree(tmpdir, ignore_errors=True)
 
-    except Exception as e:
-        logger.error(f"[DL] {e}")
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-async def search_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    if not u.message: return
+# ══════════════════════════════════════════════════════
+#  /news — Google News India
+# ══════════════════════════════════════════════════════
+def scrape_google_news_india() -> list[dict]:
+    url = "https://news.google.com/rss?hl=en-IN&gl=IN&ceid=IN:en"
+    articles = []
     try:
-        parts = u.message.text.split(maxsplit=1)
-        if len(parts) < 2:
-            await u.message.reply_text("🐱 *Usage:* `/search topic`", parse_mode=ParseMode.MARKDOWN); return
-        query = parts[1].strip()
-        cid = u.effective_chat.id
-        await safe_react(c.bot, cid, u.message.message_id, "🔍")
-        sm = await u.message.reply_text("🔎 *Searching…*", parse_mode=ParseMode.MARKDOWN)
-        loop = asyncio.get_running_loop()
-        wiki, goog = await asyncio.gather(
-            loop.run_in_executor(None, wiki_summary, query),
-            loop.run_in_executor(None, google_search, query))
-        summary = await ai_summarise(query, wiki, goog)
-        try: await sm.delete()
-        except Exception: pass
-        if summary:
-            await u.message.reply_text(f"🔍 *{query}*\n\n{summary}", parse_mode=ParseMode.MARKDOWN)
-        else:
-            await u.message.reply_text("😿 No results.", parse_mode=ParseMode.MARKDOWN)
-        bot_status["message_count"] += 1
+        r = requests.get(url, headers=G_HDR, timeout=10)
+        if r.status_code == 200:
+            soup = BeautifulSoup(r.content, "xml")
+            items = soup.find_all("item")
+            for item in items:
+                title = item.find("title").text if item.find("title") else ""
+                link = item.find("link").text if item.find("link") else ""
+                desc = item.find("description").text if item.find("description") else ""
+                
+                # Try parsing out image if it exists in the HTML description, else fallback image
+                img_url = "https://i.postimg.cc/k4kX6bVp/Google-News-icon.png"
+                if desc:
+                    desc_soup = BeautifulSoup(desc, "html.parser")
+                    img = desc_soup.find("img")
+                    if img and img.get("src"):
+                        img_url = img.get("src")
+                        
+                if title and link:
+                    articles.append({
+                        "title": title.strip(),
+                        "link": link.strip(),
+                        "image": img_url
+                    })
+                if len(articles) >= 15:
+                    break
     except Exception as e:
-        logger.error(f"[search] {e}")
+        logger.error(f"[News Scraper Google News] {e}")
+    return articles
 
-QUIZ_TOPICS = ["ocean", "space", "history", "science", "animals"]
-FALLBACK_QS = [{"q":"What is 2+2?","opts":["3","4","5","6"],"ans":1,"fact":"Math is fun!"}]
+def _news_keyboard(index: int, total: int, news_link: str) -> InlineKeyboardMarkup:
+    prev_idx = (index - 1) % total
+    next_idx = (index + 1) % total
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔗 KNOW MORE", url=news_link)],
+        [
+            InlineKeyboardButton("🟩 ◀️ BACK", callback_data=f"news:nav:{prev_idx}"),
+            InlineKeyboardButton(f"📰 {index+1}/{total}", callback_data="news:noop"),
+            InlineKeyboardButton("NEXT ▶️ 🟩", callback_data=f"news:nav:{next_idx}")
+        ]
+    ])
+
+async def news_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not u.message: return
+    cid = u.effective_chat.id
+    await safe_react(c.bot, cid, u.message.message_id, "📰")
+    
+    sm = await u.message.reply_text(
+        "📰 *Google News (India)*\n\nOperation: News Retrieval\nProgress: Fetching fresh headlines...", 
+        parse_mode=ParseMode.MARKDOWN
+    )
+    
+    loop = asyncio.get_running_loop()
+    articles = await loop.run_in_executor(None, scrape_google_news_india)
+    
+    if not articles:
+        await sm.edit_text("😿 Unable to load latest news from Google News right now.", parse_mode=ParseMode.MARKDOWN)
+        return
+        
+    c.user_data["news_list"] = articles
+    
+    try: await sm.delete()
+    except Exception: pass
+        
+    art = articles[0]
+    caption = f"📰 *GOOGLE NEWS INDIA* • *TOP STORIES*\n\n{art['title']}"
+    await u.message.reply_photo(
+        photo=art["image"],
+        caption=caption,
+        reply_markup=_news_keyboard(0, len(articles), art["link"]),
+        parse_mode=ParseMode.MARKDOWN
+    )
+    bot_status["message_count"] += 1
+
+async def news_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q: return
+    try:
+        try: await q.answer()
+        except Exception: pass
+        
+        parts = q.data.split(":")
+        if len(parts) != 3 or parts[1] == "noop": return
+        
+        index = int(parts[2])
+        articles = context.user_data.get("news_list")
+        if not articles:
+            loop = asyncio.get_running_loop()
+            articles = await loop.run_in_executor(None, scrape_google_news_india)
+            if not articles: return
+            context.user_data["news_list"] = articles
+            
+        index = index % len(articles)
+        art = articles[index]
+        caption = f"📰 *GOOGLE NEWS INDIA* • *TOP STORIES*\n\n{art['title']}"
+        
+        await q.edit_message_media(
+            media=InputMediaPhoto(media=art["image"], caption=caption, parse_mode=ParseMode.MARKDOWN),
+            reply_markup=_news_keyboard(index, len(articles), art["link"])
+        )
+    except Exception as e:
+        logger.error(f"[news_callback] {e}")
+
+# ══════════════════════════════════════════════════════
+#  QUIZ
+# ══════════════════════════════════════════════════════
+QUIZ_TOPICS = ["deep ocean biology","quantum mechanics","human brain","solar system",
+               "animal behaviour","black holes","DNA genetics","ancient Egypt","World War 2"]
+FALLBACK_QS = [
+    {"q":"Which planet has most moons?","opts":["Jupiter","Saturn","Uranus","Neptune"],"ans":1,"fact":"Saturn: 146 moons!"},
+    {"q":"What covers 71% of Earth?","opts":["Land","Ice","Water","Air"],"ans":2,"fact":"Oceans!"},
+]
 
 def quiz_on_cooldown(cid: str, question: str) -> bool:
     return time.time() < quiz_cooldown.get(cid, {}).get(q_hash(question), 0)
 
 def mark_quiz(cid: str, question: str):
-    quiz_cooldown.setdefault(cid, {})[q_hash(question)] = time.time() + 3600
+    quiz_cooldown.setdefault(cid, {})
+    quiz_cooldown[cid] = {k:v for k,v in quiz_cooldown[cid].items() if v > time.time()}
+    quiz_cooldown[cid][q_hash(question)] = time.time() + 3600
 
 async def gen_quiz(topic: str, cid: str) -> Optional[dict]:
-    try:
-        raw = await ai("Trivia. ONLY JSON.",
-            f"Topic: '{topic}'\n" + '{"question":"...","options":["A","B","C","D"],"correct_index":0,"fun_fact":"..."}',
-            "", max_tok=200)
-        if raw:
+    for _ in range(2):
+        try:
+            raw = await ai("Trivia master. Output ONLY raw JSON.",
+                f"Topic: '{topic}'. Generate 1 MC question.\n"
+                '{"question":"...","options":["A","B","C","D"],"correct_index":0,"fun_fact":"..."}',
+                "", max_tok=200)
+            if not raw: continue
             m = re.search(r"\{[\s\S]+\}", raw)
-            if m:
-                d = json.loads(m.group(0))
-                if d.get("question") and len(d.get("options",[])) == 4:
-                    return d
-    except Exception:
-        pass
+            if not m: continue
+            d = json.loads(m.group(0))
+            q = str(d.get("question","")).strip()
+            opts = d.get("options",[])
+            idx = int(d.get("correct_index",0))
+            fact = str(d.get("fun_fact","Meow!")).strip()
+            if not q or len(opts) != 4 or not (0 <= idx <= 3): continue
+            if quiz_on_cooldown(cid, q): continue
+            return {"question":q,"options":opts,"correct_index":idx,"fun_fact":fact}
+        except Exception: pass
     return None
 
 async def quiz_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message: return
     try:
-        topic = random.choice(QUIZ_TOPICS)
-        cid = str(u.effective_chat.id)
-        await safe_react(c.bot, u.effective_chat.id, u.message.message_id, "💡")
-        sm = await u.message.reply_text("🎲 Generating…")
+        parts = u.message.text.split(maxsplit=1)
+        topic = parts[1].strip() if len(parts) > 1 and parts[1].strip() else random.choice(QUIZ_TOPICS)
+        cid = str(u.effective_chat.id); cid_i = u.effective_chat.id
+        await safe_react(c.bot, cid_i, u.message.message_id, "💡")
+        await c.bot.send_chat_action(cid_i, "typing")
+        sm = await u.message.reply_text("🎲 Operation: Quiz Generation\nProgress: Building context...")
         qdata = await gen_quiz(topic, cid)
         try: await sm.delete()
         except Exception: pass
         if qdata:
             mark_quiz(cid, qdata["question"])
             try:
-                await c.bot.send_poll(chat_id=u.effective_chat.id,
-                    question=f"🐱 {qdata['question'][:255]}",
-                    options=qdata["options"], type="quiz",
-                    correct_option_id=qdata.get("correct_index",0),
-                    is_anonymous=False, explanation=qdata.get("fun_fact",""))
-            except Exception:
-                pass
+                pm = await c.bot.send_poll(
+                    chat_id=cid_i, question=f"🐱 {qdata['question'][:255]}",
+                    options=[str(o)[:100] for o in qdata["options"]],
+                    type="quiz", correct_option_id=qdata["correct_index"],
+                    is_anonymous=False, explanation=qdata["fun_fact"][:200])
+                active_polls[pm.poll.id] = {"chat_id":cid_i,"correct_index":qdata["correct_index"]}
+                bot_status["message_count"] += 1; return
+            except Exception as e: logger.error(f"[Quiz] {e}")
+        fb = random.choice(FALLBACK_QS)
+        mark_quiz(cid, fb["q"])
+        pm = await c.bot.send_poll(
+            chat_id=cid_i, question=f"🐱 {fb['q']}",
+            options=fb["opts"], type="quiz", correct_option_id=fb["ans"],
+            is_anonymous=False, explanation=fb["fact"])
+        active_polls[pm.poll.id] = {"chat_id":cid_i,"correct_index":fb["ans"]}
         bot_status["message_count"] += 1
-    except Exception as e: logger.error(f"[quiz] {e}")
+    except Exception as e: logger.error(f"[quiz] {e}"); bot_status["error_count"] += 1
 
 async def poll_answer_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     try:
         ans = u.poll_answer
-        if ans and ans.option_ids:
-            cid = str(u.message.chat.id)
-            uid = str(ans.user.id)
-            update_score(cid, uid, ans.user.first_name or "?", +10)
-    except Exception:
-        pass
+        if not ans: return
+        info = active_polls.get(ans.poll_id)
+        if not info or not ans.option_ids or ans.option_ids[0] != info["correct_index"]: return
+        cid = str(info["chat_id"]); uid = str(ans.user.id)
+        name = (ans.user.first_name or "?")[:30]
+        await update_score(cid, uid, name, +10)
+    except Exception as e: logger.debug(f"[poll] {e}")
 
-MEDALS = ["🥇","🥈","🥉"]
+# ══════════════════════════════════════════════════════
+#  LEADERBOARD
+# ══════════════════════════════════════════════════════
+MEDALS = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
 
 async def lb_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    global lb_sync_cooldown
     if not u.message: return
     try:
         cid = str(u.effective_chat.id)
+        await check_and_load_group(cid)
+        
         local_scores = db.get("scores", {}).get(cid, {})
         lb = sorted(local_scores.values(), key=lambda x: x.get("score", 0), reverse=True)
+        
+        # Deduplicate users by their strict user_id just in case old db state is dirty
+        seen_ids = set()
+        clean_lb = []
+        for entry in lb:
+            if entry.get("user_id") not in seen_ids:
+                seen_ids.add(entry.get("user_id"))
+                clean_lb.append(entry)
+                
         lw = db.get("weekly", {}).get(cid, {})
-
         lines = []
         if lw and lw.get("top3"):
-            lines.append("🏆 LAST WEEK 🏆\n")
-            for i, e in enumerate(lw["top3"][:3]):
-                lines.append(f"{MEDALS[i] if i < 3 else '4.'} {e.get('name','?')} — {e.get('score',0):,} pts")
-            lines.append("\n")
-
-        lines.append("🏆 LEADERBOARD 🏆\n")
-        if lb:
-            for i, e in enumerate(lb[:10]):
-                lines.append(f"{MEDALS[i] if i < 3 else f'{i+1}.'} {e.get('name','?')[:15]} — {e.get('score', 0):,} pts")
+            lines.append("🏆 LAST WEEK CHAMPIONS 🏆\n")
+            for i, e in enumerate(lw["top3"]):
+                lines.append(f"{MEDALS[i]} {e.get('name','?')[:18]} — {e.get('score',0):,} pts")
+            lines.append("\n━━━━━━━━━━━━━━━━━━━━\n")
+        lines += ["╔════════════════════════════╗",
+                  "🏆  CURRENT LEADERBOARD  🏆",
+                  "╚════════════════════════════╝\n"]
+        if not clean_lb:
+            lines.append("No scores yet!")
         else:
-            lines.append("No scores yet")
-
+            for i, e in enumerate(clean_lb[:10]):
+                m = MEDALS[i] if i < len(MEDALS) else f"{i+1}."
+                lines.append(f"{m} {e.get('name','Unknown')[:18]:<18} {e.get('score',0):>6,} pts")
+        lines += ["\n━━━━━━━━━━━━━━━━━━━━",
+                  "➕ +10 quiz/ttt · +700 mine  ➖ -10 loss  ⭐ +50 GM"]
         text = "\n".join(lines)
         try:
             await u.message.reply_photo(photo=LB_IMAGE_URL, caption=text, parse_mode=ParseMode.MARKDOWN)
         except Exception:
             await u.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
-        now = time.time()
-        if now - lb_sync_cooldown > 30:
-            lb_sync_cooldown = now
-            loop = asyncio.get_running_loop()
-            asyncio.create_task(loop.run_in_executor(None, github_sync_db))
-
         bot_status["message_count"] += 1
-    except Exception as e: logger.error(f"[lb] {e}")
+    except Exception as e: logger.error(f"[lb] {e}", exc_info=True)
 
 async def nw_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    global db_needs_sync
-    if not u.message or not is_owner(u.effective_user.id if u.effective_user else 0):
-        return
+    if not u.message: return
     try:
+        if not is_owner(u.effective_user.id if u.effective_user else 0):
+            await u.message.reply_text("🚫 Owner only."); return
         cid = str(u.effective_chat.id)
-        local_scores = db.get("scores", {}).get(cid, {})
-        lb = sorted(local_scores.values(), key=lambda x: x.get("score", 0), reverse=True)
-        top3 = [{"name": e.get("name","?"), "score": e.get("score",0)} for e in lb[:3]]
-        db.setdefault("weekly", {})[cid] = {"top3": top3}
-        db["scores"][cid] = {}
-        db_needs_sync = True
-        await u.message.reply_text("🏆 New week! Scores reset.", parse_mode=ParseMode.MARKDOWN)
+        await check_and_load_group(cid)
+        
+        lb = sorted(db.get("scores",{}).get(cid,{}).values(), key=lambda x: x.get("score",0), reverse=True)
+        # Deduplicate before picking top 3
+        seen_ids = set()
+        clean_lb = []
+        for entry in lb:
+            if entry.get("user_id") not in seen_ids:
+                seen_ids.add(entry.get("user_id"))
+                clean_lb.append(entry)
+                
+        top3 = [{"name": e.get("name","?"), "score": e.get("score",0)} for e in clean_lb[:3]]
+        wk_label = datetime.now().strftime("%d %b %Y")
+        
+        db.setdefault("weekly",{})[cid] = {"top3": top3, "week_label": wk_label}
+        db["scores"][cid] = {} # Completely wipe other scores
+        db_needs_sync_groups.add(cid)
+        
+        announce = ["🏆🎉 *NEW WEEK!* 🎉🏆", f"\n_Week: {wk_label}_\n", "👑 *Champions:*\n"]
+        for i, e in enumerate(top3):
+            announce.append(f"{MEDALS[i]} *{e['name']}* — {e['score']:,} pts")
+        announce += ["\n🔄 *All scores reset!*", "🚀 _New battle begins!_"]
+        await u.message.reply_text("\n".join(announce), parse_mode=ParseMode.MARKDOWN)
         bot_status["message_count"] += 1
     except Exception as e: logger.error(f"[nw] {e}")
 
+# ══════════════════════════════════════════════════════
+#  /pump  /dump
+# ══════════════════════════════════════════════════════
 async def pump_dump_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    if not u.message or not is_owner(u.effective_user.id if u.effective_user else 0):
-        return
+    if not u.message: return
     try:
+        if not is_owner(u.effective_user.id if u.effective_user else 0):
+            await u.message.reply_text("🚫 Owner only."); return
         if not u.message.reply_to_message or not u.message.reply_to_message.from_user:
-            return
+            await u.message.reply_text("⚠️ Reply to a user."); return
         parts = u.message.text.split()
         if len(parts) < 2 or not parts[1].isdigit():
-            return
+            await u.message.reply_text("⚠️ Usage: `/pump 100`", parse_mode=ParseMode.MARKDOWN); return
         amount = int(parts[1])
-        cmd = parts[0].lstrip("/").lower()
+        cmd = parts[0].lstrip("/").lower().split("@")[0]
+        delta = +amount if cmd == "pump" else -amount
         target = u.message.reply_to_message.from_user
         cid = str(u.effective_chat.id)
-        new_sc = update_score(cid, str(target.id), (target.first_name or "User")[:30], amount if cmd == "pump" else -amount)
-        await u.message.reply_text(f"✅ {target.first_name}: {new_sc:,} pts", parse_mode=ParseMode.MARKDOWN)
+        
+        new_sc = await update_score(cid, str(target.id), (target.first_name or "User")[:30], delta)
+        emoji = "🚀" if cmd == "pump" else "📉"
+        sign = "+" if delta > 0 else ""
+        await u.message.reply_text(
+            f"{emoji} *{'PUMP' if cmd=='pump' else 'DUMP'}*\n\n"
+            f"👤 *{target.first_name}*\n"
+            f"{'📈' if delta>0 else '📉'} {sign}{amount:,} pts\n"
+            f"💰 New total: *{new_sc:,} pts*",
+            parse_mode=ParseMode.MARKDOWN)
         bot_status["message_count"] += 1
     except Exception as e: logger.error(f"[pump_dump] {e}")
 
+# ══════════════════════════════════════════════════════
+#  /mine GAME
+# ══════════════════════════════════════════════════════
+def _mine_setup_keyboard(gkey: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("3 Mines", callback_data=f"mine:set:{gkey}:3"),
+        InlineKeyboardButton("4 Mines", callback_data=f"mine:set:{gkey}:4"),
+        InlineKeyboardButton("5 Mines", callback_data=f"mine:set:{gkey}:5"),
+    ]])
+
+def _mine_board_keyboard(gkey: str, state: list, revealed: list, disabled: bool = False) -> InlineKeyboardMarkup:
+    rows = []
+    r = []
+    for i in range(6):
+        if disabled or revealed[i]:
+            if disabled:
+                label = "💣" if state[i] else ("✅" if revealed[i] else "⬜")
+            else:
+                label = "✅"
+            btn = InlineKeyboardButton(label, callback_data=f"mine:noop:{gkey}:{i}")
+        else:
+            btn = InlineKeyboardButton("📦", callback_data=f"mine:play:{gkey}:{i}")
+        r.append(btn)
+        if len(r) == 3:
+            rows.append(r); r = []
+    if r: rows.append(r)
+    return InlineKeyboardMarkup(rows)
+
+def mine_build_text(g: dict, rem: int) -> str:
+    bombs = g["bombs"]
+    opened_count = sum(1 for x in g["revealed"] if x)
+    total_safe = 6 - bombs
+    status = g.get("status", "playing")
+    if status == "timeout":
+        return "⏰ *Time Up!*\n\nYou took too long. Lost *-5 pts*."
+    elif status == "lost":
+        return "💥 *BOOM!* You hit a mine!\n\nLost *-5 pts*."
+    elif status == "won":
+        return f"🎉 *YOU WIN!*\n\nAll {total_safe} safe boxes found! Won *+700 pts*."
+    else:
+        return (f"💣 *MINESWEEPER*\n\n"
+                f"Find all safe boxes! Avoid the mines.\n"
+                f"Mines: {bombs}  |  Safe found: {opened_count}/{total_safe}\n"
+                f"⏱ Time left: `{rem}s`")
+
+async def mine_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not u.message: return
+    try:
+        cid = str(u.effective_chat.id)
+        uid = str(u.effective_user.id)
+        
+        # Checking Mine play limits and cooldown block
+        now = time.time()
+        m_stat = mine_play_stats.setdefault(uid, {"plays": 0, "block_until": 0})
+        if now < m_stat["block_until"]:
+            rem_m = max(1, int((m_stat["block_until"] - now) // 60))
+            await u.message.reply_text(f"⏳ *Cooldown Active!*\n\nYou've played too much! Let your paws rest. 🐾\nYou can play Minesweeper again in {rem_m} minutes.", parse_mode=ParseMode.MARKDOWN)
+            return
+            
+        m_stat["plays"] += 1
+        if m_stat["plays"] > 20:
+            m_stat["block_until"] = now + 3600
+            m_stat["plays"] = 0
+            await u.message.reply_text("🛑 *Minesweeper Limit Reached!*\n\nYou've hit the limit of 20 games! Taking a mandatory 1-hour break to recalibrate! 💥", parse_mode=ParseMode.MARKDOWN)
+            return
+
+        gkey = f"{cid}_{uid}_{int(now)}"
+        mine_games[gkey] = {
+            "uid": uid, "name": (u.effective_user.first_name or "Player")[:20],
+            "bombs": 0, "state": [], "revealed": [False]*6,
+            "chat_id": u.effective_chat.id, "msg_id": None, "status": "setting"
+        }
+        msg = await u.message.reply_photo(
+            photo=MINE_IMAGE_URL,
+            caption="💣 *MINESWEEPER*\n\nChoose number of mines:",
+            reply_markup=_mine_setup_keyboard(gkey),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        mine_games[gkey]["msg_id"] = msg.message_id
+        bot_status["message_count"] += 1
+    except Exception as e: logger.error(f"[mine] {e}")
+
+async def run_mine_timer(c: ContextTypes.DEFAULT_TYPE, gkey: str):
+    try:
+        while True:
+            await asyncio.sleep(5)
+            g = mine_games.get(gkey)
+            td = mine_timers.get(gkey)
+            if not g or not td or g.get("status") != "playing":
+                return
+            td["remaining"] = max(0, td["remaining"] - 5)
+            cid = g.get("chat_id")
+            msg_id = g.get("msg_id")
+            if not msg_id: return
+
+            if td["remaining"] <= 0:
+                g["status"] = "timeout"
+                cid_s = str(cid)
+                new_sc = await update_score(cid_s, g["uid"], g["name"], -5)
+                try:
+                    await c.bot.edit_message_caption(
+                        chat_id=cid, message_id=msg_id,
+                        caption=mine_build_text(g, 0) + f"\n\nBalance: *{new_sc:,} pts*",
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=_mine_board_keyboard(gkey, g["state"], g["revealed"], disabled=True)
+                    )
+                except Exception: pass
+                mine_timers.pop(gkey, None)
+                mine_games.pop(gkey, None)
+                return
+            else:
+                try:
+                    await c.bot.edit_message_caption(
+                        chat_id=cid, message_id=msg_id,
+                        caption=mine_build_text(g, td["remaining"]),
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=_mine_board_keyboard(gkey, g["state"], g["revealed"])
+                    )
+                except BadRequest as e:
+                    if "not modified" not in str(e).lower():
+                        logger.debug(f"[Mine Timer Edit] {e}")
+                except Exception: pass
+    except asyncio.CancelledError: pass
+    except Exception as e: logger.debug(f"[Mine Timer] {e}")
+
+async def mine_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q: return
+    try:
+        try: await q.answer()
+        except Exception: pass
+
+        parts = q.data.split(":")
+        if len(parts) < 4 or parts[0] != "mine":
+            return
+
+        action = parts[1]
+        gkey   = parts[2]
+        val    = int(parts[3])
+
+        if gkey not in mine_games:
+            return
+
+        g = mine_games[gkey]
+        if str(q.from_user.id) != g["uid"]:
+            await q.answer("This game isn't yours! 😅", show_alert=True)
+            return
+
+        if action == "noop":
+            return
+
+        if action == "set":
+            if g.get("status") != "setting":
+                return
+            bombs = max(3, min(5, val))
+            state = [True]*bombs + [False]*(6-bombs)
+            random.shuffle(state)
+            g.update({"bombs": bombs, "state": state, "status": "playing", "revealed": [False]*6})
+            mine_timers[gkey] = {"remaining": 60}
+            asyncio.create_task(run_mine_timer(context, gkey))
+            try:
+                await q.edit_message_caption(
+                    caption=mine_build_text(g, 60),
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=_mine_board_keyboard(gkey, state, g["revealed"])
+                )
+            except Exception as e:
+                logger.debug(f"[Mine set edit] {e}")
+
+        elif action == "play":
+            if g.get("status") != "playing":
+                return
+            if g["revealed"][val]:
+                return
+
+            state = g["state"]
+            is_bomb = state[val]
+            cid = str(q.message.chat_id)
+
+            if is_bomb:
+                g["status"] = "lost"
+                mine_timers.pop(gkey, None)
+                new_sc = await update_score(cid, g["uid"], g["name"], -5)
+                try:
+                    await q.edit_message_caption(
+                        caption=mine_build_text(g, 0) + f"\n\nBalance: *{new_sc:,} pts*",
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=_mine_board_keyboard(gkey, state, g["revealed"], disabled=True)
+                    )
+                except Exception as e:
+                    logger.debug(f"[Mine lost edit] {e}")
+                mine_games.pop(gkey, None)
+            else:
+                g["revealed"][val] = True
+                total_safe = 6 - g["bombs"]
+                opened_count = sum(1 for x in g["revealed"] if x)
+
+                if gkey in mine_timers:
+                    mine_timers[gkey]["remaining"] = 60
+
+                if opened_count >= total_safe:
+                    g["status"] = "won"
+                    mine_timers.pop(gkey, None)
+                    new_sc = await update_score(cid, g["uid"], g["name"], +700)
+                    try:
+                        await q.edit_message_caption(
+                            caption=mine_build_text(g, 0) + f"\n\nBalance: *{new_sc:,} pts*",
+                            parse_mode=ParseMode.MARKDOWN,
+                            reply_markup=_mine_board_keyboard(gkey, state, g["revealed"], disabled=True)
+                        )
+                    except Exception as e:
+                        logger.debug(f"[Mine won edit] {e}")
+                    mine_games.pop(gkey, None)
+                else:
+                    rem = mine_timers.get(gkey, {}).get("remaining", 60)
+                    try:
+                        await q.edit_message_caption(
+                            caption=mine_build_text(g, rem),
+                            parse_mode=ParseMode.MARKDOWN,
+                            reply_markup=_mine_board_keyboard(gkey, state, g["revealed"])
+                        )
+                    except BadRequest as e:
+                        if "not modified" not in str(e).lower():
+                            logger.debug(f"[Mine play edit] {e}")
+                    except Exception as e:
+                        logger.debug(f"[Mine play edit] {e}")
+
+    except Exception as e: logger.error(f"[mine_callback] {e}", exc_info=True)
+
+# ══════════════════════════════════════════════════════
+#  /gm — Daily Attendance
+# ══════════════════════════════════════════════════════
 def _build_gm_caption(users: list, date_str: str) -> str:
-    lines = ["📸 DAILY ATTENDANCE\n", f"📅 {date_str} | 👥 {len(users)}\n", "━━━━━━━━━━━━━━━━\n"]
-    for i, u in enumerate(users[-10:], 1):
-        lines.append(f"{i}. {u['name']} • {u['time']}")
-    lines.append("\n🎯 Press GM button to mark!")
+    lines = [
+        "📸 *DAILY ATTENDANCE*\n",
+        "🥱 Mark your attendance below!\n",
+        f"📅 {date_str}  |  👥 Present: {len(users)}\n",
+        "━━━━━━━━━━━━━━━━━━━━\n"
+    ]
+    display_users = users[-15:] if len(users) > 15 else users
+    if len(users) > 15:
+        lines.append(f"... and {len(users) - 15} more...\n")
+    for i, user in enumerate(display_users, 1):
+        lines.append(f"{i}. {user['name']} • {user['time']}")
+    lines += ["\n━━━━━━━━━━━━━━━━━━━━\n",
+              "🔥 Daily check-in = *+50 pts*",
+              "👇 Press GM to mark attendance!"]
     return "\n".join(lines)
 
 def _build_gm_keyboard(cid: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("GM 🥱", callback_data=f"gm:attend:{cid}")]])
 
 async def gm_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    if not u.message or not is_owner(u.effective_user.id if u.effective_user else 0):
-        return
+    if not u.message: return
     try:
+        if not is_owner(u.effective_user.id if u.effective_user else 0):
+            await u.message.reply_text("🚫 Owner only."); return
         cid = str(u.effective_chat.id)
         date_str = datetime.now().strftime("%d %b %Y")
+        msg = None
         try:
-            msg = await u.message.reply_photo(photo=GM_IMAGE_URL, caption=_build_gm_caption([], date_str), reply_markup=_build_gm_keyboard(cid))
-        except Exception:
-            msg = await u.message.reply_text(_build_gm_caption([], date_str), reply_markup=_build_gm_keyboard(cid))
+            msg = await u.message.reply_photo(
+                photo=GM_IMAGE_URL,
+                caption=_build_gm_caption([], date_str),
+                reply_markup=_build_gm_keyboard(cid),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception as e:
+            logger.debug(f"[GM photo failed] {e}")
+            try:
+                msg = await u.message.reply_text(
+                    text=_build_gm_caption([], date_str),
+                    reply_markup=_build_gm_keyboard(cid),
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            except Exception as e2:
+                logger.error(f"[GM text fallback failed] {e2}"); return
         gm_tracker[cid] = (msg.message_id, [], date_str)
         gm_msg_lock[cid] = asyncio.Lock()
         bot_status["message_count"] += 1
@@ -1290,51 +1302,111 @@ async def gm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             gm_msg_lock[cid] = asyncio.Lock()
         async with gm_msg_lock[cid]:
             if cid not in gm_tracker:
-                await q.answer("Expired")
-                return
+                await q.answer("⏰ Attendance session expired", show_alert=True); return
             msg_id, users, date_str = gm_tracker[cid]
             user = q.from_user
-            if any(uu.get("id") == str(user.id) for uu in users):
-                await q.answer("Already marked")
-                return
-            users.append({"id": str(user.id), "name": user.first_name[:15], "time": datetime.now().strftime("%H:%M")})
+            user_id = str(user.id)
+            utime = datetime.now().strftime("%H:%M")
+            already = next((uu for uu in users if uu.get("id") == user_id), None)
+            if already:
+                await q.answer(f"✅ Already marked at {already['time']}", show_alert=True); return
+            users.append({"id": user_id, "name": (user.first_name or "User")[:20], "time": utime})
             gm_tracker[cid] = (msg_id, users, date_str)
-            update_score(str(q.message.chat_id), str(user.id), user.first_name[:15], +50)
+            await update_score(str(q.message.chat_id), user_id, (user.first_name or "User")[:20], +50)
             try:
+                new_cap = _build_gm_caption(users, date_str)
                 if q.message.photo:
-                    await context.bot.edit_message_caption(chat_id=q.message.chat_id, message_id=msg_id, caption=_build_gm_caption(users, date_str), reply_markup=_build_gm_keyboard(cid))
+                    await context.bot.edit_message_caption(
+                        chat_id=q.message.chat_id, message_id=msg_id,
+                        caption=new_cap, reply_markup=_build_gm_keyboard(cid),
+                        parse_mode=ParseMode.MARKDOWN)
                 else:
-                    await context.bot.edit_message_text(chat_id=q.message.chat_id, message_id=msg_id, text=_build_gm_caption(users, date_str), reply_markup=_build_gm_keyboard(cid))
-                await q.answer("✅ +50 pts")
-            except Exception:
-                pass
+                    await context.bot.edit_message_text(
+                        chat_id=q.message.chat_id, message_id=msg_id,
+                        text=new_cap, reply_markup=_build_gm_keyboard(cid),
+                        parse_mode=ParseMode.MARKDOWN)
+                await q.answer("✅ Attendance marked! +50 pts", show_alert=False)
+            except BadRequest as e:
+                if "not modified" not in str(e).lower():
+                    logger.debug(f"[GM edit] {e}")
+                await q.answer("✅ Marked!", show_alert=False)
     except Exception as e: logger.error(f"[gm_callback] {e}")
 
-def register_player(uid: str, gkey: str):
-    user_in_game[uid] = gkey
-
-def release_player(uid: str):
-    user_in_game.pop(uid, None)
+# ══════════════════════════════════════════════════════
+#  GAME HELPERS
+# ══════════════════════════════════════════════════════
+def register_player(uid: str, gkey: str): user_in_game[uid] = gkey
+def release_player(uid: str): user_in_game.pop(uid, None)
 
 def player_busy(uid: str) -> bool:
-    return uid in user_in_game and user_in_game[uid] in ttt_games
+    gkey = user_in_game.get(uid)
+    if not gkey: return False
+    if gkey in ttt_games: return True
+    release_player(uid); return False
 
 async def cleanup_expired_games():
     now = time.time()
     for gkey in list(ttt_games.keys()):
         g = ttt_games[gkey]
         if now - g.get("created", now) > GAME_TIMEOUT:
-            for p in [g.get("x_id"), g.get("o_id")]:
-                release_player(str(p))
-            game_timers.pop(gkey, None)
-            del ttt_games[gkey]
+            release_player(str(g.get("x_id",""))); release_player(str(g.get("o_id","")))
+            game_timers.pop(gkey, None); del ttt_games[gkey]
 
+# ══════════════════════════════════════════════════════
+#  TTT TIMER
+# ══════════════════════════════════════════════════════
+async def run_game_timer(c: ContextTypes.DEFAULT_TYPE, gkey: str):
+    try:
+        while True:
+            await asyncio.sleep(5)
+            g = ttt_games.get(gkey)
+            td = game_timers.get(gkey)
+            if not g or not td or g.get("status") != "playing":
+                return
+            td["remaining"] = max(0, td["remaining"] - 5)
+            cid, msg_id = g.get("chat_id"), g.get("msg_id")
+            if not msg_id: return
+            if td["remaining"] <= 0:
+                loser_uid   = str(g["x_id"]) if g["turn"] == "X" else str(g["o_id"])
+                loser_name  = g["x_name"] if g["turn"] == "X" else g["o_name"]
+                winner_uid  = str(g["o_id"]) if g["turn"] == "X" else str(g["x_id"])
+                winner_name = g["o_name"] if g["turn"] == "X" else g["x_name"]
+                g["status"] = "timeout"; g["winner_name"] = winner_name
+                try:
+                    await c.bot.edit_message_text(
+                        chat_id=cid, message_id=msg_id,
+                        text=ttt_build_text(g), parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=ttt_build_keyboard(g["board"], disabled=True))
+                except Exception: pass
+                cid_s = str(cid)
+                if not g["vs_bot"]:
+                    await update_score(cid_s, winner_uid, winner_name, +10)
+                    await update_score(cid_s, loser_uid, loser_name, -10)
+                release_player(str(g["x_id"])); release_player(str(g["o_id"]))
+                game_timers.pop(gkey, None); ttt_games.pop(gkey, None)
+                return
+            else:
+                try:
+                    await c.bot.edit_message_text(
+                        chat_id=cid, message_id=msg_id,
+                        text=ttt_build_text(g), parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=ttt_build_keyboard(g["board"]))
+                except BadRequest as e:
+                    if "not modified" not in str(e).lower():
+                        logger.debug(f"[TTT timer edit] {e}")
+                except Exception: pass
+    except asyncio.CancelledError: pass
+    except Exception as e: logger.debug(f"[TTT Timer] {e}")
+
+# ══════════════════════════════════════════════════════
+#  TIC TAC TOE
+# ══════════════════════════════════════════════════════
 TTT_EMPTY = "⬜"; TTT_X = "❌"; TTT_O = "⭕"
 WINS = [(0,1,2),(3,4,5),(6,7,8),(0,3,6),(1,4,7),(2,5,8),(0,4,8),(2,4,6)]
 
 def ttt_check_winner(board: list) -> Optional[str]:
-    for a,b,c in WINS:
-        if board[a] == board[b] == board[c] and board[a] != TTT_EMPTY:
+    for a,b,cc in WINS:
+        if board[a] == board[b] == board[cc] and board[a] != TTT_EMPTY:
             return board[a]
     return None
 
@@ -1352,23 +1424,20 @@ def _minimax(board: list, is_max: bool, alpha: int, beta: int) -> int:
         board[i] = TTT_O if is_max else TTT_X
         score = _minimax(board, not is_max, alpha, beta)
         board[i] = TTT_EMPTY
-        best = max(best, score) if is_max else min(best, score)
-        alpha = max(alpha, best) if is_max else alpha
-        beta = min(beta, best) if not is_max else beta
+        if is_max: best = max(best, score); alpha = max(alpha, best)
+        else:       best = min(best, score); beta  = min(beta, best)
         if beta <= alpha: break
     return best
 
 def ttt_bot_move(board: list) -> int:
-    best_score = -1000
+    best_score = -1000; best_move = -1
     for i in range(9):
         if board[i] != TTT_EMPTY: continue
         board[i] = TTT_O
         score = _minimax(board, False, -1000, 1000)
         board[i] = TTT_EMPTY
-        if score > best_score:
-            best_score = score
-            best_move = i
-    return best_move if best_score > -1000 else -1
+        if score > best_score: best_score = score; best_move = i
+    return best_move
 
 def ttt_build_keyboard(board: list, disabled: bool = False) -> InlineKeyboardMarkup:
     rows = []
@@ -1378,7 +1447,7 @@ def ttt_build_keyboard(board: list, disabled: bool = False) -> InlineKeyboardMar
             idx = row*3 + col
             cell = board[idx]
             cb = f"ttt:noop:{idx}" if (cell != TTT_EMPTY or disabled) else f"ttt:move:{idx}"
-            r.append(InlineKeyboardButton(cell if cell != TTT_EMPTY else TTT_EMPTY, callback_data=cb))
+            r.append(InlineKeyboardButton(cell, callback_data=cb))
         rows.append(r)
     return InlineKeyboardMarkup(rows)
 
@@ -1387,215 +1456,295 @@ def ttt_build_text(g: dict) -> str:
     turn = g["turn"]; status = g.get("status","playing")
     gkey = f"{g['chat_id']}:{g.get('msg_id','')}"
     td = game_timers.get(gkey, {})
-    rem = td.get("remaining", 60)
+    rem = td.get("remaining", TIMER_DURATION)
+    tsec = f"{rem//60:02d}:{rem%60:02d}"
     board = g["board"]
     rows = [" ".join(board[r*3+col] for col in range(3)) for r in range(3)]
-    
+    board_str = "\n".join(rows)
     if status == "playing":
-        sl = f"🎯 *{(x_name if turn=='X' else o_name)}'s Turn*\n⏱ `{rem}s`"
+        cur = x_name if turn == "X" else o_name
+        sym = TTT_X if turn == "X" else TTT_O
+        sl = f"🎯 *{cur}'s turn* {sym}  ⏱ `{tsec}`"
     elif status == "timeout":
-        sl = f"⏰ *Time Up!*\n🏆 {g.get('winner_name','')} +10"
+        loser = g["x_name"] if g["turn"] == "X" else g["o_name"]
+        sl = f"⏰ *Time up!*\n🏆 *{g.get('winner_name','')}* wins! +10 pts\n📉 *{loser}* -10 pts"
     elif status == "draw":
-        sl = "🤝 *Draw!*"
+        sl = "🤝 *Draw!* No points awarded."
     else:
-        sl = f"🏆 {g.get('winner_name','')} +10"
-    
-    return f"🎮 TIC TAC TOE\n━━━━\n{x_name} 🆚 {o_name}\n━━━━\n\n" + "\n".join(rows) + f"\n\n━━━━\n{sl}"
+        loser = g["o_name"] if g.get("winner_name") == g["x_name"] else g["x_name"]
+        sl = f"🏆 *{g.get('winner_name','')}* wins! +10 pts\n📉 *{loser}* -10 pts"
+    return (f"🎮 *TIC TAC TOE*\n━━━━━━━━━━━━━━\n"
+            f"❌ {x_name}  🆚  ⭕ {o_name}\n━━━━━━━━━━━━━━\n\n"
+            f"{board_str}\n\n━━━━━━━━━━━━━━\n{sl}")
 
 def _ready_keyboard(gkey: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("READY 🔥", callback_data=f"ttt_ready:{gkey}")]])
 
 def _ready_text(g: dict) -> str:
-    x_ready = g.get("x_ready", False)
-    o_ready = g.get("o_ready", False)
-    return f"🎮 WAITING\n{g['x_name']}: {'✅' if x_ready else '⏳'}\n{g['o_name']}: {'✅' if o_ready else '⏳'}"
+    return (f"🎮 *TIC TAC TOE — LOBBY*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"❌ {g['x_name']}: {'✅ READY' if g.get('x_ready') else '⏳ Waiting'}\n"
+            f"⭕ {g['o_name']}: {'✅ READY' if g.get('o_ready') else '⏳ Waiting'}\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n_Both press READY to start!_ ⚔️")
 
 async def tictac_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message: return
     try:
         await cleanup_expired_games()
         ua = u.effective_user; cid = u.effective_chat.id
-        vs_bot = True; user_b_id = None
-        
-        if u.message.reply_to_message and u.message.reply_to_message.from_user and not u.message.reply_to_message.from_user.is_bot:
-            vs_bot = False
-            user_b_id = u.message.reply_to_message.from_user.id
-            if player_busy(str(user_b_id)):
-                await u.message.reply_text("⚠️ Player busy!")
-                return
-        
-        if player_busy(str(ua.id)):
-            await u.message.reply_text("⚠️ You're busy!")
-            return
-        
+        uid_a = str(ua.id); name_a = (ua.first_name or "Player")[:20]
+        vs_bot = True; user_b_id = None; name_b = "🤖 Bot"
+
+        if u.message.reply_to_message and u.message.reply_to_message.from_user:
+            rb = u.message.reply_to_message.from_user
+            if not rb.is_bot:
+                vs_bot = False; user_b_id = rb.id
+                name_b = (rb.first_name or "Player2")[:20]
+                if player_busy(str(rb.id)): await u.message.reply_text("⚠️ That player is already in a game!"); return
+
+        if player_busy(uid_a): await u.message.reply_text("⚠️ You're already in a game!"); return
+
         board = [TTT_EMPTY] * 9
         g = {
-            "board": board, "turn": "X", "x_id": ua.id, "x_name": (ua.first_name or "P1")[:15],
-            "o_id": user_b_id, "o_name": (u.message.reply_to_message.from_user.first_name if not vs_bot else "🤖")[:15],
+            "board": board, "turn": "X", "x_id": ua.id, "x_name": name_a,
+            "o_id": user_b_id if not vs_bot else -1, "o_name": name_b,
             "vs_bot": vs_bot, "status": "waiting" if not vs_bot else "playing",
-            "created": time.time(), "chat_id": cid, "msg_id": None, "x_ready": False, "o_ready": False,
+            "created": time.time(), "chat_id": cid, "msg_id": None,
+            "x_ready": False, "o_ready": False,
         }
-        
-        if vs_bot:
-            msg = await u.message.reply_text(ttt_build_text(g), parse_mode=ParseMode.MARKDOWN, reply_markup=ttt_build_keyboard(board))
-        else:
-            gkey_temp = f"{cid}:temp_{int(time.time())}"
-            msg = await u.message.reply_text(_ready_text(g), parse_mode=ParseMode.MARKDOWN, reply_markup=_ready_keyboard(gkey_temp))
-        
-        g["msg_id"] = msg.message_id
-        gkey = game_key(msg.message_id, cid)
-        ttt_games[gkey] = g
-        game_timers[gkey] = {"remaining": 60}
-        register_player(str(ua.id), gkey)
-        if not vs_bot: register_player(str(user_b_id), gkey)
-        if vs_bot or not vs_bot:
-            asyncio.create_task(run_game_timer(c, gkey))
-        bot_status["message_count"] += 1
-    except Exception as e: logger.error(f"[tictac] {e}")
 
-async def run_game_timer(c: ContextTypes.DEFAULT_TYPE, gkey: str):
-    try:
-        while True:
-            await asyncio.sleep(3)
-            g = ttt_games.get(gkey)
-            td = game_timers.get(gkey)
-            if not g or not td or g.get("status") != "playing":
-                return
-            td["remaining"] = max(0, td["remaining"] - 3)
-            if td["remaining"] <= 0:
-                loser_uid = str(g["x_id"]) if g["turn"] == "X" else str(g["o_id"])
-                loser_name = g["x_name"] if g["turn"] == "X" else g["o_name"]
-                winner_name = g["o_name"] if g["turn"] == "X" else g["x_name"]
-                g["status"] = "timeout"
-                g["winner_name"] = winner_name
-                if not g["vs_bot"]:
-                    update_score(str(g["chat_id"]), str(g["x_id"] if g["turn"]!="X" else g["o_id"]), winner_name, +10)
-                    update_score(str(g["chat_id"]), loser_uid, loser_name, -10)
-                try:
-                    await c.bot.edit_message_text(chat_id=g["chat_id"], message_id=g["msg_id"],
-                        text=ttt_build_text(g), parse_mode=ParseMode.MARKDOWN, reply_markup=ttt_build_keyboard(g["board"], disabled=True))
-                except Exception: pass
-                release_player(str(g["x_id"]))
-                release_player(str(g["o_id"]))
-                game_timers.pop(gkey, None)
-                ttt_games.pop(gkey, None)
-                return
-    except asyncio.CancelledError: pass
-    except Exception as e: logger.debug(f"[Timer] {e}")
+        if vs_bot:
+            msg = await u.message.reply_text(ttt_build_text(g),
+                parse_mode=ParseMode.MARKDOWN, reply_markup=ttt_build_keyboard(board))
+            g["status"] = "playing"
+            g["msg_id"] = msg.message_id
+            gkey = game_key(msg.message_id, cid)
+            ttt_games[gkey] = g
+            game_timers[gkey] = {"remaining": TIMER_DURATION}
+            register_player(uid_a, gkey)
+            asyncio.create_task(run_game_timer(c, gkey))
+        else:
+            msg = await u.message.reply_text(_ready_text(g),
+                parse_mode=ParseMode.MARKDOWN, reply_markup=_ready_keyboard(f"temp_{int(time.time())}"))
+            g["msg_id"] = msg.message_id
+            gkey = game_key(msg.message_id, cid)
+            ttt_games[gkey] = g
+            register_player(uid_a, gkey)
+            register_player(str(user_b_id), gkey)
+
+        bot_status["message_count"] += 1
+    except Exception as e:
+        logger.error(f"[tictac] {e}", exc_info=True); bot_status["error_count"] += 1
 
 async def ttt_ready_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q: return
     try:
-        await q.answer()
-        parts = q.data.split(":")
-        if len(parts) < 2 or parts[0] != "ttt_ready": return
+        try: await q.answer()
+        except Exception: pass
+        
         cid = q.message.chat_id
-        gkey = game_key(q.message.message_id, cid)
+        mid = q.message.message_id
+        gkey = game_key(mid, cid)
         g = ttt_games.get(gkey)
         if not g or g.get("status") != "waiting": return
+
         uid = str(q.from_user.id)
-        if uid == str(g["x_id"]): g["x_ready"] = True
-        elif uid == str(g["o_id"]): g["o_ready"] = True
-        else: return
+        if uid == str(g["x_id"]):       g["x_ready"] = True
+        elif uid == str(g["o_id"]):     g["o_ready"] = True
+        else: await q.answer("❌ You're not in this game!", show_alert=True); return
+
         if g["x_ready"] and g["o_ready"]:
             g["status"] = "playing"
-            await q.edit_message_text(text=ttt_build_text(g), parse_mode=ParseMode.MARKDOWN, reply_markup=ttt_build_keyboard(g["board"]))
+            game_timers[gkey] = {"remaining": TIMER_DURATION}
+            try:
+                await q.edit_message_text(text=ttt_build_text(g),
+                    parse_mode=ParseMode.MARKDOWN, reply_markup=ttt_build_keyboard(g["board"]))
+            except Exception: pass
             asyncio.create_task(run_game_timer(context, gkey))
         else:
-            await q.edit_message_text(text=_ready_text(g), parse_mode=ParseMode.MARKDOWN, reply_markup=_ready_keyboard(gkey))
+            try:
+                await q.edit_message_text(text=_ready_text(g),
+                    parse_mode=ParseMode.MARKDOWN, reply_markup=_ready_keyboard(gkey))
+            except BadRequest as e:
+                if "not modified" not in str(e).lower(): logger.debug(f"[ttt_ready edit] {e}")
     except Exception as e: logger.error(f"[ttt_ready] {e}")
 
 async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q: return
     try:
-        await q.answer()
+        try: await q.answer()
+        except Exception: pass
+
         parts = q.data.split(":")
         if len(parts) != 3 or parts[0] != "ttt": return
-        action, idx = parts[1], int(parts[2])
-        cid, mid = q.message.chat_id, q.message.message_id
+
+        action = parts[1]; idx = int(parts[2])
+        cid = q.message.chat_id; mid = q.message.message_id
         gkey = game_key(mid, cid)
         g = ttt_games.get(gkey)
-        if not g or g["status"] != "playing": return
-        if action == "noop": return
+
+        if not g or g["status"] != "playing" or action == "noop": return
+
         uid = str(q.from_user.id)
-        if g["turn"] == "X" and uid != str(g["x_id"]): return
-        if g["turn"] == "O" and not g["vs_bot"] and uid != str(g["o_id"]): return
-        if gkey in game_timers: game_timers[gkey]["remaining"] = 60
+        valid_x = uid == str(g["x_id"])
+        valid_o = uid == str(g["o_id"]) or (g["vs_bot"] and valid_x)
+        is_part  = uid in [str(g["x_id"]), str(g["o_id"])]
+
+        if g["turn"] == "X" and not valid_x:
+            if is_part: await q.answer("Not your turn!", show_alert=True)
+            return
+        if g["turn"] == "O" and not g["vs_bot"] and not valid_o:
+            if is_part: await q.answer("Not your turn!", show_alert=True)
+            return
+
         board = g["board"]
+        if board[idx] != TTT_EMPTY: return 
+
+        if gkey in game_timers:
+            game_timers[gkey]["remaining"] = TIMER_DURATION
+
         board[idx] = TTT_X if g["turn"] == "X" else TTT_O
         ws = ttt_check_winner(board)
-        if ws or ttt_is_draw(board):
-            if ws:
-                wname = g["x_name"] if ws == TTT_X else g["o_name"]
-                wuid = str(g["x_id"]) if ws == TTT_X else str(g["o_id"])
-                lname = g["o_name"] if ws == TTT_X else g["x_name"]
-                luid = str(g["o_id"]) if ws == TTT_X else str(g["x_id"])
-                g["winner_name"] = wname
+
+        async def _end_game(winner_sym=None):
+            if winner_sym:
+                wname = g["x_name"] if winner_sym == TTT_X else g["o_name"]
+                wuid  = str(g["x_id"]) if winner_sym == TTT_X else str(g["o_id"])
+                lname = g["o_name"] if winner_sym == TTT_X else g["x_name"]
+                luid  = str(g["o_id"]) if winner_sym == TTT_X else str(g["x_id"])
+                g["status"] = "win"; g["winner_name"] = wname
+                cid_s = str(cid)
                 if not g["vs_bot"]:
-                    update_score(str(cid), wuid, wname, +10)
-                    update_score(str(cid), luid, lname, -10)
-                elif ws == TTT_X:
-                    update_score(str(cid), wuid, wname, +10)
-            g["status"] = "draw" if ttt_is_draw(board) else "win"
+                    await update_score(cid_s, wuid, wname, +10)
+                    await update_score(cid_s, luid, lname, -10)
+                elif winner_sym == TTT_X:
+                    await update_score(cid_s, wuid, wname, +10)
+            else:
+                g["status"] = "draw"
             game_timers.pop(gkey, None)
-            release_player(str(g["x_id"]))
-            release_player(str(g["o_id"]))
+            release_player(str(g["x_id"])); release_player(str(g["o_id"]))
             ttt_games.pop(gkey, None)
-            await q.edit_message_text(text=ttt_build_text(g), parse_mode=ParseMode.MARKDOWN, reply_markup=ttt_build_keyboard(board, disabled=True))
+
+        if ws:
+            await _end_game(ws)
+            try:
+                await q.edit_message_text(ttt_build_text(g), parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=ttt_build_keyboard(board, disabled=True))
+            except Exception: pass
             return
+
+        if ttt_is_draw(board):
+            await _end_game()
+            try:
+                await q.edit_message_text(ttt_build_text(g), parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=ttt_build_keyboard(board, disabled=True))
+            except Exception: pass
+            return
+
         g["turn"] = "O" if g["turn"] == "X" else "X"
+
         if g["vs_bot"] and g["turn"] == "O":
             bi = ttt_bot_move(board)
             if bi >= 0:
                 board[bi] = TTT_O
-                if ttt_check_winner(board):
-                    g["status"] = "win"
-                    g["winner_name"] = g["o_name"]
-                    update_score(str(cid), str(g["x_id"]), g["x_name"], -10)
-                    game_timers.pop(gkey, None)
-                    release_player(str(g["x_id"]))
-                    ttt_games.pop(gkey, None)
-                    await q.edit_message_text(text=ttt_build_text(g), parse_mode=ParseMode.MARKDOWN, reply_markup=ttt_build_keyboard(board, disabled=True))
+                ws2 = ttt_check_winner(board)
+                if ws2:
+                    await _end_game(ws2)
+                    try:
+                        await q.edit_message_text(ttt_build_text(g), parse_mode=ParseMode.MARKDOWN,
+                            reply_markup=ttt_build_keyboard(board, disabled=True))
+                    except Exception: pass
+                    return
+                if ttt_is_draw(board):
+                    await _end_game()
+                    try:
+                        await q.edit_message_text(ttt_build_text(g), parse_mode=ParseMode.MARKDOWN,
+                            reply_markup=ttt_build_keyboard(board, disabled=True))
+                    except Exception: pass
                     return
                 g["turn"] = "X"
-        await q.edit_message_text(text=ttt_build_text(g), parse_mode=ParseMode.MARKDOWN, reply_markup=ttt_build_keyboard(board))
-    except Exception as e: logger.error(f"[ttt_cb] {e}")
 
+        try:
+            await q.edit_message_text(ttt_build_text(g), parse_mode=ParseMode.MARKDOWN,
+                reply_markup=ttt_build_keyboard(board))
+        except BadRequest as e:
+            if "not modified" not in str(e).lower(): logger.debug(f"[ttt edit] {e}")
+        except Exception as e: logger.debug(f"[ttt edit] {e}")
+
+    except Exception as e: logger.error(f"[ttt_cb] {e}", exc_info=True)
+
+# ══════════════════════════════════════════════════════
+#  FUN COMMANDS
+# ══════════════════════════════════════════════════════
 async def fun_dispatcher(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message: return
     try:
         cid = str(u.effective_chat.id)
+        await check_and_load_group(cid)
+        
         cmd = u.message.text.lower().split()[0].lstrip("/").split("@")[0]
         users = list(db.get("seen",{}).get(cid,{}).values())
-        if len(users) < (2 if cmd == "couple" else 1): return
-        if cmd == "couple":
-            m = random.sample(users, 2)
-            res = f"💖 *{m[0]['n']}* 💞 *{m[1]['n']}* 100%"
+        if len(users) < (2 if cmd == "couple" else 1): await u.message.reply_text("Need more members first!"); return
+        
+        day = datetime.now().strftime("%y-%m-%d"); lk = f"{cid}:{cmd}"
+        
+        # 24h Lock mechanism
+        locks = db.setdefault("locks", {}).setdefault(cid, {})
+        if lk in locks and locks[lk]["date"] == day:
+            res = locks[lk]["res"]
         else:
-            m = [random.choice(users)]
-            res = f"🌈 *{m[0]['n']}* IS SUPER GAY! 🌈"
+            if cmd == "couple":
+                m = random.sample(users, 2)
+                res = f"💖 *{m[0]['n']}* 💞 *{m[1]['n']}*\n100% compatible today!"
+            else:
+                m = [random.choice(users)]
+                res = f"🌈 *{m[0]['n']}* is today's rainbow! 🌈"
+            locks[lk] = {"date": day, "res": res}
+            db_needs_sync_groups.add(cid)
+            
         await u.message.reply_text(res, parse_mode=ParseMode.MARKDOWN)
         bot_status["message_count"] += 1
     except Exception as e: logger.error(f"[fun] {e}")
 
+# ══════════════════════════════════════════════════════
+#  /start
+# ══════════════════════════════════════════════════════
 async def start_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message: return
     try:
         text = (
-            "✨ 🐱 *BELUGA BOT v7.5* 🐱 ✨\n\n"
-            "🎮 `/tictac` ❌🆚⭕ | `/mine` 💣 | `/quiz` 🎲\n"
-            "📰 `/news` Latest News | 🍌 `/bananalogic` Ask Google\n"
-            "🔍 `/search` Smart Search | 🏆 `/lb` Leaderboard\n"
-            "🎉 `/gay` `/couple` Fun | 👑 `/gm` Attendance\n\n"
-            "💬 Mention 'beluga' for AI chat!\n"
-            "📹 YT/Instagram auto-download"
+            "✨✨✨✨✨✨✨✨✨✨✨✨✨✨\n"
+            "     🐱 BELUGA BOT v7.6.1 🐱\n"
+            "✨✨✨✨✨✨✨✨✨✨✨✨✨✨\n\n"
+            "Hi! I'm Beluga 🐾 Your friendly cat from Team Oldy Crypto!\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "🎮 *GAMES*\n"
+            "`/tictac` — Tic Tac Toe (PvP or vs Bot)\n"
+            "`/mine` — Minesweeper\n\n"
+            "🧠 *SEARCH & NEWS*\n"
+            "`/news` — Google News (India) 📰\n"
+            "`/quiz` — Trivia Quiz\n"
+            "`/search` — Web Search\n"
+            "`/bananalogic` — Ask me anything! 🍌\n\n"
+            "🏆 *COMPETE*\n"
+            "`/lb` — Leaderboard\n"
+            "`/nw` — New Week (Owner)\n\n"
+            "🎉 *FUN*\n"
+            "`/gay`  `/couple` — Daily Fun\n\n"
+            "👑 *GROUP*\n"
+            "`/gm` — Daily Attendance (Owner)\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🔥 *Scoring:* +10 win · -10 loss · +50 GM · +700 mine\n"
+            "_Just mention me to chat anytime!_ 🐾"
         )
         await u.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
         bot_status["message_count"] += 1
     except Exception as e: logger.error(f"[start] {e}")
 
+# ══════════════════════════════════════════════════════
+#  CV PHOTO HANDLER
+# ══════════════════════════════════════════════════════
 async def photo_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message or not u.message.photo: return
     try:
@@ -1603,15 +1752,19 @@ async def photo_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         if "beluga" not in caption: return
         await c.bot.send_chat_action(u.effective_chat.id, "typing")
         photo_file = await u.message.photo[-1].get_file()
+        file_url = photo_file.file_path
         loop = asyncio.get_running_loop()
         res = await asyncio.wait_for(
-            loop.run_in_executor(None, _groq_vision_sync, 
-            "Describe this image creatively in 1 sentence.", photo_file.file_path, caption), timeout=25)
-        if res:
-            await u.message.reply_text(res)
+            loop.run_in_executor(None, _groq_vision_sync,
+            "You are Beluga, a smart friendly female cat. Describe the image naturally and helpfully.",
+            file_url, caption), timeout=25)
+        await u.message.reply_text(res if res else "Hmm, I can't quite make that out! 🐾")
         bot_status["message_count"] += 1
     except Exception as e: logger.error(f"[photo] {e}")
 
+# ══════════════════════════════════════════════════════
+#  MONITOR
+# ══════════════════════════════════════════════════════
 async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message or not u.effective_user or u.effective_user.is_bot: return
     try:
@@ -1623,119 +1776,176 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
             try: await u.message.delete()
             except Exception: pass
             return
-        db.setdefault("seen",{}).setdefault(cid,{})[str(uid)] = {"id": uid, "un": u.effective_user.username, "n": u.effective_user.first_name or "User"}
-        db.setdefault("counts",{})[cid] = db["counts"].get(cid, 0) + 1
-        
+
+        # Simple activity tracker
+        db.setdefault("seen",{}).setdefault(cid,{})[str(uid)] = {
+            "id": uid, "un": u.effective_user.username, "n": u.effective_user.first_name or "User",
+        }
+        counts = db.setdefault("counts", {})
+        counts[cid] = counts.get(cid, 0) + 1
+        if counts[cid] % 6 == 0:
+            await safe_react(c.bot, u.effective_chat.id, u.message.message_id)
+
         text = (u.message.text or u.message.caption or "").strip()
         text_low = text.lower()
-        
+
         media_m = _MEDIA_RE.search(text)
         if media_m:
             asyncio.create_task(download_and_send(u, c, media_m.group(0)))
-        
+
         bot_username = bot_status.get("username", "")
-        if text and ("beluga" in text_low or (bot_username and bot_username in text_low) or (u.message.reply_to_message and u.message.reply_to_message.from_user and u.message.reply_to_message.from_user.id == c.bot.id)):
+        contains_beluga   = "beluga" in text_low
+        contains_username = bool(bot_username) and (bot_username in text_low or f"@{bot_username}" in text_low)
+        is_reply_to_bot   = (
+            u.message.reply_to_message is not None
+            and u.message.reply_to_message.from_user is not None
+            and u.message.reply_to_message.from_user.id == c.bot.id
+        )
+
+        if text and (contains_beluga or contains_username or is_reply_to_bot):
             try:
-                await c.bot.send_chat_action(u.effective_chat.id, "typing")
-                emoji = await ai_emoji(text)
-                await safe_react(c.bot, u.effective_chat.id, u.message.message_id, emoji)
-                reply = await ai(CHAT_PROMPT, text, "Meow! 🐾")
-                await u.message.reply_text(reply)
-            except Exception as e: logger.error(f"[monitor/chat] {e}")
-        
+                await asyncio.wait_for(
+                    c.bot.send_chat_action(u.effective_chat.id, "typing"), timeout=4.0)
+            except Exception: pass
+
+            emoji = "😼"
+            try: emoji = await ai_emoji(text)
+            except Exception: pass
+            try: await safe_react(c.bot, u.effective_chat.id, u.message.message_id, emoji)
+            except Exception: pass
+
+            reply = "Meow! 🐾"
+            try: reply = await ai(CHAT_PROMPT, text, "Meow! 🐾")
+            except Exception as e: logger.error(f"[monitor/ai] {e}")
+
+            try: await u.message.reply_text(reply)
+            except Exception as e: logger.error(f"[monitor/reply] {e}")
+
+            try: await send_random_sticker(c.bot, u.effective_chat.id)
+            except Exception: pass
+
         bot_status["message_count"] += 1
         bot_status["last_update"] = datetime.now()
-    except Exception as e: logger.error(f"[monitor] {e}")
+    except Exception as e:
+        logger.error(f"[monitor] {e}", exc_info=True)
+        bot_status["error_count"] += 1
 
+# ══════════════════════════════════════════════════════
+#  GLOBAL ERROR HANDLER
+# ══════════════════════════════════════════════════════
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    err = context.error
+    if isinstance(err, (NetworkError, TimedOut)): return
+    if isinstance(err, RetryAfter):
+        logger.warning(f"[Err] Rate limit, retry after {err.retry_after}s")
+        await asyncio.sleep(err.retry_after + 1); return
+    if isinstance(err, Forbidden): return
+    if isinstance(err, BadRequest):
+        msg = str(err).lower()
+        if any(x in msg for x in ["not modified","message to edit not found",
+                                   "query is too old","message can't be deleted"]):
+            return
+        logger.warning(f"[Err] BadRequest: {err}"); return
+    if isinstance(err, InvalidToken):
+        logger.critical("[Err] InvalidToken"); bot_status["running"] = False; return
+
+    bot_status["error_count"] += 1
+    tb_str = "".join(traceback.format_exception(type(err), err, err.__traceback__))
+    update_info = ""
+    if isinstance(update, Update):
+        chat = update.effective_chat; user = update.effective_user
+        update_info = (f" | chat={chat.id if chat else 'N/A'}"
+                       f" | user={user.id if user else 'N/A'}")
+    logger.error(f"[Err] Unhandled{update_info}: {err}\n{tb_str}")
+    if OWNER_ID:
+        try:
+            short_tb = tb_str[-800:] if len(tb_str) > 800 else tb_str
+            await context.bot.send_message(
+                chat_id=OWNER_ID,
+                text=f"⚠️ *Beluga Error*\n\n`{err.__class__.__name__}: {str(err)[:200]}`\n\n```\n{short_tb}\n```",
+                parse_mode=ParseMode.MARKDOWN)
+        except Exception: pass
+
+# ══════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════
 async def main():
-    logger.info("🐱 BELUGA BOT v7.5.0 PRODUCTION")
-    
-    github_load_db()
+    logger.info("🐱  BELUGA BOT  v7.6.1  — PRODUCTION")
     http_runner = await start_http(HTTP_PORT)
     await asyncio.sleep(0.3)
-    
+
     app = TGApp.builder().token(BOT_TOKEN).build()
-    
-    # Command handlers
-    app.add_handler(CommandHandler("start", start_handler))
-    app.add_handler(CommandHandler("search", search_handler))
-    app.add_handler(CommandHandler("quiz", quiz_handler))
-    app.add_handler(CommandHandler(["lb","leaderboard"], lb_handler))
-    app.add_handler(CommandHandler("nw", nw_handler))
-    app.add_handler(CommandHandler(["gay","couple"], fun_dispatcher))
-    app.add_handler(CommandHandler(["pump","dump"], pump_dump_handler))
-    app.add_handler(CommandHandler("gm", gm_handler))
-    app.add_handler(CommandHandler("tictac", tictac_handler))
-    app.add_handler(CommandHandler("mine", mine_handler))
-    app.add_handler(CommandHandler("news", news_handler))
-    app.add_handler(CommandHandler("bananalogic", bananalogic_handler))
-    
-    # Callbacks
+
+    app.add_handler(CommandHandler("start",               start_handler))
+    app.add_handler(CommandHandler("search",              search_handler))
+    app.add_handler(CommandHandler("bananalogic",         bananalogic_handler))
+    app.add_handler(CommandHandler("quiz",                quiz_handler))
+    app.add_handler(CommandHandler(["lb","leaderboard"],  lb_handler))
+    app.add_handler(CommandHandler("nw",                  nw_handler))
+    app.add_handler(CommandHandler(["gay","couple"],      fun_dispatcher))
+    app.add_handler(CommandHandler(["pump","dump"],       pump_dump_handler))
+    app.add_handler(CommandHandler("gm",                  gm_handler))
+    app.add_handler(CommandHandler("tictac",              tictac_handler))
+    app.add_handler(CommandHandler("mine",                mine_handler))
+    app.add_handler(CommandHandler("news",                news_handler))
+
     app.add_handler(CallbackQueryHandler(ttt_ready_callback, pattern=r"^ttt_ready:"))
-    app.add_handler(CallbackQueryHandler(ttt_callback, pattern=r"^ttt:"))
-    app.add_handler(CallbackQueryHandler(gm_callback, pattern=r"^gm:"))
-    app.add_handler(CallbackQueryHandler(mine_callback, pattern=r"^mine:"))
-    
-    # Polls & Messages
+    app.add_handler(CallbackQueryHandler(ttt_callback,       pattern=r"^ttt:"))
+    app.add_handler(CallbackQueryHandler(gm_callback,        pattern=r"^gm:"))
+    app.add_handler(CallbackQueryHandler(mine_callback,      pattern=r"^mine:"))
+    app.add_handler(CallbackQueryHandler(news_callback,      pattern=r"^news:"))
+
     app.add_handler(PollAnswerHandler(poll_answer_handler))
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, monitor))
-    
-    app.add_error_handler(advanced_error_handler)
-    
+    app.add_error_handler(error_handler)
+
     await app.initialize()
     await app.start()
-    
+
     try:
         me = await app.bot.get_me()
         bot_status["username"] = me.username.lower()
         logger.info(f"🤖 @{me.username}")
-    except Exception as e:
-        logger.warning(f"[Bot Init] {e}")
+    except Exception as e: logger.warning(f"[Startup] {e}")
+
+    await init_stickers(app.bot)
+    if sticker_file_ids:
+        logger.info(f"🎭 {len(sticker_file_ids)} stickers ready")
+    else:
+        logger.warning("⚠️ No stickers loaded")
 
     await app.updater.start_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
     bot_status["running"] = True
-    logger.info("✅ BELUGA LIVE v7.5.0")
-    
+
     stop_evt = asyncio.Event()
     try:
         import signal
         loop = asyncio.get_running_loop()
         loop.add_signal_handler(signal.SIGTERM, stop_evt.set)
-        loop.add_signal_handler(signal.SIGINT, stop_evt.set)
-    except:
-        pass
-    
-    cleanup_task = asyncio.create_task(cleanup_expired_games_loop())
-    sync_task = asyncio.create_task(periodic_github_sync())
-    
-    try:
-        await stop_evt.wait()
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        pass
-    
-    cleanup_task.cancel()
-    sync_task.cancel()
-    if db_needs_sync:
-        github_sync_db()
-    
-    bot_status["running"] = False
-    for fn in [app.updater.stop, app.stop, app.shutdown, http_runner.cleanup]:
-        try:
-            await fn()
-        except:
-            pass
+        loop.add_signal_handler(signal.SIGINT,  stop_evt.set)
+    except (NotImplementedError, RuntimeError): pass
 
-async def cleanup_expired_games_loop():
-    while True:
-        await asyncio.sleep(60)
-        await cleanup_expired_games()
+    async def periodic_cleanup():
+        while not stop_evt.is_set():
+            await asyncio.sleep(60)
+            await cleanup_expired_games()
+
+    cleanup_task = asyncio.create_task(periodic_cleanup())
+    sync_task    = asyncio.create_task(periodic_github_sync())
+
+    await stop_evt.wait()
+
+    cleanup_task.cancel(); sync_task.cancel()
+    bot_status["running"] = False
+
+    for fn in [app.updater.stop, app.stop, app.shutdown, http_runner.cleanup]:
+        try: await fn()
+        except Exception: pass
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("👋 Bye!")
-    except Exception as e:
-        logger.critical(f"FATAL: {e}")
+    except KeyboardInterrupt: pass
+    except Exception:
         sys.exit(1)
