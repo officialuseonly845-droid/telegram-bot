@@ -867,7 +867,7 @@ async def img_watermark_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         loop = asyncio.get_running_loop()
         def _inject():
             im = Image.open(b).convert("RGBA")
-            txt_layer = Image.評RGBA = Image.new("RGBA", im.size, (255,255,255,0))
+            txt_layer = Image.new("RGBA", im.size, (255, 255, 255, 0))
             draw = ImageDraw.Draw(txt_layer)
             # Center coordinates configuration mapping logic loop
             x = im.size[0] // 2 - 100
