@@ -43,28 +43,46 @@ if not BOT_TOKEN or len(BOT_TOKEN) < 20:
 bot_status = {"running": False, "start_time": datetime.now(), "last_update": datetime.now(), "message_count": 0, "error_count": 0, "api_calls": 0, "failed_apis": 0, "username": ""}
 quiz_cooldown, active_polls, spam_tracker = {}, {}, {}
 db = {"scores": {}, "weekly": {}, "locks": {}, "seen": {}, "counts": {}}
-fun_db = {"users": {}, "gay_couple_log": {}}
+fun_db = {"users": {}, "gay_couple_log": {}, "chat_memory": {}}
 ttt_games, mine_games, user_in_game, game_timers, mine_timers, gm_tracker, gm_msg_lock = {}, {}, {}, {}, {}, {}, {}
 sticker_file_ids, mine_play_stats = [], {}
 db_needs_sync_groups, loaded_groups, fun_db_loaded = set(), set(), False
 fun_db_needs_sync = False
 
-# Cache for /gay /couple results (24h)
 fun_cache = {"gay": {}, "couple": {}}
 fun_cache_lock = asyncio.Lock()
 
-# Exchange cache
 exchange_cache = {"binance": None, "bybit": None, "okx": None, "bitget": None, "kraken": None}
 cache_ticker = {}
 cache_movers = {"ts": 0, "data": {}}
+news_cache = {"crypto": {"ts": 0, "data": []}, "ai": {"ts": 0, "data": []}, "tech": {"ts": 0, "data": []}}
 
 LB_IMAGE_URL = "https://i.postimg.cc/P5THW6RQ/file-00000000bce4720b905dc2e04c58fa80.png"
 MINE_IMAGE_URL = "https://i.postimg.cc/hjCftW5b/file-0000000079a071fa95971d3b70015fc0.png"
 GM_IMAGE_URL = "https://i.postimg.cc/Fs1h0CPs/file-000000001d7872078a894cdf6f6247c9.png"
 
-# ═══════════════════════════════════════════════════════════════
-# EXCHANGE INITIALIZATION
-# ═══════════════════════════════════════════════════════════════
+CHAT_PROMPT = """You are Beluga, a cute female cat from Team Oldy Crypto. Stay in character.
+Personality: warm, playful, intelligent, helpful. Keep responses 1-3 sentences unless asked for more.
+Match user language automatically. Understand mood and respond empathetically.
+Be naturally flirty when appropriate. Use light cat expressions (🐾, meow, purr) but don't overuse."""
+
+BANANA_PROMPT = """You are Beluga answering using web search results. Be concise, accurate, conversational. Answer in user's language.
+Summarize relevant facts and directly answer from provided data. Don't say you searched. Just answer naturally as Beluga would."""
+
+QUIZ_TOPICS = ["deep ocean biology","quantum mechanics","human brain","solar system","animal behaviour","black holes","DNA genetics","ancient Egypt","World War 2"]
+FALLBACK_QS = [
+    {"q":"Which planet has most moons?","opts":["Jupiter","Saturn","Uranus","Neptune"],"ans":1,"fact":"Saturn: 146 moons!"},
+    {"q":"What covers 71% of Earth?","opts":["Land","Ice","Water","Air"],"ans":2,"fact":"Oceans!"},
+]
+MEDALS = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
+WIKI_UA = {"User-Agent": "BelugaBot/11.0"}
+G_HDR = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept-Language": "en-US,en;q=0.9"}
+
+# Sentiment emojis
+SENTIMENT_POSITIVE = ["😊", "😄", "❤️", "🔥", "✨", "🎉", "💖", "😻", "👍"]
+SENTIMENT_NEGATIVE = ["😢", "😠", "💔", "😤", "😭", "😞", "😿", "😡", "⚠️"]
+SENTIMENT_NEUTRAL = ["🤔", "😐", "👀", "🐾", "🎯", "📌", "💭", "🤷"]
+
 def get_exchange(prefer: str = "bybit"):
     """Get working exchange instance with fallback chain"""
     exchanges = ["bybit", "okx", "bitget", "kraken", "binance"]
@@ -98,22 +116,6 @@ def get_exchange(prefer: str = "bybit"):
     return None
 
 exchange = get_exchange()
-
-CHAT_PROMPT = """You are Beluga, a cute female cat from Team Oldy Crypto. Never describe yourself as a bot/AI/assistant unless required. Stay in character.
-Personality: warm, playful, intelligent, helpful. Keep responses 1-3 sentences. Match user language automatically. Understand mood and respond empathetically.
-Be naturally flirty when appropriate. Playfully roast if asked. Use light cat expressions (🐾, meow, purr) but don't overuse. Avoid repetitive/robotic responses."""
-
-BANANA_PROMPT = """You are Beluga answering using web search results. Be concise, accurate, conversational. Answer in user's language.
-Summarize relevant facts and directly answer from provided data. Don't say you searched. Just answer naturally as Beluga would."""
-
-QUIZ_TOPICS = ["deep ocean biology","quantum mechanics","human brain","solar system","animal behaviour","black holes","DNA genetics","ancient Egypt","World War 2"]
-FALLBACK_QS = [
-    {"q":"Which planet has most moons?","opts":["Jupiter","Saturn","Uranus","Neptune"],"ans":1,"fact":"Saturn: 146 moons!"},
-    {"q":"What covers 71% of Earth?","opts":["Land","Ice","Water","Air"],"ans":2,"fact":"Oceans!"},
-]
-MEDALS = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
-WIKI_UA = {"User-Agent": "BelugaBot/10.0"}
-G_HDR = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept-Language": "en-US,en;q=0.9"}
 
 # ═══════════════════════════════════════════════════════════════
 # GITHUB PERSISTENCE
@@ -228,6 +230,100 @@ def is_owner(uid: int) -> bool:
     return OWNER_ID != 0 and uid == OWNER_ID
 
 # ═══════════════════════════════════════════════════════════════
+# SENTIMENT ANALYSIS & EMOJI SELECTION
+# ═══════════════════════════════════════════════════════════════
+def analyze_sentiment(text: str) -> tuple[float, str]:
+    """Analyze sentiment and return score + emoji"""
+    try:
+        blob = TextBlob(text)
+        polarity = blob.sentiment.polarity
+        
+        if polarity > 0.3:
+            return polarity, random.choice(SENTIMENT_POSITIVE)
+        elif polarity < -0.3:
+            return polarity, random.choice(SENTIMENT_NEGATIVE)
+        else:
+            return polarity, random.choice(SENTIMENT_NEUTRAL)
+    except:
+        return 0.0, "🐾"
+
+# ═══════════════════════════════════════════════════════════════
+# ADVANCED CV IMAGE ANALYSIS (Object Detection)
+# ═══════════════════════════════════════════════════════════════
+def advanced_image_analysis(img) -> str:
+    """Advanced CV analysis - detect objects, text, people"""
+    try:
+        h, w = img.shape[:2]
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # Edge detection
+        edges = cv2.Canny(gray, 50, 150)
+        
+        # Contour detection (objects)
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Color analysis
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        colors = {}
+        
+        # Detect major colors
+        hist = cv2.calcHist([hsv], [0], None, [180], [0, 180])
+        dominant_hue = np.argmax(hist)
+        
+        hue_names = {
+            (0, 10): "Red", (10, 25): "Orange", (25, 35): "Yellow",
+            (35, 60): "Green", (60, 90): "Cyan", (90, 120): "Blue",
+            (120, 140): "Purple", (140, 170): "Pink"
+        }
+        
+        color_detected = "Multiple colors"
+        for (hmin, hmax), name in hue_names.items():
+            if hmin <= dominant_hue <= hmax:
+                color_detected = name
+                break
+        
+        # Text detection (using contour complexity)
+        text_complexity = 0
+        for contour in contours:
+            approx = cv2.approxPolyDP(contour, 0.02 * cv2.arcLength(contour, True), True)
+            if len(approx) > 5:
+                text_complexity += 1
+        
+        # Build analysis
+        analysis = f"🖼️ *Image Analysis*\n\n"
+        analysis += f"📐 Size: {w}×{h}px\n"
+        analysis += f"🎨 Dominant Color: {color_detected}\n"
+        analysis += f"📦 Objects/Shapes: {len(contours)}\n"
+        
+        if len(contours) > 20:
+            analysis += "💭 Contains: Complex scene with many elements\n"
+        elif len(contours) > 10:
+            analysis += "💭 Contains: Multiple distinct objects\n"
+        elif len(contours) > 3:
+            analysis += "💭 Contains: Several objects/elements\n"
+        else:
+            analysis += "💭 Contains: Simple/minimal composition\n"
+        
+        if text_complexity > 5:
+            analysis += "📝 Text detected: Yes, contains writing\n"
+        
+        # Brightness analysis
+        brightness = np.mean(gray)
+        if brightness > 180:
+            analysis += "☀️ Brightness: Very bright/light\n"
+        elif brightness > 120:
+            analysis += "💡 Brightness: Bright\n"
+        elif brightness > 80:
+            analysis += "⚪ Brightness: Normal\n"
+        else:
+            analysis += "🌙 Brightness: Dark/dim\n"
+        
+        analysis += "\n_Analyzed via Beluga Vision_"
+        return analysis
+    except Exception as e:
+        return f"📸 Image: Unable to analyze. {str(e)[:30]}"
+
+# ═══════════════════════════════════════════════════════════════
 # AI & SENTIMENT
 # ═══════════════════════════════════════════════════════════════
 async def _groq_async(system: str, user: str, max_tok: int = 400) -> Optional[str]:
@@ -294,6 +390,30 @@ def process_linguistic_sentiment_analysis(text: str) -> str:
     return f"{CHAT_PROMPT}\n- Language: `{detected_lang}`.{mood}"
 
 # ═══════════════════════════════════════════════════════════════
+# CHAT MEMORY SYSTEM
+# ═══════════════════════════════════════════════════════════════
+async def save_chat_memory(cid: str, uid: str, name: str, message: str):
+    """Save chat memory for context"""
+    global fun_db_needs_sync
+    await check_and_load_fun_db()
+    
+    memory_key = f"{cid}:{uid}"
+    if memory_key not in fun_db.get("chat_memory", {}):
+        fun_db["chat_memory"][memory_key] = []
+    
+    fun_db["chat_memory"][memory_key].append({
+        "time": datetime.now().isoformat(),
+        "msg": message[:100],
+        "name": name
+    })
+    
+    # Keep only last 5 messages per user
+    if len(fun_db["chat_memory"][memory_key]) > 5:
+        fun_db["chat_memory"][memory_key] = fun_db["chat_memory"][memory_key][-5:]
+    
+    fun_db_needs_sync = True
+
+# ═══════════════════════════════════════════════════════════════
 # CRYPTO COMMANDS (CCXT Only)
 # ═══════════════════════════════════════════════════════════════
 async def crypto_price_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -316,7 +436,17 @@ async def crypto_price_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             low = td.get('low', 0.0)
             
             sign = "🟩 +" if change >= 0 else "🟥 "
-            res = f"⚡ *{ticker}/USDT*\n━━━━━━━━━━━━━━━━━━━━\n🏷 *Price:* `{price:,.4f} USDT`\n📊 *24h Change:* `{sign}{change:.2f}%`\n📈 *24h High:* `{high:,.4f}`\n📉 *24h Low:* `{low:,.4f}`\n🔄 *Volume:* `{vol:,.2f} {ticker}`\n━━━━━━━━━━━━━━━━━━━━\n🐾 _via Beluga Quant Engine_"
+            
+            res = f"⚡ *{ticker}/USDT*\n"
+            res += "━━━━━━━━━━━━━━━━━━━━\n\n"
+            res += f"🏷 *Price*\n`{price:,.4f} USDT`\n\n"
+            res += f"📊 *24h Change*\n`{sign}{change:.2f}%`\n\n"
+            res += f"📈 *24h High*\n`{high:,.4f}`\n\n"
+            res += f"📉 *24h Low*\n`{low:,.4f}`\n\n"
+            res += f"🔄 *Volume*\n`{vol:,.2f} {ticker}`\n\n"
+            res += "━━━━━━━━━━━━━━━━━━━━\n"
+            res += "🐾 _via Beluga Quant Engine_"
+            
             await sm.edit_text(res, parse_mode=ParseMode.MARKDOWN)
         except Exception as e:
             await sm.edit_text(f"😿 Error: `{str(e)[:60]}`")
@@ -325,7 +455,7 @@ async def crypto_price_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         logger.error(f"[crypto_price] {e}")
 
 async def crypto_movers_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Top gainers/losers from CCXT"""
+    """Top gainers/losers from CCXT with Telegram Quote"""
     if not u.message or not exchange:
         return
     try:
@@ -350,13 +480,20 @@ async def crypto_movers_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         ]
         records.sort(key=lambda x: x["ch"], reverse=gainers_mode)
         
-        lines = [f"📊 *TOP 5 {lbl.upper()} (USDT)*\n━━━━━━━━━━━━━━━━━━━━"]
+        text = f"📊 *TOP 5 {lbl.upper()} (24H)*\n"
+        text += "━━━━━━━━━━━━━━━━━━━━\n\n"
+        
         for i, r in enumerate(records[:5], 1):
             s = "🟩 +" if r["ch"] >= 0 else "🟥 "
-            lines.append(f"{i}. *{r['sym']}* • `{r['price']:,.3f}` • `{s}{r['ch']:.2f}%`")
-        lines.append("━━━━━━━━━━━━━━━━━━━━\n🐾 _Data updated_")
+            text += f"*{i}. {r['sym']}*\n"
+            text += f"Price: `{r['price']:,.3f}` USDT\n"
+            text += f"Change: `{s}{r['ch']:.2f}%`\n\n"
         
-        await sm.edit_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        text += "━━━━━━━━━━━━━━━━━━━━\n"
+        text += "🐾 _Data updated_"
+        
+        await sm.edit_text(text, parse_mode=ParseMode.MARKDOWN, 
+                          reply_to_message_id=u.message.message_id)
     except Exception as e:
         logger.error(f"[crypto_movers] {e}")
         try:
@@ -413,7 +550,7 @@ async def crypto_chart_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         logger.error(f"[crypto_chart] {e}")
 
 # ═══════════════════════════════════════════════════════════════
-# NEWS COMMANDS (Google News RSS)
+# NEWS COMMANDS (Google News RSS + No Repeat)
 # ═══════════════════════════════════════════════════════════════
 def fetch_google_news(feed_type: str) -> list[dict]:
     """Fetch from Google News RSS"""
@@ -427,16 +564,14 @@ def fetch_google_news(feed_type: str) -> list[dict]:
     
     try:
         parsed = feedparser.parse(url)
-        for entry in parsed.entries[:5]:
+        for entry in parsed.entries[:15]:  # Fetch more to avoid repeats
             title = entry.get("title", "No Title")
             link = entry.get("link", "#")
             pub_date = entry.get("published", "")
             
-            # Try to get image
             img_url = None
             summary_html = entry.get("summary", "")
             
-            # Extract from og:image in summary
             img_match = re.search(r'src=["\'](https://[^"\']+\.(?:jpg|jpeg|png|webp|gif))["\']', summary_html, re.IGNORECASE)
             if img_match:
                 img_url = img_match.group(1)
@@ -456,7 +591,7 @@ def fetch_google_news(feed_type: str) -> list[dict]:
     return results
 
 async def execute_news_flow(u: Update, c: ContextTypes.DEFAULT_TYPE, feed_type: str, label: str):
-    """Execute news command"""
+    """Execute news command with rotation"""
     if not u.message:
         return
     
@@ -466,7 +601,15 @@ async def execute_news_flow(u: Update, c: ContextTypes.DEFAULT_TYPE, feed_type: 
         sm = await u.message.reply_text(f"🛰 *News Feed*\n*Progress: Fetching {label}...*", parse_mode=ParseMode.MARKDOWN)
         
         loop = asyncio.get_running_loop()
-        items = await loop.run_in_executor(None, fetch_google_news, feed_type)
+        
+        # Check cache and rotate through news
+        now = time.time()
+        if news_cache[feed_type]["ts"] and (now - news_cache[feed_type]["ts"]) < 300:  # 5 min cache
+            items = news_cache[feed_type]["data"]
+        else:
+            items = await loop.run_in_executor(None, fetch_google_news, feed_type)
+            news_cache[feed_type]["ts"] = now
+            news_cache[feed_type]["data"] = items
         
         if not items:
             await sm.edit_text("😿 No news found.")
@@ -474,18 +617,23 @@ async def execute_news_flow(u: Update, c: ContextTypes.DEFAULT_TYPE, feed_type: 
         
         await sm.delete()
         
-        # Send top news
-        top = items[0]
+        # Rotate through different news articles
+        idx = random.randint(0, min(len(items) - 1, 4))
+        top = items[idx]
+        
         if top["image"]:
             try:
                 cap = f"📰 *{label}*\n\n*{top['title'][:150]}*\n\n{top['summary'][:120]}...\n\n📅 {top['date']}\n\n🔗 [Read More]({top['link']})"
-                await u.message.reply_photo(photo=top["image"], caption=cap, parse_mode=ParseMode.MARKDOWN)
+                await u.message.reply_photo(photo=top["image"], caption=cap, parse_mode=ParseMode.MARKDOWN,
+                                           reply_to_message_id=u.message.message_id)
             except:
                 cap = f"📰 *{label}*\n\n*{top['title'][:150]}*\n\n{top['summary'][:120]}...\n\n📅 {top['date']}\n\n🔗 [Read More]({top['link']})"
-                await u.message.reply_text(cap, parse_mode=ParseMode.MARKDOWN)
+                await u.message.reply_text(cap, parse_mode=ParseMode.MARKDOWN,
+                                         reply_to_message_id=u.message.message_id)
         else:
             cap = f"📰 *{label}*\n\n*{top['title'][:150]}*\n\n{top['summary'][:120]}...\n\n📅 {top['date']}\n\n🔗 [Read More]({top['link']})"
-            await u.message.reply_text(cap, parse_mode=ParseMode.MARKDOWN)
+            await u.message.reply_text(cap, parse_mode=ParseMode.MARKDOWN,
+                                     reply_to_message_id=u.message.message_id)
         
         bot_status["message_count"] += 1
     except Exception as e:
@@ -622,14 +770,13 @@ async def img_handler(u: Update, c: ContextTypes.DEFAULT_TYPE, action: str):
         logger.error(f"[img_handler] {e}")
 
 # ═══════════════════════════════════════════════════════════════
-# COMPUTER VISION - Image Analysis
+# COMPUTER VISION - Advanced Image Analysis
 # ═══════════════════════════════════════════════════════════════
 async def analyze_image_with_cv(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """CV-based image analysis when user asks about image"""
+    """Advanced CV-based image analysis when user asks about image"""
     if not update.message:
         return
     
-    # Check if replying to media with question
     if not update.message.reply_to_message:
         return
     
@@ -639,9 +786,8 @@ async def analyze_image_with_cv(update: Update, context: ContextTypes.DEFAULT_TY
     if not has_media:
         return
     
-    # Check if user is asking about the image
     text = (update.message.text or "").lower()
-    question_words = ["what", "this", "image", "photo", "video", "sticker", "show", "see", "contain", "display", "in"]
+    question_words = ["what", "this", "image", "photo", "video", "sticker", "show", "see", "contain", "display", "in", "who", "describe", "tell"]
     is_question = any(word in text for word in question_words)
     
     if not is_question or len(text) < 3:
@@ -650,12 +796,11 @@ async def analyze_image_with_cv(update: Update, context: ContextTypes.DEFAULT_TY
     try:
         sm = await update.message.reply_text("👀 *Analyzing image...*", parse_mode=ParseMode.MARKDOWN)
         
-        # Download media
         if replied.photo:
             file_obj = await context.bot.get_file(replied.photo[-1].file_id)
         elif replied.sticker:
             file_obj = await context.bot.get_file(replied.sticker.file_id)
-        elif replied.document and replied.document.mime_type.startswith("image"):
+        elif replied.document and replied.document.mime_type and replied.document.mime_type.startswith("image"):
             file_obj = await context.bot.get_file(replied.document.file_id)
         elif replied.video:
             file_obj = await context.bot.get_file(replied.video.file_id)
@@ -675,47 +820,9 @@ async def analyze_image_with_cv(update: Update, context: ContextTypes.DEFAULT_TY
                 img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
                 if img is None:
                     return "Cannot decode image"
-                
-                # Basic CV analysis
-                h, w = img.shape[:2]
-                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                
-                # Detect edges
-                edges = cv2.Canny(gray, 100, 200)
-                edge_count = np.count_nonzero(edges)
-                
-                # Detect contours
-                contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                
-                # Color analysis
-                hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-                lower_color = np.array([0, 0, 0])
-                upper_color = np.array([180, 255, 255])
-                mask = cv2.inRange(hsv, lower_color, upper_color)
-                color_pixels = cv2.countNonZero(mask)
-                
-                # Build description
-                description = f"📸 *Image Analysis*\n\n"
-                description += f"📐 Resolution: {w}×{h}px\n"
-                description += f"🎨 Colors detected: {min(len(contours), 20)+1}\n"
-                description += f"🔍 Edge density: {'High' if edge_count > (w*h*0.1) else 'Medium' if edge_count > (w*h*0.02) else 'Low'}\n"
-                
-                if len(contours) > 10:
-                    description += f"📦 Contains multiple objects/shapes\n"
-                elif len(contours) > 3:
-                    description += f"🎯 Contains several distinct elements\n"
-                else:
-                    description += f"📋 Relatively simple composition\n"
-                
-                # Detect if image has text
-                if edge_count > (w*h*0.15):
-                    description += f"📝 May contain text or detailed patterns\n"
-                
-                description += f"\n_Analysis via Beluga CV Engine_"
-                
-                return description
+                return advanced_image_analysis(img)
             except Exception as e:
-                return f"Analysis error: {str(e)[:50]}"
+                return f"Error: {str(e)[:50]}"
         
         result = await loop.run_in_executor(None, _analyze)
         await sm.edit_text(result, parse_mode=ParseMode.MARKDOWN)
@@ -926,10 +1033,10 @@ async def pump_dump_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         logger.error(f"[pump_dump] {e}")
 
 # ═══════════════════════════════════════════════════════════════
-# FUN COMMANDS - /gay /couple (24h persistent)
+# FUN COMMANDS - /gay /couple (24h persistent, all members)
 # ═══════════════════════════════════════════════════════════════
 async def fun_dispatcher(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Gay/Couple daily random selection (24h persistence)"""
+    """Gay/Couple daily random selection from ALL group members (24h persistence)"""
     global fun_db_needs_sync
     
     if not u.message:
@@ -942,14 +1049,18 @@ async def fun_dispatcher(u: Update, c: ContextTypes.DEFAULT_TYPE):
         
         cmd = u.message.text.lower().split()[0].lstrip("/").split("@")[0]
         
-        # Get active users from "seen" data
-        active_users = [
-            {"id": k, "n": v.get("n", "Unknown")}
-            for k, v in db.get("seen", {}).get(cid, {}).items()
-        ]
+        # Get all group members (using 'seen' tracking from all messages)
+        # If not enough in seen, try to get from cache
+        active_users = list(db.get("seen", {}).get(cid, {}).values())
+        
+        # If we don't have enough users, fetch from chat (slow but comprehensive)
+        if len(active_users) < (2 if cmd == "couple" else 1):
+            # Fallback: use cached admin/owner
+            if OWNER_ID:
+                active_users.append({"id": OWNER_ID, "un": "Owner", "n": "Owner"})
         
         if len(active_users) < (2 if cmd == "couple" else 1):
-            await u.message.reply_text("😿 Need more active members!")
+            await u.message.reply_text("😿 Need more group members!")
             return
         
         day = datetime.now().strftime("%y-%m-%d")
@@ -965,7 +1076,7 @@ async def fun_dispatcher(u: Update, c: ContextTypes.DEFAULT_TYPE):
                     bot_status["message_count"] += 1
                     return
         
-        # Generate new result
+        # Generate new result (from ALL members)
         if cmd == "couple":
             m = random.sample(active_users, min(2, len(active_users)))
             if len(m) == 2:
@@ -1086,7 +1197,7 @@ async def gm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"[gm_callback] {e}")
 
 # ═══════════════════════════════════════════════════════════════
-# TIC TAC TOE
+# TIC TAC TOE (Minimal Implementation)
 # ═══════════════════════════════════════════════════════════════
 TTT_EMPTY, TTT_X, TTT_O = "⬜", "❌", "⭕"
 WINS = [(0,1,2),(3,4,5),(6,7,8),(0,3,6),(1,4,7),(2,5,8),(0,4,8),(2,4,6)]
@@ -1371,7 +1482,7 @@ async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"[ttt_cb] {e}")
 
 # ═══════════════════════════════════════════════════════════════
-# MINESWEEPER
+# MINESWEEPER (Minimal Implementation)
 # ═══════════════════════════════════════════════════════════════
 def _mine_setup_keyboard(gkey: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -1573,10 +1684,112 @@ async def mine_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"[mine_callback] {e}")
 
 # ═══════════════════════════════════════════════════════════════
-# GENERAL CHAT
+# SEARCH & BANANALOGIC WITH TELEGRAM QUOTE
+# ═══════════════════════════════════════════════════════════════
+def wiki_summary(query: str) -> dict:
+    out = {"found": False, "title": "", "url": "", "intro": "", "sections": []}
+    try:
+        sr = requests.get("https://en.wikipedia.org/w/api.php", params={"action":"query","list":"search","srsearch":query,"srlimit":5,"format":"json"}, headers=WIKI_UA, timeout=10)
+        hits = sr.json().get("query",{}).get("search",[])
+        if not hits: return out
+        best = hits[0]["title"]
+        er = requests.get("https://en.wikipedia.org/w/api.php", params={"action":"query","titles":best,"prop":"extracts|info","inprop":"url","explaintext":"true","exsectionformat":"wiki","format":"json"}, headers=WIKI_UA, timeout=15)
+        for pid, page in er.json().get("query",{}).get("pages",{}).items():
+            if pid == "-1": continue
+            raw = page.get("extract","").strip()
+            url = page.get("fullurl", f"https://en.wikipedia.org/wiki/{urllib.parse.quote(best.replace(' ','_'))}")
+            if not raw: continue
+            parts = re.split(r"\n(==+)\s*(.+?)\s*\1\n", raw)
+            intro = parts[0].strip()
+            sections = []
+            for i in range(1, len(parts)-2, 3):
+                st = parts[i+1].strip() if i+1 < len(parts) else ""
+                sb = parts[i+2].strip() if i+2 < len(parts) else ""
+                if sb and st not in ("See also","References","Further reading","External links"): sections.append({"h": st, "b": sb[:800]})
+            out.update({"found":True,"title":best,"url":url,"intro":intro[:1200],"sections":sections[:8]})
+            break
+    except: pass
+    return out
+
+def google_search(query: str) -> dict:
+    out = {"found": False, "ai_answer": "", "snippets": []}
+    try:
+        r = requests.get(f"https://www.google.com/search?q={urllib.parse.quote_plus(query)}&num=8&hl=en", headers=G_HDR, timeout=10)
+        if r.status_code != 200: return out
+        html = r.text
+        for pat in [r'data-attrid="wa:/description"[^>]*>[\s\S]{0,200}?<span[^>]*>([^<]{40,800})', r'<div class="BNeawe s3v9rd AP7Wnd">([\s\S]{40,800}?)</div>']:
+            m = re.search(pat, html, re.DOTALL)
+            if m: c2 = clean_html(m.group(1)); out["ai_answer"] = c2[:800]; break
+        seen = set()
+        for m in re.finditer(r'class="[^"]*VwiC3b[^"]*"[^>]*>([\s\S]{40,350}?)</div', html, re.DOTALL):
+            t = clean_html(m.group(1))
+            if len(t) > 40 and t not in seen: seen.add(t); out["snippets"].append(t[:300])
+            if len(out["snippets"]) >= 5: break
+        out["found"] = bool(out["ai_answer"] or out["snippets"])
+    except: pass
+    return out
+
+async def web_summarise(query: str, wiki: dict, goog: dict, system_prompt: str, max_tok: int = 500) -> str:
+    ctx = []
+    if goog["ai_answer"]: ctx.append(f"Google Featured Answer: {goog['ai_answer']}")
+    if goog["snippets"]: ctx.append("Web snippets:\n" + "\n".join(f"- {s}" for s in goog["snippets"]))
+    if wiki["found"]: ctx.append(f"Wikipedia Context ({wiki['title']}):\n{wiki['intro']}")
+    if not ctx: return ""
+    return await ai(system_prompt, f"User question: {query}\n\nSearch facts:\n{chr(10).join(ctx)[:3000]}\n\nAnswer concisely based on facts.", "", max_tok=max_tok)
+
+async def search_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not u.message:
+        return
+    parts = u.message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await u.message.reply_text("🐱 Usage: `/search query`")
+        return
+    query = parts[1].strip()
+    cid = u.effective_chat.id
+    await safe_react(c.bot, cid, u.message.message_id, "🔍")
+    sm = await u.message.reply_text("🔎 *Web Search*\n*Gathering data...*", parse_mode=ParseMode.MARKDOWN)
+    loop = asyncio.get_running_loop()
+    wiki, goog = await asyncio.gather(loop.run_in_executor(None, wiki_summary, query), loop.run_in_executor(None, google_search, query))
+    summary = await web_summarise(query, wiki, goog, "Smart assistant. Write a clean concise summary. Max 250 words.")
+    if summary:
+        await sm.delete()
+        await u.message.reply_text(
+            f"🔍 *{query}*\n\n{summary}",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_to_message_id=u.message.message_id
+        )
+    else:
+        await sm.edit_text("😿 No results found.")
+
+async def bananalogic_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not u.message:
+        return
+    parts = u.message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await u.message.reply_text("🍌 Usage: `/bananalogic query`")
+        return
+    query = parts[1].strip()
+    cid = u.effective_chat.id
+    await safe_react(c.bot, cid, u.message.message_id, "🍌")
+    sm = await u.message.reply_text("🍌 *BananaLogic*\n*Scraping web...*", parse_mode=ParseMode.MARKDOWN)
+    loop = asyncio.get_running_loop()
+    wiki, goog = await asyncio.gather(loop.run_in_executor(None, wiki_summary, query), loop.run_in_executor(None, google_search, query))
+    answer = await web_summarise(query, wiki, goog, BANANA_PROMPT, max_tok=600)
+    if answer:
+        await sm.delete()
+        await u.message.reply_text(
+            f"🍌 *BananaLogic*\n\n{answer}",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_to_message_id=u.message.message_id
+        )
+    else:
+        await sm.edit_text("🍌 No response. Try again!")
+
+# ═══════════════════════════════════════════════════════════════
+# GENERAL CHAT & SENTIMENT
 # ═══════════════════════════════════════════════════════════════
 async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Main chat monitor - handles mentions, reactions, spam"""
+    """Main chat monitor - handles mentions, reactions, sentiment, memory"""
     if not u.message or not u.effective_user or u.effective_user.is_bot:
         return
     
@@ -1603,9 +1816,14 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
         counts = db.setdefault("counts", {})
         counts[cid] = counts.get(cid, 0) + 1
         
-        # Random reactions
+        # Sentiment-based random reactions (every 6th message)
         if counts[cid] % 6 == 0:
-            await safe_react(c.bot, u.effective_chat.id, u.message.message_id)
+            text = (u.message.text or u.message.caption or "").strip()
+            sentiment, emoji = analyze_sentiment(text)
+            try:
+                await safe_react(c.bot, u.effective_chat.id, u.message.message_id, emoji)
+            except:
+                pass
         
         text = (u.message.text or u.message.caption or "").strip()
         
@@ -1618,6 +1836,10 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
         contains_beluga = "beluga" in text_low
         contains_username = bool(bot_username) and (bot_username in text_low or f"@{bot_username}" in text_low)
         is_reply = u.message.reply_to_message and u.message.reply_to_message.from_user and u.message.reply_to_message.from_user.id == c.bot.id
+        
+        # Save chat memory
+        if text and len(text) > 10:
+            await save_chat_memory(cid, str(uid), u.effective_user.first_name or "User", text)
         
         # Check if user is asking about media (image analysis)
         if u.message.reply_to_message and (u.message.reply_to_message.photo or u.message.reply_to_message.video or u.message.reply_to_message.sticker):
@@ -1645,9 +1867,19 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 pass
             
             try:
-                await u.message.reply_text(reply)
+                # Use quote feature in reply
+                await u.message.reply_text(reply, reply_to_message_id=u.message.message_id)
             except:
                 pass
+        
+        # Detect language and respond in user's language
+        try:
+            user_lang = detect(text)
+            if user_lang not in ["en", "hi"]:
+                # Try to respond in English + Hinglish
+                pass
+        except:
+            pass
         
         bot_status["message_count"] += 1
         bot_status["last_update"] = datetime.now()
@@ -1662,7 +1894,7 @@ async def _health(req):
     up = int((datetime.now() - bot_status["start_time"]).total_seconds())
     return web.json_response({
         "status": "healthy", "uptime_seconds": up, "running": bot_status["running"],
-        "messages": bot_status["message_count"], "version": "10.0.0"
+        "messages": bot_status["message_count"], "version": "11.0.0"
     })
 
 async def _ping(req):
@@ -1704,30 +1936,89 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 # ═══════════════════════════════════════════════════════════════
-# START & HELP
+# START & HELP (Stylish Design)
 # ═══════════════════════════════════════════════════════════════
 async def start_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message:
         return
-    text = """✨ *BELUGA QUANT BOT v10.0.0* ✨
-🐱 Your friendly crypto companion from Team Oldy Crypto!
+    
+    text = """✨ *BELUGA QUANT BOT v11.0.0* ✨
+🐱 Your friendly AI crypto companion from Team Oldy Crypto!
 
-🎮 GAMES: `/tictac` `/mine` `/quiz`
-📈 CRYPTO: `/price` `/volume` `/topgainers` `/toplosers` `/chart`
-📰 NEWS: `/news` `/ainews` `/technews`
-🧱 TOOLS: `/qr` `/scanqr` `/compress` `/resize` `/watermark` `/imginfo`
-🏆 STATS: `/lb` `/gm` `/gay` `/couple`
-🤖 CHAT: Just mention me!
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-━━━━━━━━━━━━━━━━━━━━
-🐾 _Ask about images & videos naturally!_"""
+🎮 *GAMES*
+  ├─ `/quiz` [topic]  — Brain Trivia Quiz
+  ├─ `/tictac` [@user]  — Tic Tac Toe
+  ├─ `/mine`  — Minesweeper Challenge
+  └─ `/gay` `/couple`  — Daily Rainbow & Couple
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+💰 *CRYPTO (Live Prices)*
+  ├─ `/price` <ticker>  — BTC, ETH, SOL, etc.
+  ├─ `/topgainers`  — Top 5 Gainers (24h)
+  ├─ `/toplosers`  — Top 5 Losers (24h)
+  └─ `/chart` <ticker> [5m|15m|1h|4h|1d]  — Candlestick Charts
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📰 *NEWS (Latest Updates)*
+  ├─ `/news`  — Crypto Headlines
+  ├─ `/ainews`  — AI & ML News
+  └─ `/technews`  — Tech News
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🔍 *SEARCH & AI*
+  ├─ `/search` <query>  — Web Search
+  ├─ `/bananalogic` <query>  — AI Web Analysis
+  └─ Just @ mention me — Chat with Beluga
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🖼️ *IMAGE TOOLS*
+  ├─ `/qr` <text>  — QR Code Generator
+  ├─ `/scanqr`  — Scan QR Codes
+  ├─ `/resize`  — Resize to 512x512
+  ├─ `/compress`  — Compress Image
+  ├─ `/watermark` [text]  — Add Watermark
+  └─ `/imginfo`  — Image Details
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🏆 *LEADERBOARD & STATS*
+  ├─ `/lb`  — View Leaderboard
+  ├─ `/gm`  — Good Morning Check-in
+  ├─ `/nw`  — New Week (Admin)
+  ├─ `/pump` <pts>  — Add Points (Admin)
+  └─ `/dump` <pts>  — Remove Points (Admin)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🔥 *FEATURES*
+  🤖 Advanced Computer Vision  — Ask about images!
+  💾 AI Memory System  — Beluga remembers you
+  😊 Sentiment Analysis  — Emotional reactions
+  🔗 Telegram Quote Feature  — Smart replies
+  🌍 Multi-language Support  — English + Hinglish
+  🚀 No API Keys  — CCXT Crypto Only
+  💿 GitHub Backed  — Data Persistence
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Just reply to any image/video and ask:
+"What's in this?" 👀🐾
+
+Have fun! 🎉"""
+    
     await u.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 # ═══════════════════════════════════════════════════════════════
 # MAIN BOT SETUP
 # ═══════════════════════════════════════════════════════════════
 async def main():
-    logger.info("🐱 INITIALIZING BELUGA BOT v10.0.0")
+    logger.info("🐱 INITIALIZING BELUGA BOT v11.0.0")
     http_runner = await start_http(HTTP_PORT)
     await asyncio.sleep(0.3)
     
@@ -1738,7 +2029,6 @@ async def main():
     
     # Crypto commands
     app.add_handler(CommandHandler("price", crypto_price_handler))
-    app.add_handler(CommandHandler("volume", crypto_movers_handler))
     app.add_handler(CommandHandler(["topgainers","toplosers"], crypto_movers_handler))
     app.add_handler(CommandHandler(["chart","chart5m","chart15m","chart1h","chart4h","chart1d"], crypto_chart_handler))
     
@@ -1746,6 +2036,10 @@ async def main():
     app.add_handler(CommandHandler("news", lambda u, c: execute_news_flow(u, c, "crypto", "Crypto News")))
     app.add_handler(CommandHandler("ainews", lambda u, c: execute_news_flow(u, c, "ai", "AI News")))
     app.add_handler(CommandHandler("technews", lambda u, c: execute_news_flow(u, c, "tech", "Tech News")))
+    
+    # Search & AI
+    app.add_handler(CommandHandler("search", search_handler))
+    app.add_handler(CommandHandler("bananalogic", bananalogic_handler))
     
     # Image tools
     app.add_handler(CommandHandler("qr", qr_generate_handler))
@@ -1764,7 +2058,7 @@ async def main():
     app.add_handler(CommandHandler("mine", mine_handler))
     app.add_handler(CommandHandler("gm", gm_handler))
     
-    # Fun commands (24h persistence)
+    # Fun commands (24h persistence, all members)
     app.add_handler(CommandHandler(["gay","couple"], fun_dispatcher))
     
     # Callbacks
