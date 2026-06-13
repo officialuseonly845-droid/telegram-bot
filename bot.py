@@ -1,4 +1,4 @@
-import os, logging, random, json, asyncio, requests, re, urllib.parse, traceback, sys, hashlib, time, base64, io
+import os, logging, random, json, asyncio, requests, re, urllib.parse, traceback, sys, hashlib, time, base64, io, textwrap
 from datetime import datetime, timedelta
 from typing import Optional
 from aiohttp import web
@@ -45,11 +45,18 @@ quiz_cooldown, active_polls, spam_tracker = {}, {}, {}
 db = {"scores": {}, "weekly": {}, "locks": {}, "seen": {}, "counts": {}}
 fun_db = {"users": {}, "gay_couple_log": {}, "chat_memory": {}}
 ttt_games, mine_games, user_in_game, game_timers, mine_timers, gm_tracker, gm_msg_lock = {}, {}, {}, {}, {}, {}, {}
-sticker_file_ids, mine_play_stats = [], {}
+
+# Sticker pack from t.me/addstickers/t_me_belugapack_mystickers_by_fStikBot
+# File IDs are loaded at runtime via get_sticker_set API
+STICKER_PACK_NAME = "t_me_belugapack_mystickers_by_fStikBot"
+sticker_file_ids = []  # Populated at startup from the pack
+sticker_cache_loaded = False
+
+mine_play_stats = {}
 db_needs_sync_groups, loaded_groups, fun_db_loaded = set(), set(), False
 fun_db_needs_sync = False
 
-# Watermark session state: maps user_id -> {gkey, step, font_size, color, style}
+# Watermark session state: maps user_id -> {text, file_id, chat_id, step, font_size, color, style}
 wm_sessions = {}
 
 fun_cache = {"gay": {}, "couple": {}}
@@ -76,13 +83,18 @@ BANANA_PROMPT = """You are Beluga from @BELUGAPY answering using web search resu
 Answer in English only. Summarize relevant facts directly. Don't say you searched. Just answer naturally as Beluga would.
 Keep it to 3-4 lines max."""
 
+CV_PROMPT = """You are Beluga, a cute AI cat assistant. You are describing what you SEE in an image using computer vision analysis data.
+Describe only visible content naturally: objects, people, animals, food, vehicles, text, logos, scenes, actions.
+NEVER mention: resolution, dimensions, file size, pixels, aspect ratio, encoding, format, metadata, or technical specs.
+Sound natural and friendly. Max 4 lines. Start with what's most prominent."""
+
 QUIZ_TOPICS = ["deep ocean biology","quantum mechanics","human brain","solar system","animal behaviour","black holes","DNA genetics","ancient Egypt","World War 2"]
 FALLBACK_QS = [
     {"q":"Which planet has most moons?","opts":["Jupiter","Saturn","Uranus","Neptune"],"ans":1,"fact":"Saturn: 146 moons!"},
     {"q":"What covers 71% of Earth?","opts":["Land","Ice","Water","Air"],"ans":2,"fact":"Oceans!"},
 ]
 MEDALS = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
-WIKI_UA = {"User-Agent": "BelugaBot/11.0"}
+WIKI_UA = {"User-Agent": "BelugaBot/11.2"}
 G_HDR = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept-Language": "en-US,en;q=0.9"}
 
 SENTIMENT_POSITIVE = ["😊", "😄", "❤️", "🔥", "✨", "🎉", "💖", "😻", "👍"]
@@ -91,29 +103,13 @@ SENTIMENT_NEUTRAL = ["🤔", "😐", "👀", "🐾", "🎯", "📌", "💭", "�
 
 # Watermark font styles
 WM_STYLES = {
-    "Normal": None,
-    "Bold Classic": "bold",
-    "Italic Elegant": "italic",
+    "Normal": "normal",
+    "Bold": "bold",
+    "Italic": "italic",
+    "Bold Italic": "bolditalic",
     "Condensed": "condensed",
     "Light Thin": "light",
-    "Script Fancy": "script",
     "Block Strong": "block"
-}
-
-WM_COLORS_HEX = {
-    "Red": (255, 0, 0),
-    "Blue": (0, 0, 255),
-    "Green": (0, 200, 0),
-    "Yellow": (255, 255, 0),
-    "White": (255, 255, 255),
-    "Black": (0, 0, 0),
-    "Violet": (148, 0, 211),
-    "Indigo": (75, 0, 130),
-    "Blue2": (0, 0, 255),
-    "Green2": (0, 255, 0),
-    "Yellow2": (255, 255, 0),
-    "Orange": (255, 165, 0),
-    "Red2": (255, 0, 0),
 }
 
 VIBGYOR_COLORS = {
@@ -127,6 +123,57 @@ VIBGYOR_COLORS = {
     "⚪ White": (255, 255, 255, 220),
     "⚫ Black": (0, 0, 0, 220),
 }
+
+# Font path helpers
+FONT_PATHS = {
+    "bold": [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    ],
+    "italic": [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansOblique.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Italic.ttf",
+    ],
+    "bolditalic": [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBoldOblique.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-BoldItalic.ttf",
+    ],
+    "normal": [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    ],
+    "condensed": [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ],
+    "light": [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-ExtraLight.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ],
+    "block": [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+    ],
+}
+
+def load_font(style_key: str, size: int) -> ImageFont.FreeTypeFont:
+    """Load a font by style key and size, falling back gracefully."""
+    paths = FONT_PATHS.get(style_key, FONT_PATHS["normal"])
+    for p in paths:
+        try:
+            return ImageFont.truetype(p, size)
+        except Exception:
+            continue
+    # Last resort: default font scaled
+    try:
+        return ImageFont.load_default()
+    except Exception:
+        return ImageFont.load_default()
+
 
 def get_exchange(prefer: str = "bybit"):
     exchanges = ["bybit", "okx", "bitget", "kraken", "binance"]
@@ -233,6 +280,30 @@ async def periodic_github_sync():
             logger.error(f"[periodic_sync] {e}")
 
 # ═══════════════════════════════════════════════════════════════
+# STICKER PACK LOADER
+# ═══════════════════════════════════════════════════════════════
+async def load_sticker_pack(bot):
+    """Load sticker file IDs from the Beluga sticker pack at startup."""
+    global sticker_file_ids, sticker_cache_loaded
+    if sticker_cache_loaded:
+        return
+    try:
+        sticker_set = await bot.get_sticker_set(STICKER_PACK_NAME)
+        sticker_file_ids = [s.file_id for s in sticker_set.stickers]
+        sticker_cache_loaded = True
+        logger.info(f"✅ Loaded {len(sticker_file_ids)} stickers from {STICKER_PACK_NAME}")
+    except Exception as e:
+        logger.warning(f"⚠️ Could not load sticker pack '{STICKER_PACK_NAME}': {e}")
+        sticker_file_ids = []
+        sticker_cache_loaded = True  # Mark as attempted so we don't retry every message
+
+async def get_random_sticker() -> Optional[str]:
+    """Return a random sticker file_id from the loaded pack."""
+    if sticker_file_ids:
+        return random.choice(sticker_file_ids)
+    return None
+
+# ═══════════════════════════════════════════════════════════════
 # SCORING & LEADERBOARD
 # ═══════════════════════════════════════════════════════════════
 async def update_score(cid: str, uid: str, name: str, delta: int) -> int:
@@ -291,89 +362,189 @@ def analyze_sentiment(text: str) -> tuple:
         return 0.0, "🐾"
 
 # ═══════════════════════════════════════════════════════════════
-# ADVANCED CV - TRUE CONTENT DETECTION
+# COMPUTER VISION — NATURAL SCENE DESCRIPTION (NO TECH METADATA)
 # ═══════════════════════════════════════════════════════════════
-def advanced_image_analysis(img_bytes: bytes) -> str:
-    """Detect text, faces, objects and describe image content"""
+def advanced_image_analysis(img_bytes: bytes) -> dict:
+    """
+    Analyze image content using OpenCV and return structured data
+    about what is visible (objects, people, text, colors, scene).
+    Never returns technical metadata like resolution or file size.
+    """
+    result = {
+        "faces": 0,
+        "has_text": False,
+        "text_density": 0,
+        "scene_complexity": "simple",
+        "dominant_color": "Mixed",
+        "brightness": "normal",
+        "contour_count": 0,
+        "is_likely_screenshot": False,
+        "is_likely_document": False,
+        "is_likely_outdoor": False,
+        "sky_detected": False,
+        "error": None,
+    }
     try:
         arr = np.frombuffer(img_bytes, dtype=np.uint8)
         img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if img is None:
-            return "😿 Could not decode the image."
+            result["error"] = "decode_failed"
+            return result
 
         h, w = img.shape[:2]
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        analysis_parts = []
-
-        # ── TEXT DETECTION via MSER ──
-        mser = cv2.MSER_create()
-        regions, _ = mser.detectRegions(gray)
-        text_score = len(regions)
-        has_text = text_score > 30
 
         # ── FACE DETECTION ──
         face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
         faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
-        num_faces = len(faces) if hasattr(faces, '__len__') else 0
+        result["faces"] = len(faces) if hasattr(faces, '__len__') else 0
 
-        # ── EDGE / OBJECT COMPLEXITY ──
+        # ── TEXT DETECTION via MSER ──
+        try:
+            mser = cv2.MSER_create()
+            regions, _ = mser.detectRegions(gray)
+            result["text_density"] = len(regions)
+            result["has_text"] = len(regions) > 40
+        except:
+            pass
+
+        # ── EDGE COMPLEXITY ──
         edges = cv2.Canny(gray, 50, 150)
         contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        num_contours = len(contours)
+        n_contours = len(contours)
+        result["contour_count"] = n_contours
+        if n_contours > 150:
+            result["scene_complexity"] = "complex"
+        elif n_contours > 60:
+            result["scene_complexity"] = "moderate"
+        else:
+            result["scene_complexity"] = "simple"
 
         # ── DOMINANT COLOR ──
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         hist = cv2.calcHist([hsv], [0], None, [180], [0, 180])
         dominant_hue = int(np.argmax(hist))
-        hue_map = [(0,10,"Red"),(10,25,"Orange"),(25,35,"Yellow"),(35,60,"Green"),(60,90,"Cyan"),(90,120,"Blue"),(120,140,"Purple"),(140,170,"Pink")]
-        color_name = "Mixed"
-        for hmin, hmax, name in hue_map:
-            if hmin <= dominant_hue <= hmax:
-                color_name = name
-                break
+        sat_mean = np.mean(hsv[:, :, 1])
+        if sat_mean < 30:
+            # Low saturation — likely grayscale/black-and-white
+            bright_mean = np.mean(hsv[:, :, 2])
+            result["dominant_color"] = "White/Light tones" if bright_mean > 180 else "Black/Dark tones"
+        else:
+            hue_map = [
+                (0, 10, "Red"), (10, 25, "Orange"), (25, 35, "Yellow"),
+                (35, 60, "Green"), (60, 90, "Cyan"), (90, 120, "Blue"),
+                (120, 140, "Purple"), (140, 170, "Pink"), (170, 180, "Red"),
+            ]
+            for hmin, hmax, name in hue_map:
+                if hmin <= dominant_hue <= hmax:
+                    result["dominant_color"] = name
+                    break
 
         # ── BRIGHTNESS ──
         brightness = np.mean(gray)
         if brightness > 200:
-            bright_desc = "very bright / white background"
+            result["brightness"] = "very bright"
         elif brightness > 140:
-            bright_desc = "well-lit"
+            result["brightness"] = "well-lit"
         elif brightness > 80:
-            bright_desc = "normal lighting"
+            result["brightness"] = "normal"
         else:
-            bright_desc = "dark / low-light"
+            result["brightness"] = "dark"
 
-        # ── BUILD DESCRIPTION ──
-        desc = "👁️ *What I see in this image:*\n\n"
+        # ── SCREENSHOT / DOCUMENT HEURISTIC ──
+        # Screenshots tend to have very uniform rows (menus, text on white bg)
+        row_var = np.var(gray, axis=1)
+        low_var_rows = np.sum(row_var < 5)
+        if low_var_rows > h * 0.4:
+            result["is_likely_screenshot"] = True
+        if result["has_text"] and result["text_density"] > 200 and brightness > 180:
+            result["is_likely_document"] = True
 
-        if num_faces >= 2:
-            desc += f"👥 *People:* {num_faces} faces detected — looks like a group photo or conversation scene\n"
-        elif num_faces == 1:
-            desc += "🧑 *People:* 1 person detected — could be a selfie or portrait\n"
-
-        if has_text:
-            desc += f"📝 *Text:* Appears to contain written text or symbols\n"
-
-        # Object type guess based on contours + color
-        if num_contours > 150:
-            desc += f"🎨 *Scene:* Complex scene with many elements — possibly a graphic, meme, screenshot or busy photo\n"
-        elif num_contours > 60:
-            desc += f"📦 *Scene:* Multiple distinct objects visible\n"
-        elif num_contours > 15:
-            desc += f"🖼️ *Scene:* Simple scene with a few objects\n"
-        else:
-            desc += f"⬜ *Scene:* Minimal composition — possibly a plain image or icon\n"
-
-        desc += f"🎨 *Dominant color:* {color_name}\n"
-        desc += f"💡 *Lighting:* {bright_desc}\n"
-        desc += f"📐 *Resolution:* {w}×{h}px\n"
-        desc += "\n_🐾 Beluga Vision — for deeper analysis send me text about what you want to know!_"
-
-        return desc
+        # ── SKY DETECTION (top third mostly blue/light) ──
+        top_third = hsv[:h // 3, :, :]
+        blue_mask = cv2.inRange(top_third, np.array([90, 30, 100]), np.array([130, 255, 255]))
+        sky_ratio = np.sum(blue_mask > 0) / (blue_mask.size) if blue_mask.size > 0 else 0
+        result["sky_detected"] = sky_ratio > 0.3
+        result["is_likely_outdoor"] = result["sky_detected"]
 
     except Exception as e:
         logger.error(f"[cv_analysis] {e}")
-        return f"😿 Could not analyze this image. Try a clearer one!"
+        result["error"] = str(e)[:80]
+
+    return result
+
+
+def build_cv_description(cv_data: dict) -> str:
+    """Build a structured prompt-friendly description from CV data."""
+    parts = []
+
+    if cv_data.get("error") == "decode_failed":
+        return "I couldn't decode this image clearly."
+
+    faces = cv_data.get("faces", 0)
+    if faces >= 2:
+        parts.append(f"{faces} people visible (group shot or conversation)")
+    elif faces == 1:
+        parts.append("1 person visible (portrait or selfie)")
+
+    if cv_data.get("is_likely_document"):
+        parts.append("dense text content — looks like a document, article or webpage")
+    elif cv_data.get("is_likely_screenshot"):
+        parts.append("appears to be a screenshot (UI, app or website)")
+    elif cv_data.get("has_text"):
+        parts.append("contains visible text or labels")
+
+    complexity = cv_data.get("scene_complexity", "simple")
+    outdoor = cv_data.get("is_likely_outdoor", False)
+    sky = cv_data.get("sky_detected", False)
+
+    if complexity == "complex":
+        if outdoor:
+            parts.append("busy outdoor scene — possibly a street, crowd or landscape")
+        else:
+            parts.append("complex scene with many objects or graphic elements")
+    elif complexity == "moderate":
+        if outdoor or sky:
+            parts.append("outdoor setting — possibly nature, sky or open area")
+        else:
+            parts.append("a few distinct objects or elements")
+    else:
+        parts.append("minimal composition — possibly a simple object, icon or logo")
+
+    color = cv_data.get("dominant_color", "Mixed")
+    parts.append(f"dominant color tones: {color}")
+
+    brightness = cv_data.get("brightness", "normal")
+    if brightness in ("very bright", "dark"):
+        parts.append(f"lighting: {brightness}")
+
+    return "; ".join(parts) if parts else "general image content"
+
+
+async def describe_image_with_ai(img_bytes: bytes, user_question: str = "") -> str:
+    """Run CV analysis then use Groq to produce a natural language description."""
+    loop = asyncio.get_running_loop()
+    cv_data = await loop.run_in_executor(None, advanced_image_analysis, img_bytes)
+    cv_desc = build_cv_description(cv_data)
+
+    if cv_data.get("error") == "decode_failed":
+        return "😿 I couldn't decode this image — try sending a clearer one!"
+
+    user_q_part = f"\nUser asked: {user_question}" if user_question else ""
+    prompt = (
+        f"CV analysis data (do NOT mention these technical terms to user): {cv_desc}"
+        f"{user_q_part}\n\n"
+        "Describe what you see naturally as Beluga would, focusing on visible content only. "
+        "No metadata, no dimensions, no resolution. Just what's in the image."
+    )
+
+    reply = await ai(CV_PROMPT, prompt, fallback="", max_tok=150)
+    if reply:
+        return f"👁️ {reply}\n\n_🐾 Beluga Vision_"
+
+    # Fallback: build a readable sentence ourselves
+    parts_desc = cv_desc.replace(";", " •")
+    return f"👁️ Here's what I see: {parts_desc}\n\n_🐾 Beluga Vision_"
 
 # ═══════════════════════════════════════════════════════════════
 # AI & GROQ
@@ -570,7 +741,7 @@ async def crypto_chart_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         logger.error(f"[crypto_chart] {e}")
 
 # ═══════════════════════════════════════════════════════════════
-# NEWS - FIXED: single headline, 20 lines summary, no repeat, image
+# NEWS
 # ═══════════════════════════════════════════════════════════════
 def fetch_google_news(feed_type: str) -> list:
     feeds = {
@@ -584,7 +755,6 @@ def fetch_google_news(feed_type: str) -> list:
         parsed = feedparser.parse(url)
         for entry in parsed.entries[:20]:
             title = entry.get("title", "").strip()
-            # Remove source suffix like " - TechCrunch" that Google adds
             title = re.sub(r'\s*-\s*[^-]{3,40}$', '', title).strip()
             link = entry.get("link", "#")
             pub_date = entry.get("published", "")[:16]
@@ -595,18 +765,15 @@ def fetch_google_news(feed_type: str) -> list:
             if img_match:
                 img_url = img_match.group(1)
 
-            # Fetch article content for 20 lines
             full_text = ""
             try:
                 r = requests.get(link, headers=G_HDR, timeout=8)
                 if r.status_code == 200:
                     soup = BeautifulSoup(r.text, "html.parser")
-                    # Remove scripts/styles
                     for tag in soup(["script","style","nav","footer","header","aside"]):
                         tag.decompose()
                     paragraphs = [p.get_text().strip() for p in soup.find_all('p') if len(p.get_text().strip()) > 50]
                     full_text = " ".join(paragraphs[:8])[:1800]
-                    # Try to get image from article page
                     if not img_url:
                         og_img = soup.find("meta", property="og:image")
                         if og_img and og_img.get("content"):
@@ -629,8 +796,6 @@ def fetch_google_news(feed_type: str) -> list:
     return results
 
 def _format_news_body(summary: str) -> str:
-    """Format summary into ~20 readable lines"""
-    # Split into sentences
     sentences = re.split(r'(?<=[.!?])\s+', summary.strip())
     lines = []
     for s in sentences:
@@ -665,11 +830,9 @@ async def execute_news_flow(u: Update, c: ContextTypes.DEFAULT_TYPE, feed_type: 
 
         await sm.delete()
 
-        # Pick a random article from top 8
         top = random.choice(items[:min(8, len(items))])
         body = _format_news_body(top["summary"])
 
-        # Build caption — headline once only, then body, then readmore
         caption = (
             f"📰 *{label.upper()}*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -679,7 +842,6 @@ async def execute_news_flow(u: Update, c: ContextTypes.DEFAULT_TYPE, feed_type: 
             f"📅 {top['date']}"
         )
 
-        # Telegram caption limit is 1024 chars
         if len(caption) > 1020:
             caption = caption[:1017] + "..."
 
@@ -700,7 +862,6 @@ async def execute_news_flow(u: Update, c: ContextTypes.DEFAULT_TYPE, feed_type: 
                 logger.warning(f"[news_img] {img_err}")
 
         if not sent:
-            # Send as text with longer body since no image limit
             full_cap = (
                 f"📰 *{label.upper()}*\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -816,8 +977,144 @@ async def img_handler(u: Update, c: ContextTypes.DEFAULT_TYPE, action: str):
         logger.error(f"[img_handler] {e}")
 
 # ═══════════════════════════════════════════════════════════════
-# WATERMARK - FULL INTERACTIVE FLOW WITH INLINE KEYBOARD
+# WATERMARK — IMPROVED: wrapping, bold/italic/bold-italic, no overflow
 # ═══════════════════════════════════════════════════════════════
+def _wrap_text_to_fit(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont,
+                      max_width: int) -> list:
+    """
+    Wrap text into lines that fit within max_width pixels.
+    Handles Unicode and emoji by measuring each segment with PIL.
+    Returns list of line strings.
+    """
+    words = text.split()
+    lines = []
+    current = ""
+    for word in words:
+        test = f"{current} {word}".strip() if current else word
+        try:
+            bbox = draw.textbbox((0, 0), test, font=font)
+            test_w = bbox[2] - bbox[0]
+        except Exception:
+            test_w = len(test) * (font.size // 2)
+        if test_w <= max_width:
+            current = test
+        else:
+            if current:
+                lines.append(current)
+            # If single word is wider than max, force-break it
+            if not current:
+                lines.append(word)
+                current = ""
+            else:
+                current = word
+    if current:
+        lines.append(current)
+    return lines if lines else [text]
+
+
+def _apply_watermark(buf: io.BytesIO, wm_text: str, font_size: int,
+                     color_key: str, style_name: str) -> io.BytesIO:
+    """
+    Apply watermark with:
+    - Automatic text wrapping so it never overflows
+    - Font size auto-reduction if needed
+    - Proper centering (bottom of image)
+    - Shadow for visibility on any background
+    - Supports Bold, Italic, Bold Italic styles
+    """
+    im = Image.open(buf).convert("RGBA")
+    img_w, img_h = im.size
+
+    rgba = VIBGYOR_COLORS.get(color_key, (255, 255, 255, 220))
+    style_key = WM_STYLES.get(style_name, "normal")
+
+    # Margins: 4% on each side
+    margin_x = max(10, int(img_w * 0.04))
+    margin_y = max(10, int(img_h * 0.03))
+    max_text_width = img_w - 2 * margin_x
+
+    # Try font sizes from requested down to minimum (12px)
+    chosen_font = None
+    chosen_lines = None
+    chosen_size = font_size
+
+    for try_size in range(font_size, 11, -2):
+        try:
+            font = load_font(style_key, try_size)
+        except Exception:
+            font = ImageFont.load_default()
+
+        # Temporary draw surface for measuring
+        tmp_draw = ImageDraw.Draw(Image.new("RGBA", (img_w, img_h)))
+        lines = _wrap_text_to_fit(tmp_draw, wm_text, font, max_text_width)
+
+        # Measure total block height
+        try:
+            line_bbox = tmp_draw.textbbox((0, 0), "Ay", font=font)
+            line_h = (line_bbox[3] - line_bbox[1]) + int(try_size * 0.25)
+        except Exception:
+            line_h = try_size + 4
+
+        total_h = line_h * len(lines)
+        max_line_w = max(
+            (tmp_draw.textbbox((0, 0), ln, font=font)[2] - tmp_draw.textbbox((0, 0), ln, font=font)[0])
+            for ln in lines
+        ) if lines else 0
+
+        if max_line_w <= max_text_width and total_h <= img_h * 0.4:
+            chosen_font = font
+            chosen_lines = lines
+            chosen_size = try_size
+            break
+
+    if chosen_font is None:
+        chosen_font = load_font(style_key, 12)
+        tmp_draw = ImageDraw.Draw(Image.new("RGBA", (img_w, img_h)))
+        chosen_lines = _wrap_text_to_fit(tmp_draw, wm_text, chosen_font, max_text_width)
+        chosen_size = 12
+
+    # Measure final layout
+    measure_draw = ImageDraw.Draw(Image.new("RGBA", (img_w, img_h)))
+    try:
+        line_bbox = measure_draw.textbbox((0, 0), "Ay", font=chosen_font)
+        line_h = (line_bbox[3] - line_bbox[1]) + int(chosen_size * 0.25)
+    except Exception:
+        line_h = chosen_size + 4
+
+    total_text_h = line_h * len(chosen_lines)
+
+    # Position block: bottom-center with margin
+    block_top = img_h - total_text_h - margin_y
+
+    # Create text overlay layer
+    txt_layer = Image.new("RGBA", im.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(txt_layer)
+
+    shadow_color = (0, 0, 0, 140)
+    shadow_offset = max(1, chosen_size // 20)
+
+    for i, line in enumerate(chosen_lines):
+        try:
+            lb = draw.textbbox((0, 0), line, font=chosen_font)
+            lw = lb[2] - lb[0]
+        except Exception:
+            lw = len(line) * (chosen_size // 2)
+
+        x = (img_w - lw) // 2
+        y = block_top + i * line_h
+
+        # Shadow
+        draw.text((x + shadow_offset, y + shadow_offset), line, font=chosen_font, fill=shadow_color)
+        # Main text
+        draw.text((x, y), line, font=chosen_font, fill=rgba)
+
+    combined = Image.alpha_composite(im, txt_layer)
+    out_b = io.BytesIO()
+    combined.convert("RGB").save(out_b, "JPEG", quality=92)
+    out_b.seek(0)
+    return out_b
+
+
 async def watermark_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """Step 1: User sends /watermark text replying to image → ask font size"""
     if not u.message:
@@ -833,7 +1130,6 @@ async def watermark_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     cid = u.effective_chat.id
     photo = u.message.reply_to_message.photo[-1]
 
-    # Store session
     wm_sessions[uid] = {
         "text": wm_text,
         "file_id": photo.file_id,
@@ -841,20 +1137,19 @@ async def watermark_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         "step": "font_size"
     }
 
-    # Build font size keyboard
-    sizes = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+    sizes = [16, 24, 32, 40, 52, 64, 80, 96]
     rows = []
     row = []
     for sz in sizes:
         row.append(InlineKeyboardButton(str(sz), callback_data=f"wm:size:{uid}:{sz}"))
-        if len(row) == 5:
+        if len(row) == 4:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
 
     await u.message.reply_text(
-        f"🖊 *Watermark: `{wm_text}`*\n\nStep 1️⃣ — Choose *font size:*",
+        f"🖊 *Watermark:* `{wm_text}`\n\nStep 1️⃣ — Choose *font size:*",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(rows)
     )
@@ -872,7 +1167,7 @@ def _build_color_keyboard(uid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 def _build_style_keyboard(uid: int) -> InlineKeyboardMarkup:
-    styles = ["Normal", "Bold Classic", "Italic Elegant", "Condensed", "Light Thin", "Script Fancy", "Block Strong"]
+    styles = list(WM_STYLES.keys())
     rows = []
     for s in styles:
         rows.append([InlineKeyboardButton(s, callback_data=f"wm:style:{uid}:{s}")])
@@ -888,7 +1183,6 @@ async def watermark_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         _, step, owner_uid_str, value = parts
         owner_uid = int(owner_uid_str)
 
-        # Only the original requester can interact
         if q.from_user.id != owner_uid:
             await q.answer("❌ This is not your watermark session!", show_alert=True)
             return
@@ -902,7 +1196,7 @@ async def watermark_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             sess["font_size"] = int(value)
             sess["step"] = "color"
             await q.edit_message_text(
-                f"🖊 *Watermark: `{sess['text']}`*\nFont size: `{value}`\n\nStep 2️⃣ — Choose *text color:*",
+                f"🖊 *Watermark:* `{sess['text']}`\nFont size: `{value}`\n\nStep 2️⃣ — Choose *text color:*",
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=_build_color_keyboard(owner_uid)
             )
@@ -911,7 +1205,7 @@ async def watermark_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             sess["color"] = value
             sess["step"] = "style"
             await q.edit_message_text(
-                f"🖊 *Watermark: `{sess['text']}`*\nFont size: `{sess['font_size']}` | Color: `{value}`\n\nStep 3️⃣ — Choose *text style:*",
+                f"🖊 *Watermark:* `{sess['text']}`\nSize: `{sess['font_size']}` | Color: `{value}`\n\nStep 3️⃣ — Choose *text style:*",
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=_build_style_keyboard(owner_uid)
             )
@@ -921,7 +1215,6 @@ async def watermark_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             sess["step"] = "done"
             await q.edit_message_text("⚙️ *Applying watermark...*", parse_mode=ParseMode.MARKDOWN)
 
-            # Apply watermark
             try:
                 file_obj = await context.bot.get_file(sess["file_id"])
                 buf = io.BytesIO()
@@ -933,68 +1226,29 @@ async def watermark_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 style_name = sess.get("style", "Normal")
                 wm_text = sess["text"]
 
-                rgba = VIBGYOR_COLORS.get(color_key, (255, 255, 255, 200))
-
                 loop = asyncio.get_running_loop()
-
-                def _apply():
-                    im = Image.open(buf).convert("RGBA")
-                    txt_layer = Image.new("RGBA", im.size, (255, 255, 255, 0))
-                    draw = ImageDraw.Draw(txt_layer)
-
-                    # Try to load a font
-                    font = None
-                    try:
-                        if style_name in ("Bold Classic", "Block Strong"):
-                            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
-                        elif style_name in ("Italic Elegant", "Script Fancy"):
-                            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf", font_size)
-                        elif style_name == "Light Thin":
-                            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-ExtraLight.ttf", font_size)
-                        else:
-                            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", font_size)
-                    except:
-                        try:
-                            font = ImageFont.truetype("/usr/share/fonts/truetype/freefont/FreeSans.ttf", font_size)
-                        except:
-                            font = ImageFont.load_default()
-
-                    # Get text size for centering
-                    try:
-                        bbox = draw.textbbox((0, 0), wm_text, font=font)
-                        tw = bbox[2] - bbox[0]
-                        th = bbox[3] - bbox[1]
-                    except:
-                        tw, th = len(wm_text) * font_size // 2, font_size
-
-                    # Position: bottom center
-                    x = max(0, (im.size[0] - tw) // 2)
-                    y = max(0, im.size[1] - th - 20)
-
-                    # Shadow for visibility
-                    shadow_color = (0, 0, 0, 120)
-                    draw.text((x+2, y+2), wm_text, font=font, fill=shadow_color)
-                    draw.text((x, y), wm_text, font=font, fill=rgba)
-
-                    combined = Image.alpha_composite(im, txt_layer)
-                    out_b = io.BytesIO()
-                    combined.convert("RGB").save(out_b, "JPEG", quality=92)
-                    out_b.seek(0)
-                    return out_b
-
-                res_b = await loop.run_in_executor(None, _apply)
+                res_b = await loop.run_in_executor(
+                    None, _apply_watermark, buf, wm_text, font_size, color_key, style_name
+                )
 
                 await context.bot.send_photo(
                     chat_id=sess["chat_id"],
                     photo=res_b,
-                    caption=f"🛡 *Watermark Applied!*\n`{wm_text}` | Size: `{font_size}` | Color: `{color_key}` | Style: `{style_name}`",
+                    caption=(
+                        f"🛡 *Watermark Applied!*\n"
+                        f"Text: `{wm_text}` | Size: `{font_size}` | "
+                        f"Color: `{color_key}` | Style: `{style_name}`"
+                    ),
                     parse_mode=ParseMode.MARKDOWN
                 )
                 wm_sessions.pop(owner_uid, None)
 
             except Exception as e:
                 logger.error(f"[wm_apply] {e}")
-                await q.edit_message_text(f"😿 Error applying watermark: `{str(e)[:60]}`", parse_mode=ParseMode.MARKDOWN)
+                await q.edit_message_text(
+                    f"😿 Error applying watermark: `{str(e)[:80]}`",
+                    parse_mode=ParseMode.MARKDOWN
+                )
 
     except Exception as e:
         logger.error(f"[wm_callback] {e}")
@@ -1011,7 +1265,8 @@ async def analyze_image_with_cv(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     text = (update.message.text or "").lower().strip()
-    question_words = ["what","who","where","show","see","contains","display","in","describe","tell","whats","explain","is","are","text","written","says","this","that"]
+    question_words = ["what","who","where","show","see","contains","display","in","describe",
+                      "tell","whats","explain","is","are","text","written","says","this","that"]
     if not any(w in text for w in question_words) or len(text) < 3:
         return
 
@@ -1030,11 +1285,9 @@ async def analyze_image_with_cv(update: Update, context: ContextTypes.DEFAULT_TY
 
         buf = io.BytesIO()
         await file_obj.download_to_memory(buf)
-        buf.seek(0)
         img_bytes = buf.getvalue()
 
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, advanced_image_analysis, img_bytes)
+        result = await describe_image_with_ai(img_bytes, user_question=text)
         await sm.edit_text(result, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         logger.error(f"[analyze_image] {e}")
@@ -1122,19 +1375,17 @@ async def poll_answer_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         pass
 
 # ═══════════════════════════════════════════════════════════════
-# LEADERBOARD - ALWAYS FROM GITHUB FILE
+# LEADERBOARD
 # ═══════════════════════════════════════════════════════════════
 async def lb_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message:
         return
     try:
         cid = str(u.effective_chat.id)
-        # Always fresh from GitHub
         loop = asyncio.get_running_loop()
         gh_data = await loop.run_in_executor(None, gh_rw, "read", f"beluga_{cid}.json", {})
 
         if gh_data:
-            # Update in-memory with latest from GitHub
             db.setdefault("scores", {})[cid] = gh_data.get("scores", {})
             db.setdefault("weekly", {})[cid] = gh_data.get("weekly", {})
             loaded_groups.add(cid)
@@ -1422,14 +1673,16 @@ def ttt_build_text(g):
     return f"🎮 *TIC TAC TOE*\n━━━━━━━━━━━━━━\n❌ {g['x_name']}  🆚  ⭕ {g['o_name']}\n━━━━━━━━━━━━━━\n\n{board_str}\n\n━━━━━━━━━━━━━━\n{sl}"
 
 async def cleanup_expired_games():
-    now = time.time()
-    for gkey in list(ttt_games.keys()):
-        g = ttt_games[gkey]
-        if now - g.get("created", now) > 300:
-            for uid in [str(g.get("x_id","")), str(g.get("o_id",""))]:
-                user_in_game.pop(uid, None)
-            game_timers.pop(gkey, None)
-            del ttt_games[gkey]
+    while True:
+        await asyncio.sleep(60)
+        now = time.time()
+        for gkey in list(ttt_games.keys()):
+            g = ttt_games[gkey]
+            if now - g.get("created", now) > 300:
+                for uid in [str(g.get("x_id","")), str(g.get("o_id",""))]:
+                    user_in_game.pop(uid, None)
+                game_timers.pop(gkey, None)
+                del ttt_games[gkey]
 
 async def run_game_timer(c, gkey):
     try:
@@ -1464,7 +1717,6 @@ def player_busy(uid):
 async def tictac_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message: return
     try:
-        await cleanup_expired_games()
         ua, cid, uid_a = u.effective_user, u.effective_chat.id, str(u.effective_user.id)
         name_a = (ua.first_name or "Player")[:20]
         vs_bot, user_b_id, name_b = True, None, "🤖 Bot"
@@ -1754,14 +2006,13 @@ async def bananalogic_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     answer = await web_summarise(query, wiki, goog, BANANA_PROMPT, max_tok=600)
     if answer:
         await sm.delete()
-        # Quote style: user question in bold, then answer as reply
         text = f"❝ *{query}* ❞\n\n{answer}\n\n🐾 _via BananaLogic_"
         await u.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_to_message_id=u.message.message_id)
     else:
         await sm.edit_text("🍌 No response. Try again!")
 
 # ═══════════════════════════════════════════════════════════════
-# GENERAL CHAT - 2-LINE REPLIES, NO NLP, USE USER NAME
+# GENERAL CHAT MONITOR
 # ═══════════════════════════════════════════════════════════════
 async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message or not u.effective_user or u.effective_user.is_bot:
@@ -1802,7 +2053,7 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
         is_reply = (u.message.reply_to_message and u.message.reply_to_message.from_user
                     and u.message.reply_to_message.from_user.id == c.bot.id)
 
-        # Image analysis
+        # Image analysis — triggered when user asks a question replying to an image
         if u.message.reply_to_message and (u.message.reply_to_message.photo or u.message.reply_to_message.sticker):
             await analyze_image_with_cv(u, c)
             return
@@ -1823,7 +2074,6 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
             reply = await ai(system, text, f"Meow {user_name}! 🐾", max_tok=120)
 
-            # Save memory
             if text and len(text) > 5:
                 await save_chat_memory(cid, str(uid), user_name, text)
 
@@ -1842,7 +2092,7 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════
 async def _health(req):
     up = int((datetime.now() - bot_status["start_time"]).total_seconds())
-    return web.json_response({"status": "healthy", "uptime_seconds": up, "running": bot_status["running"], "messages": bot_status["message_count"], "version": "11.1.0"})
+    return web.json_response({"status": "healthy", "uptime_seconds": up, "running": bot_status["running"], "messages": bot_status["message_count"], "version": "11.2.0"})
 
 async def _ping(req):
     return web.json_response({"pong": True, "ts": datetime.now().isoformat()})
@@ -1872,7 +2122,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         except: pass
 
 # ═══════════════════════════════════════════════════════════════
-# START COMMAND - QUOTED CLASSY DESIGN + UPDATES CHANNEL BUTTON
+# START COMMAND
 # ═══════════════════════════════════════════════════════════════
 async def start_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message:
@@ -1883,7 +2133,7 @@ async def start_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     text = (
         f"*Hey {user_name}!* 👋\n\n"
         "┌─────────────────────────────┐\n"
-        "│   ✨ *BELUGA BOT v11.1.0* ✨   │\n"
+        "│   ✨ *BELUGA BOT v11.2.0* ✨   │\n"
         "│  🐱 _Your AI Crypto Companion_  │\n"
         "│       *from* @BELUGAPY         │\n"
         "└─────────────────────────────┘\n\n"
@@ -1939,7 +2189,7 @@ async def start_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
 # MAIN
 # ═══════════════════════════════════════════════════════════════
 async def main():
-    logger.info("🐱 STARTING BELUGA BOT v11.1.0")
+    logger.info("🐱 STARTING BELUGA BOT v11.2.0")
     http_runner = await start_http(HTTP_PORT)
     await asyncio.sleep(0.3)
 
@@ -1977,7 +2227,7 @@ async def main():
     app.add_handler(CallbackQueryHandler(watermark_callback, pattern=r"^wm:"))
     app.add_handler(PollAnswerHandler(poll_answer_handler))
 
-    # Chat monitor (text only)
+    # Chat monitor
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, monitor))
     app.add_error_handler(error_handler)
 
@@ -1989,10 +2239,14 @@ async def main():
         bot_status["username"] = me.username.lower()
         logger.info(f"🤖 Bot: @{me.username}")
     except Exception as e:
-        logger.warning(f"[Startup] {e}")
+        logger.warning(f"[Startup/get_me] {e}")
+
+    # Load sticker pack from Telegram
+    await load_sticker_pack(app.bot)
 
     await app.updater.start_polling(drop_pending_updates=True, allowed_updates=[])
     bot_status["running"] = True
+    logger.info("✅ Beluga Bot is running")
 
     stop_evt = asyncio.Event()
     try:
@@ -2000,22 +2254,28 @@ async def main():
         loop = asyncio.get_running_loop()
         loop.add_signal_handler(signal.SIGTERM, stop_evt.set)
         loop.add_signal_handler(signal.SIGINT, stop_evt.set)
-    except: pass
+    except:
+        pass
 
     cleanup_task = asyncio.create_task(cleanup_expired_games())
     sync_task = asyncio.create_task(periodic_github_sync())
 
     await stop_evt.wait()
-    cleanup_task.cancel(); sync_task.cancel()
+    logger.info("🛑 Shutting down...")
+    cleanup_task.cancel()
+    sync_task.cancel()
     bot_status["running"] = False
     for fn in [app.updater.stop, app.stop, app.shutdown, http_runner.cleanup]:
-        try: await fn()
-        except: pass
+        try:
+            await fn()
+        except:
+            pass
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
-    except Exception:
+    except Exception as e:
+        logger.critical(f"Fatal: {e}")
         sys.exit(1)
