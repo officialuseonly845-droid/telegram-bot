@@ -108,7 +108,7 @@ G_HDR = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/53
 
 SENTIMENT_POSITIVE = ["😊", "😄", "❤️", "🔥", "✨", "🎉", "💖", "😻", "👍"]
 SENTIMENT_NEGATIVE = ["😢", "😠", "💔", "😤", "😭", "😞", "😿", "😡", "⚠️"]
-SENTIMENT_NEUTRAL = ["🤔", "😐", "👀", "🐾", "🎯", "📌", "💭", "🤷"]
+SENTIMENT_NEUTRAL = ["🤔", "😎", "👀", "🐾", "🥴", "🥸", "💭", "👾"]
 
 # Watermark font styles
 WM_STYLES = {
