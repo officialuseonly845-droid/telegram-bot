@@ -1968,10 +1968,15 @@ async def main():
     app.add_handler(CallbackQueryHandler(watermark_callback, pattern=r"^wm:"))
     app.add_handler(PollAnswerHandler(poll_answer_handler))
 
-    # ---- Message handlers (order matters: DM secretary -> ghost mode -> general monitor) ----
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, monitor_dm))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, monitor_ghost_mode))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, monitor))
+    # ---- Message handlers ----
+    # IMPORTANT: each handler is registered in its OWN handler group (0, 1, 2).
+    # PTB only runs the FIRST matching handler within a single group by default,
+    # so without separate groups, monitor_ghost_mode (group 0) would silently
+    # swallow every group-chat text message and monitor() would never run —
+    # which is exactly why saying "beluga" stopped getting AI replies.
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, monitor_dm), group=0)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, monitor_ghost_mode), group=1)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, monitor), group=2)
 
     app.add_error_handler(error_handler)
 
