@@ -37,15 +37,24 @@ if not BOT_TOKEN or len(BOT_TOKEN) < 20:
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION 2: PERSISTENT GITHUB FILE NAMES (single source of truth)
 # ═══════════════════════════════════════════════════════════════════════════
-# These are the ONLY data files this bot creates/reads on GitHub.
-# On every restart the bot CHECKS if a file already exists before writing —
-# it never creates duplicates.
+# These are the ONLY two data files this bot ever creates on GitHub.
+# On EVERY restart (see SECTION 5 -> load_persistent_data), the bot checks
+# gh_file_exists(filename) FIRST. If the file is already there, it is loaded
+# and never re-created or overwritten with empty data. A new file is only
+# written the very first time a deployment runs with no existing file.
+#
+#   FILE_LEADERBOARD = "beluga_leaderboard.json"
+#       -> stores: all chat scores (db["scores"]) + weekly champions (db["weekly"])
+#
+#   FILE_STICKERS = "beluga_stickers.json"
+#       -> stores: sticker pack file_ids for every loaded pack + banned pack list
+#
 FILE_LEADERBOARD = "beluga_leaderboard.json"   # all chat scores + weekly champions
 FILE_STICKERS = "beluga_stickers.json"          # sticker pack file_ids + banned packs
 
 # Sticker packs this bot manages
-STICKER_PACK_MAIN = "t_me_belugapack_mystickers_by_fStikBot"
-STICKER_PACK_SAFE = "t_me_staysafebelu_by_fStikBot"
+STICKER_PACK_MAIN = "t_me_belugapack_mystickers_by_fStikBot"   # normal Beluga pack
+STICKER_PACK_SAFE = "t_me_staysafebelu_by_fStikBot"             # "stay safe" pack
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION 3: IN-MEMORY STATE
@@ -57,7 +66,10 @@ fun_db = {"gay_couple_log": {}, "chat_memory": {}}
 ttt_games, mine_games, user_in_game, game_timers, mine_timers, gm_tracker, gm_msg_lock = {}, {}, {}, {}, {}, {}, {}
 mine_play_stats = {}
 wm_sessions = {}
-secretary_enabled = set()
+
+# Secretary mode: uid -> {"owner_name": str, "owner_gender": "male"/"female"/"unknown"}
+# Enabled per Telegram user via Chat Automation (forwarding their DMs to this bot).
+secretary_enabled = {}
 
 sticker_data = {"packs": {}, "banned_packs": []}
 db_needs_sync = False
@@ -78,10 +90,11 @@ START_VIDEO = "https://go.screenpal.com/watch/cO1oqenuAPr"
 CHAT_PROMPT = """You are Beluga, a cute female AI cat assistant from @BELUGAPY channel. Stay in character.
 Personality: warm, playful, intelligent, helpful. Reply in EXACTLY 2 short lines maximum.
 Always use the user's first name when replying. Be casual and friendly.
-Reply in English and henglish when user asks in henglish or else answer in English only. Never use NLP analysis labels. Just reply naturally."""
+Reply in English always. Never use NLP analysis labels. Just reply naturally."""
 
-DM_SECRETARY_PROMPT = """You are Beluga's secretary mode, handling a personal DM on behalf of the user.
-Reply with EXACTLY 1 short line. Be crunchy, casual, fast, to the point."""
+DM_SECRETARY_PROMPT = """You are Beluga, handling a personal DM on behalf of the chat owner (acting as their secretary).
+By default, reply with EXACTLY 1 short line — crunchy, casual, fast, to the point.
+Only if the incoming message explicitly asks for detail/explanation should you give a longer answer, and even then stay under 100 words."""
 
 BANANA_PROMPT = """You are Beluga from @BELUGAPY answering using web search results. Be concise, accurate, conversational.
 Answer in English only. Summarize relevant facts directly. Don't say you searched. Keep it to 3-4 lines max."""
@@ -97,7 +110,7 @@ G_HDR = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/53
 
 SENTIMENT_POSITIVE = ["😊", "😄", "❤️", "🔥", "✨", "🎉", "💖", "😻", "👍"]
 SENTIMENT_NEGATIVE = ["😢", "😠", "💔", "😤", "😭", "😞", "😿", "😡", "⚠️"]
-SENTIMENT_NEUTRAL = ["🤔", "😐", "👀", "🐾", "🎯", "📌", "💭", "😎"]
+SENTIMENT_NEUTRAL = ["🤔", "😐", "👀", "🐾", "🎯", "📌", "💭", "🤷"]
 
 WM_STYLES = {
     "Normal": "normal", "Bold": "bold", "Italic": "italic", "Bold Italic": "bolditalic",
@@ -266,6 +279,15 @@ async def periodic_sync():
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION 6: STICKER PACK MANAGEMENT
 # ═══════════════════════════════════════════════════════════════════════════
+# sticker_data["packs"]        : { pack_name: [file_id, file_id, ...] }
+# sticker_data["banned_packs"] : [ pack_name, pack_name, ... ]
+#
+# IMPORTANT for /block: every sticker a user SENDS in a group carries a
+# `set_name` field (the pack name it belongs to) directly on the Sticker
+# object — we do NOT need to have pre-loaded that pack ourselves to detect
+# and delete it. ban_sticker_pack() just adds the name to banned_packs, and
+# the group message handler (SECTION 24) checks any incoming sticker's
+# `.set_name` against that list on every message.
 async def load_sticker_pack(bot, pack_name: str):
     """
     Fetch a sticker pack's file_ids from Telegram and store them in memory.
@@ -283,21 +305,29 @@ async def load_sticker_pack(bot, pack_name: str):
         logger.warning(f"Could not load sticker pack '{pack_name}': {e}")
 
 async def ban_sticker_pack(pack_name: str):
-    """Add a pack to the banned list so its stickers are excluded going forward."""
+    """Add a pack to the banned list. Any sticker sent FROM this pack by any
+    user in any group will be auto-deleted by the bot (see monitor())."""
     global sticker_data_needs_sync
     if pack_name not in sticker_data["banned_packs"]:
         sticker_data["banned_packs"].append(pack_name)
         sticker_data_needs_sync = True
         logger.info(f"Sticker pack banned: {pack_name}")
 
+def is_pack_banned(pack_name: Optional[str]) -> bool:
+    """Check whether a sticker's set_name is on the banned list."""
+    if not pack_name:
+        return False
+    return pack_name in sticker_data.get("banned_packs", [])
+
 async def get_random_sticker_from(pack_name: str) -> Optional[str]:
-    """Get a random sticker file_id from one specific pack (skips if banned)."""
-    if pack_name in sticker_data.get("banned_packs", []):
+    """Get a random sticker file_id from ONE specific pack (skips if banned)."""
+    if is_pack_banned(pack_name):
         return None
     stickers = sticker_data.get("packs", {}).get(pack_name, [])
     return random.choice(stickers) if stickers else None
 
 async def get_random_sticker_any() -> Optional[str]:
+
     """Get a random sticker from ANY loaded, non-banned pack."""
     pool = []
     for pack_name, stickers in sticker_data.get("packs", {}).items():
@@ -1644,8 +1674,14 @@ async def bananalogic_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await sm.edit_text("🍌 No response. Try again!")
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 21: /block — STICKER PACK BAN
+# SECTION 21: /block — STICKER PACK BAN (auto-delete banned-pack stickers)
 # ═══════════════════════════════════════════════════════════════════════════
+# Usage: /block https://t.me/addstickers/Sadalien_pack   (or just the pack name)
+#
+# Behaviour: from this point on, ANY sticker sent by ANY user in ANY group,
+# that belongs to a banned pack, is automatically deleted by Beluga. This is
+# detected live in monitor_group() (SECTION 24) by reading the incoming
+# sticker's `.set_name` field and checking it against sticker_data["banned_packs"].
 async def block_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """Owner-only. /block <pack_name OR t.me/addstickers/ URL> bans a sticker pack."""
     if not u.message:
@@ -1660,61 +1696,179 @@ async def block_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             return
         pack_input = parts[1].strip()
         pack_name = pack_input.split("t.me/addstickers/")[-1].strip("/") if "t.me/addstickers/" in pack_input else pack_input
-        await load_sticker_pack(c.bot, pack_name)  # load so we know its stickers (then exclude them)
         await ban_sticker_pack(pack_name)
-        await u.message.reply_text(f"🚫 *Pack blocked:* `{pack_name}`\nAll stickers from this pack are now excluded from Beluga's responses.", parse_mode=ParseMode.MARKDOWN)
+        await u.message.reply_text(
+            f"🚫 *Pack blocked:* `{pack_name}`\n"
+            f"Any sticker from this pack sent by anyone in this group will now be auto-deleted.",
+            parse_mode=ParseMode.MARKDOWN
+        )
     except Exception as e:
         logger.error(f"[block] {e}")
         await u.message.reply_text(f"❌ Error: `{str(e)[:60]}`")
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 22: SECRETARY MODE (DM handling, 1-line replies)
+# SECTION 22: SECRETARY MODE (Chat Automation DM handling)
 # ═══════════════════════════════════════════════════════════════════════════
+# Setup (done by the END USER on their own Telegram account, not a bot command):
+#   Settings -> Account -> Chat Automation -> set link to @iSaminaBot (or this
+#   bot's username) -> tap the checkmark top-right -> Done.
+# Once set up, Telegram itself forwards the user's incoming private messages
+# to this bot, which then auto-replies on their behalf.
+#
+# `/secretary` here is just a manual on/off toggle + a one-time setup question
+# (the owner's display name + gender) so Beluga can answer "where is he/she?"
+# correctly when someone DMs the account being covered.
+#
+# Reply rules:
+#   - Default: ONE short line.
+#   - If the incoming message explicitly asks for more detail / a longer
+#     answer, reply can be up to ~100 words.
+#   - Every reply signs off with "— Beluga (handling chat for <name>)" at the
+#     BOTTOM of the message (Telegram-style signature), never woven into the
+#     AI-generated sentence itself.
+#   - If asked "where is he/she/are they", answer using the stored gender:
+#     "He's not home right now" / "She's not home right now".
+def _wants_long_reply(text: str) -> bool:
+    """Heuristic: does the incoming message ask Beluga to elaborate?"""
+    triggers = ["explain", "detail", "elaborate", "more info", "tell me more",
+                "describe", "in full", "long answer", "why", "how does", "how do"]
+    t = text.lower()
+    return any(trig in t for trig in triggers) or len(text) > 200
+
+def _asks_where_is_owner(text: str) -> bool:
+    t = text.lower()
+    return bool(re.search(r"\bwhere\s+(is|are|s)\b", t)) and any(w in t for w in ["he", "she", "they", "him", "her", "owner", "is he", "is she"])
+
 async def secretary_toggle_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Owner-side toggle + setup. DM only."""
     if not u.message or u.effective_chat.type != "private":
         await u.message.reply_text("📨 Secretary mode only works in DMs!")
         return
     uid = u.effective_user.id
     if uid in secretary_enabled:
-        secretary_enabled.discard(uid)
-        await u.message.reply_text("❌ *Secretary mode OFF* — I won't handle your DMs anymore.", parse_mode=ParseMode.MARKDOWN)
-    else:
-        secretary_enabled.add(uid)
-        await u.message.reply_text("✅ *Secretary mode ON* — I'll handle your DMs with short, snappy replies!", parse_mode=ParseMode.MARKDOWN)
+        secretary_enabled.pop(uid, None)
+        await u.message.reply_text("❌ *Secretary mode OFF* — I won't auto-handle your DMs anymore.", parse_mode=ParseMode.MARKDOWN)
+        return
 
-async def monitor_dm(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    owner_name = get_user_name(u.effective_user)
+    options = [
+        InlineKeyboardButton("👨 Male", callback_data=f"sec:gender:{uid}:male"),
+        InlineKeyboardButton("👩 Female", callback_data=f"sec:gender:{uid}:female"),
+    ]
+    secretary_enabled[uid] = {"owner_name": owner_name, "owner_gender": "unknown"}
+    await u.message.reply_text(
+        "✅ *Secretary mode ON!*\n\n"
+        "I'll reply to your incoming DMs (set up via Settings → Account → Chat Automation) "
+        "on your behalf with short, snappy replies.\n\n"
+        "One quick thing — what's your gender, so I answer correctly if someone asks where you are?",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup([options])
+    )
+
+async def secretary_gender_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    try:
+        await q.answer()
+        _, _, uid_str, gender = q.data.split(":", 3)
+        uid = int(uid_str)
+        if q.from_user.id != uid:
+            await q.answer("Not your setup!", show_alert=True)
+            return
+        secretary_enabled.setdefault(uid, {"owner_name": get_user_name(q.from_user), "owner_gender": "unknown"})
+        secretary_enabled[uid]["owner_gender"] = gender
+        await q.edit_message_text(f"✅ *Secretary mode ready!* Replies will be sent on your behalf.", parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logger.error(f"[secretary_gender_callback] {e}")
+
+async def monitor_secretary_dm(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """
-    Handles private-chat messages when secretary mode is ON for that user.
-    Replies are forced to ONE short line by DM_SECRETARY_PROMPT, and every
-    reply ends with a 'Beluga' signature at the bottom (Telegram-style),
-    not embedded inside the AI-generated text itself.
+    Handles private-chat messages forwarded to this bot via Telegram's
+    Chat Automation feature (or manually while secretary mode is ON for
+    the owning user). This ONLY applies to private chats, and ONLY the AI
+    secretary feature runs here — no other bot feature is active in DMs.
     """
     if not u.message or u.effective_chat.type != "private":
         return
     uid = u.effective_user.id
-    if uid not in secretary_enabled:
+    sec = secretary_enabled.get(uid)
+    if not sec:
         return
     try:
         text = (u.message.text or u.message.caption or "").strip()
         if text.startswith("/"):
             return
-        user_name = get_user_name(u.effective_user)
-        reply = await ai(DM_SECRETARY_PROMPT, text, f"Got it {user_name}! 🐾", max_tok=60)
-        signed_msg = f"{reply}\n\n_— Beluga Secretary_"
+
+        owner_name = sec.get("owner_name", "the user")
+        gender = sec.get("owner_gender", "unknown")
+
+        if _asks_where_is_owner(text):
+            pronoun = "He's" if gender == "male" else ("She's" if gender == "female" else "They're")
+            reply = f"{pronoun} not home right now."
+        else:
+            long_reply_allowed = _wants_long_reply(text)
+            max_tok = 220 if long_reply_allowed else 35
+            prompt = DM_SECRETARY_PROMPT
+            if long_reply_allowed:
+                prompt += "\nThe user asked for more detail — you may reply up to 100 words this time only."
+            reply = await ai(prompt, text, "Got it, thanks!", max_tok=max_tok)
+
+        signed_msg = f"{reply}\n\n_— Beluga is handling this chat for {owner_name}_"
         await u.message.reply_text(signed_msg, parse_mode=ParseMode.MARKDOWN, reply_to_message_id=u.message.message_id)
+
+        # In DMs, ALWAYS send a sticker from the MAIN pack with every response
+        # (never the "stay safe" pack — that one is group-only, see SECTION 24).
+        stick = await get_random_sticker_from(STICKER_PACK_MAIN)
+        if stick:
+            try:
+                await c.bot.send_sticker(chat_id=u.effective_chat.id, sticker=stick)
+            except Exception:
+                pass
     except Exception as e:
-        logger.error(f"[monitor_dm] {e}")
+        logger.error(f"[monitor_secretary_dm] {e}")
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 23: GHOST MODE (@smartbeluga_bot mention, even without group membership)
+# SECTION 22b: PLAIN PRIVATE-CHAT AI (no secretary mode active)
+# ═══════════════════════════════════════════════════════════════════════════
+# Per spec: in private chats, NOTHING else works except plain AI replies.
+# A sticker from the MAIN pack accompanies every single response.
+async def monitor_private_chat(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not u.message or u.effective_chat.type != "private":
+        return
+    uid = u.effective_user.id
+    if uid in secretary_enabled:
+        return  # secretary handler already covers this user's DMs
+    try:
+        text = (u.message.text or u.message.caption or "").strip()
+        if text.startswith("/"):
+            return
+        user_name = get_user_name(u.effective_user)
+        system = f"{CHAT_PROMPT}\nThe user's name is {user_name}. Always address them by name.\nReply in EXACTLY 2 lines."
+        reply = await ai(system, text, f"Meow {user_name}! 🐾", max_tok=120)
+        await u.message.reply_text(reply, reply_to_message_id=u.message.message_id)
+
+        stick = await get_random_sticker_from(STICKER_PACK_MAIN)
+        if stick:
+            try:
+                await c.bot.send_sticker(chat_id=u.effective_chat.id, sticker=stick)
+            except Exception:
+                pass
+        bot_status["message_count"] += 1
+    except Exception as e:
+        logger.error(f"[monitor_private_chat] {e}")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 23: GHOST MODE (@smartbeluga_bot mention, groups only)
 # ═══════════════════════════════════════════════════════════════════════════
 async def monitor_ghost_mode(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """
-    Listens for the literal text '@smartbeluga_bot' anywhere in a group message.
-    This works even in groups Beluga hasn't been formally added to, as long as
+    Listens for the literal text '@smartbeluga_bot' anywhere in a GROUP message.
+    Works even in groups Beluga hasn't been formally added to, as long as
     Telegram still delivers the update (e.g. bot has privacy mode disabled).
+    Groups only — never fires in private chats.
     """
-    if not u.message:
+    if not u.message or u.effective_chat.type == "private":
         return
     text = (u.message.text or "").strip()
     if "@smartbeluga_bot" not in text.lower():
@@ -1724,22 +1878,44 @@ async def monitor_ghost_mode(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return
     try:
         user_name = get_user_name(u.effective_user)
-        system = (f"{CHAT_PROMPT}\nThe user's name is {user_name}. Address them by name.\nReply in EXACTLY 2 lines.")
+        system = f"{CHAT_PROMPT}\nThe user's name is {user_name}. Address them by name.\nReply in EXACTLY 2 lines."
         reply = await ai(system, msg_content, f"Meow {user_name}! 🐾", max_tok=120)
         await u.message.reply_text(reply, reply_to_message_id=u.message.message_id)
     except Exception as e:
         logger.error(f"[monitor_ghost_mode] {e}")
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 24: GENERAL GROUP CHAT MONITOR (AI chat + periodic stickers)
+# SECTION 24: GENERAL GROUP CHAT MONITOR (groups ONLY)
 # ═══════════════════════════════════════════════════════════════════════════
-async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
+# Group-only behaviour, per spec:
+#   - Every 6th message in a group  -> send 1 sticker from STICKER_PACK_MAIN,
+#                                       no AI reply needed/required.
+#   - Every 14th message in a group -> send 1 sticker from STICKER_PACK_SAFE,
+#                                       no AI reply needed/required.
+#   - STICKER_PACK_SAFE is NEVER attached to an AI response — only the
+#     periodic 14th-message counter triggers it.
+#   - Whenever Beluga gives an AI reply (mention/keyword "beluga"/reply-to-bot),
+#     a sticker from STICKER_PACK_MAIN follows it (never STICKER_PACK_SAFE).
+#   - Any incoming STICKER from a banned pack (see /block) is deleted instantly.
+async def monitor_group(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message or not u.effective_user or u.effective_user.is_bot:
         return
+    if u.effective_chat.type == "private":
+        return  # this handler is GROUPS ONLY
     try:
         uid, cid, now = u.effective_user.id, str(u.effective_chat.id), datetime.now()
 
-        # --- anti-spam ---
+        # --- /block enforcement: delete any sticker from a banned pack ---
+        if u.message.sticker:
+            pack_of_sticker = getattr(u.message.sticker, "set_name", None)
+            if is_pack_banned(pack_of_sticker):
+                try:
+                    await u.message.delete()
+                except Exception:
+                    pass
+                return  # don't count/process a deleted message further
+
+        # --- anti-spam (text messages) ---
         spam_tracker.setdefault(uid, [])
         spam_tracker[uid] = [t for t in spam_tracker[uid] if now - t < timedelta(seconds=2)]
         spam_tracker[uid].append(now)
@@ -1748,31 +1924,34 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
             except Exception: pass
             return
 
-        # --- track seen users ---
+        # --- track seen users (for /gay /couple etc.) ---
         db.setdefault("seen", {}).setdefault(cid, {})[str(uid)] = {
             "id": uid, "un": u.effective_user.username, "n": u.effective_user.first_name or "User"
         }
         counts = db.setdefault("counts", {})
         counts[cid] = counts.get(cid, 0) + 1
 
-        # --- every 8th message: send a random sticker from the loaded packs ---
-        if counts[cid] % 8 == 0:
-            stick = await get_random_sticker_any()
+        # --- every 6th message: sticker from MAIN pack (no AI needed) ---
+        if counts[cid] % 6 == 0:
+            stick = await get_random_sticker_from(STICKER_PACK_MAIN)
             if stick:
                 try:
                     await c.bot.send_sticker(chat_id=u.effective_chat.id, sticker=stick)
                 except Exception:
                     pass
 
-        # --- every 6th message: sentiment emoji reaction ---
-        if counts[cid] % 6 == 0:
-            text_for_react = (u.message.text or u.message.caption or "").strip()
-            _, emoji = analyze_sentiment(text_for_react)
-            try: await safe_react(c.bot, u.effective_chat.id, u.message.message_id, emoji)
-            except Exception: pass
+        # --- every 14th message: sticker from STAY-SAFE pack (no AI needed) ---
+        if counts[cid] % 14 == 0:
+            stick_safe = await get_random_sticker_from(STICKER_PACK_SAFE)
+            if stick_safe:
+                try:
+                    await c.bot.send_sticker(chat_id=u.effective_chat.id, sticker=stick_safe)
+                except Exception:
+                    pass
 
         text = (u.message.text or u.message.caption or "").strip()
-        if text.startswith("/"):
+        if not text or text.startswith("/"):
+            bot_status["message_count"] += 1
             return
 
         bot_username = bot_status.get("username", "")
@@ -1782,7 +1961,7 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
         is_reply = (u.message.reply_to_message and u.message.reply_to_message.from_user
                     and u.message.reply_to_message.from_user.id == c.bot.id)
 
-        if text and (contains_beluga or contains_username or is_reply):
+        if contains_beluga or contains_username or is_reply:
             try: await asyncio.wait_for(c.bot.send_chat_action(u.effective_chat.id, "typing"), timeout=4.0)
             except Exception: pass
 
@@ -1791,10 +1970,10 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
             except Exception: pass
 
             user_name = get_user_name(u.effective_user)
-            system = (f"{CHAT_PROMPT}\nThe user's name is {user_name}. Always address them by name.\nReply in EXACTLY 2 lines.")
+            system = f"{CHAT_PROMPT}\nThe user's name is {user_name}. Always address them by name.\nReply in EXACTLY 2 lines."
             reply = await ai(system, text, f"Meow {user_name}! 🐾", max_tok=120)
 
-            if text and len(text) > 5:
+            if len(text) > 5:
                 await save_chat_memory(cid, str(uid), user_name, text)
 
             try:
@@ -1802,8 +1981,8 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-            # send a random sticker after EVERY AI response too
-            stick = await get_random_sticker_any()
+            # AI response sticker -> ALWAYS from MAIN pack, NEVER stay-safe pack
+            stick = await get_random_sticker_from(STICKER_PACK_MAIN)
             if stick:
                 try:
                     await c.bot.send_sticker(chat_id=u.effective_chat.id, sticker=stick)
@@ -1812,7 +1991,8 @@ async def monitor(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
         bot_status["message_count"] += 1
     except Exception as e:
-        logger.error(f"[monitor] {e}")
+        logger.error(f"[monitor_group] {e}")
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION 25: HTTP HEALTH SERVER (keeps Render web-service alive)
@@ -1929,99 +2109,4 @@ async def main():
     await load_persistent_data()
 
     # ---- Load both sticker packs (main + staysafe) ----
-    await load_sticker_pack(app.bot, STICKER_PACK_MAIN)
-    await load_sticker_pack(app.bot, STICKER_PACK_SAFE)
-    # Flush sticker file immediately so it's created/updated on this very startup
-    await save_all_data()
-
-    # ---- Command handlers ----
-    app.add_handler(CommandHandler("start", start_handler))
-    app.add_handler(CommandHandler("price", crypto_price_handler))
-    app.add_handler(CommandHandler(["topgainers", "toplosers"], crypto_movers_handler))
-    app.add_handler(CommandHandler(["chart", "chart5m", "chart15m", "chart1h", "chart4h", "chart1d"], crypto_chart_handler))
-    app.add_handler(CommandHandler("news", lambda u, c: execute_news_flow(u, c, "crypto", "Crypto News")))
-    app.add_handler(CommandHandler("ainews", lambda u, c: execute_news_flow(u, c, "ai", "AI News")))
-    app.add_handler(CommandHandler("technews", lambda u, c: execute_news_flow(u, c, "tech", "Tech News")))
-    app.add_handler(CommandHandler("search", search_handler))
-    app.add_handler(CommandHandler("bananalogic", bananalogic_handler))
-    app.add_handler(CommandHandler("qr", qr_generate_handler))
-    app.add_handler(CommandHandler("scanqr", qr_scan_handler))
-    app.add_handler(CommandHandler("resize", lambda u, c: img_handler(u, c, "resize")))
-    app.add_handler(CommandHandler("compress", lambda u, c: img_handler(u, c, "compress")))
-    app.add_handler(CommandHandler("watermark", watermark_handler))
-    app.add_handler(CommandHandler("imginfo", lambda u, c: img_handler(u, c, "info")))
-    app.add_handler(CommandHandler("quiz", quiz_handler))
-    app.add_handler(CommandHandler(["lb", "leaderboard"], lb_handler))
-    app.add_handler(CommandHandler("nw", nw_handler))
-    app.add_handler(CommandHandler(["pump", "dump"], pump_dump_handler))
-    app.add_handler(CommandHandler("tictac", tictac_handler))
-    app.add_handler(CommandHandler("mine", mine_handler))
-    app.add_handler(CommandHandler("gm", gm_handler))
-    app.add_handler(CommandHandler(["gay", "couple"], fun_dispatcher))
-    app.add_handler(CommandHandler("secretary", secretary_toggle_handler))
-    app.add_handler(CommandHandler("block", block_handler))
-
-    # ---- Callback query handlers ----
-    app.add_handler(CallbackQueryHandler(ttt_callback, pattern=r"^ttt:"))
-    app.add_handler(CallbackQueryHandler(gm_callback, pattern=r"^gm:"))
-    app.add_handler(CallbackQueryHandler(mine_callback, pattern=r"^mine:"))
-    app.add_handler(CallbackQueryHandler(watermark_callback, pattern=r"^wm:"))
-    app.add_handler(PollAnswerHandler(poll_answer_handler))
-
-    # ---- Message handlers ----
-    # IMPORTANT: each handler is registered in its OWN handler group (0, 1, 2).
-    # PTB only runs the FIRST matching handler within a single group by default,
-    # so without separate groups, monitor_ghost_mode (group 0) would silently
-    # swallow every group-chat text message and monitor() would never run —
-    # which is exactly why saying "beluga" stopped getting AI replies.
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, monitor_dm), group=0)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, monitor_ghost_mode), group=1)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, monitor), group=2)
-
-    app.add_error_handler(error_handler)
-
-    await app.initialize()
-    await app.start()
-
-    try:
-        me = await app.bot.get_me()
-        bot_status["username"] = me.username.lower()
-        logger.info(f"Bot identity: @{me.username}")
-    except Exception as e:
-        logger.warning(f"[Startup get_me] {e}")
-
-    await app.updater.start_polling(drop_pending_updates=True, allowed_updates=[])
-    bot_status["running"] = True
-    logger.info("Beluga Bot is running")
-
-    stop_evt = asyncio.Event()
-    try:
-        import signal
-        loop = asyncio.get_running_loop()
-        loop.add_signal_handler(signal.SIGTERM, stop_evt.set)
-        loop.add_signal_handler(signal.SIGINT, stop_evt.set)
-    except Exception:
-        pass
-
-    cleanup_task = asyncio.create_task(cleanup_expired_games())
-    sync_task = asyncio.create_task(periodic_sync())
-
-    await stop_evt.wait()
-    logger.info("Shutting down...")
-    cleanup_task.cancel()
-    sync_task.cancel()
-    bot_status["running"] = False
-    for fn in [app.updater.stop, app.stop, app.shutdown, http_runner.cleanup]:
-        try:
-            await fn()
-        except Exception:
-            pass
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Interrupted by user")
-    except Exception as e:
-        logger.critical(f"Fatal: {e}")
-        sys.exit(1)
+    aw
