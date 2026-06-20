@@ -78,7 +78,7 @@ START_VIDEO = "https://go.screenpal.com/watch/cO1oqenuAPr"
 CHAT_PROMPT = """You are Beluga, a cute female AI cat assistant from @BELUGAPY channel. Stay in character.
 Personality: warm, playful, intelligent, helpful. Reply in EXACTLY 2 short lines maximum.
 Always use the user's first name when replying. Be casual and friendly.
-Reply in English always. Never use NLP analysis labels. Just reply naturally."""
+Reply in English and henglish when user asks in henglish or else answer in English only. Never use NLP analysis labels. Just reply naturally."""
 
 DM_SECRETARY_PROMPT = """You are Beluga's secretary mode, handling a personal DM on behalf of the user.
 Reply with EXACTLY 1 short line. Be crunchy, casual, fast, to the point."""
@@ -97,7 +97,7 @@ G_HDR = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/53
 
 SENTIMENT_POSITIVE = ["😊", "😄", "❤️", "🔥", "✨", "🎉", "💖", "😻", "👍"]
 SENTIMENT_NEGATIVE = ["😢", "😠", "💔", "😤", "😭", "😞", "😿", "😡", "⚠️"]
-SENTIMENT_NEUTRAL = ["🤔", "😐", "👀", "🐾", "🎯", "📌", "💭", "🤷"]
+SENTIMENT_NEUTRAL = ["🤔", "😐", "👀", "🐾", "🎯", "📌", "💭", "😎"]
 
 WM_STYLES = {
     "Normal": "normal", "Bold": "bold", "Italic": "italic", "Bold Italic": "bolditalic",
