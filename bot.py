@@ -2104,4 +2104,136 @@ async def start_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         "📨 *MODES*\n"
         "┣ `/secretary` — Toggle DM auto-handling\n"
         "┗ `/block` `pack` — Ban a sticker pack *(admin)*\n\n"
-    
+        "❝ _Built with 💙 by @BELUGAPY_ ❞"
+    )
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📢 UPDATES CHANNEL", url=UPDATES_CHANNEL)]])
+
+    try:
+        await u.message.reply_video(video=START_VIDEO, caption=text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+    except Exception:
+        await u.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 27: MAIN ENTRYPOINT
+# ═══════════════════════════════════════════════════════════════════════════
+async def main():
+    logger.info("STARTING BELUGA BOT v11.4.0")
+    http_runner = await start_http(HTTP_PORT)
+    await asyncio.sleep(0.3)
+
+    app = TGApp.builder().token(BOT_TOKEN).build()
+
+    # ---- Load persistent data: checks GitHub file existence first ----
+    await load_persistent_data()
+
+    # ---- Load both sticker packs (main + staysafe) ----
+    await load_sticker_pack(app.bot, STICKER_PACK_MAIN)
+    await load_sticker_pack(app.bot, STICKER_PACK_SAFE)
+    # Flush sticker file immediately so it's created/updated on this very startup
+    await save_all_data()
+
+    # ---- Command handlers ----
+    app.add_handler(CommandHandler("start", start_handler))
+    app.add_handler(CommandHandler("price", crypto_price_handler))
+    app.add_handler(CommandHandler(["topgainers", "toplosers"], crypto_movers_handler))
+    app.add_handler(CommandHandler(["chart", "chart5m", "chart15m", "chart1h", "chart4h", "chart1d"], crypto_chart_handler))
+    app.add_handler(CommandHandler("news", lambda u, c: execute_news_flow(u, c, "crypto", "Crypto News")))
+    app.add_handler(CommandHandler("ainews", lambda u, c: execute_news_flow(u, c, "ai", "AI News")))
+    app.add_handler(CommandHandler("technews", lambda u, c: execute_news_flow(u, c, "tech", "Tech News")))
+    app.add_handler(CommandHandler("search", search_handler))
+    app.add_handler(CommandHandler("bananalogic", bananalogic_handler))
+    app.add_handler(CommandHandler("qr", qr_generate_handler))
+    app.add_handler(CommandHandler("scanqr", qr_scan_handler))
+    app.add_handler(CommandHandler("resize", lambda u, c: img_handler(u, c, "resize")))
+    app.add_handler(CommandHandler("compress", lambda u, c: img_handler(u, c, "compress")))
+    app.add_handler(CommandHandler("watermark", watermark_handler))
+    app.add_handler(CommandHandler("imginfo", lambda u, c: img_handler(u, c, "info")))
+    app.add_handler(CommandHandler("quiz", quiz_handler))
+    app.add_handler(CommandHandler(["lb", "leaderboard"], lb_handler))
+    app.add_handler(CommandHandler("nw", nw_handler))
+    app.add_handler(CommandHandler(["pump", "dump"], pump_dump_handler))
+    app.add_handler(CommandHandler("tictac", tictac_handler))
+    app.add_handler(CommandHandler("mine", mine_handler))
+    app.add_handler(CommandHandler("gm", gm_handler))
+    app.add_handler(CommandHandler(["gay", "couple"], fun_dispatcher))
+    app.add_handler(CommandHandler("secretary", secretary_toggle_handler))
+    app.add_handler(CommandHandler("block", block_handler))
+
+    # ---- Callback query handlers ----
+    app.add_handler(CallbackQueryHandler(ttt_callback, pattern=r"^ttt:"))
+    app.add_handler(CallbackQueryHandler(gm_callback, pattern=r"^gm:"))
+    app.add_handler(CallbackQueryHandler(mine_callback, pattern=r"^mine:"))
+    app.add_handler(CallbackQueryHandler(watermark_callback, pattern=r"^wm:"))
+    app.add_handler(CallbackQueryHandler(secretary_gender_callback, pattern=r"^sec:"))
+    app.add_handler(PollAnswerHandler(poll_answer_handler))
+
+    # ---- Message handlers ----
+    # IMPORTANT: each handler is registered in its OWN handler group.
+    # PTB only runs the FIRST matching handler within a single group by
+    # default, so separate groups are required for multiple handlers to
+    # all see the same update (e.g. ghost-mode check AND general AI chat
+    # both need to run on the same group text message).
+    #
+    #   group 0: incoming STICKERS in groups -> banned-pack auto-delete check
+    #   group 1: private-chat text  -> secretary DM handling (if enabled)
+    #   group 2: private-chat text  -> plain AI handling (if secretary NOT enabled)
+    #   group 3: group-chat text    -> ghost mode (@smartbeluga_bot mention)
+    #   group 4: group-chat text/stickers -> general group monitor (AI + sticker cadence)
+    app.add_handler(MessageHandler(filters.Sticker.ALL & filters.ChatType.GROUPS, monitor_group), group=0)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, monitor_secretary_dm), group=1)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, monitor_private_chat), group=2)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, monitor_ghost_mode), group=3)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, monitor_group), group=4)
+
+    app.add_error_handler(error_handler)
+
+    await app.initialize()
+    await app.start()
+
+    try:
+        me = await app.bot.get_me()
+        bot_status["username"] = me.username.lower()
+        logger.info(f"Bot identity: @{me.username}")
+    except Exception as e:
+        logger.warning(f"[Startup get_me] {e}")
+
+    await app.updater.start_polling(drop_pending_updates=True, allowed_updates=[])
+    bot_status["running"] = True
+    logger.info("Beluga Bot is running")
+
+    stop_evt = asyncio.Event()
+    try:
+        import signal
+        loop = asyncio.get_running_loop()
+        loop.add_signal_handler(signal.SIGTERM, stop_evt.set)
+        loop.add_signal_handler(signal.SIGINT, stop_evt.set)
+    except Exception:
+        pass
+
+    cleanup_task = asyncio.create_task(cleanup_expired_games())
+    sync_task = asyncio.create_task(periodic_sync())
+    # Exchange connection (ccxt.load_markets) is a slow blocking network call.
+    # Running it here, AFTER the HTTP port is bound and Telegram polling has
+    # started, guarantees Render's port-scan / health check succeeds first.
+    exchange_task = asyncio.create_task(init_exchange_async())
+
+    await stop_evt.wait()
+    logger.info("Shutting down...")
+    cleanup_task.cancel()
+    exchange_task.cancel()
+    sync_task.cancel()
+    bot_status["running"] = False
+    for fn in [app.updater.stop, app.stop, app.shutdown, http_runner.cleanup]:
+        try:
+            await fn()
+        except Exception:
+            pass
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+    except Exception as e:
+        logger.critical(f"Fatal: {e}")
+        sys.exit(1)
