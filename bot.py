@@ -90,7 +90,7 @@ START_VIDEO = "https://go.screenpal.com/watch/cO1oqenuAPr"
 CHAT_PROMPT = """You are Beluga, a cute female AI cat assistant from @BELUGAPY channel. Stay in character.
 Personality: warm, playful, intelligent, helpful. Reply in EXACTLY 2 short lines maximum.
 Always use the user's first name when replying. Be casual and friendly.
-Reply in English and Henglish when user asks in henglish or else reply in English. Never use NLP analysis labels. Just reply naturally."""
+Reply in English always. Never use NLP analysis labels. Just reply naturally."""
 
 DM_SECRETARY_PROMPT = """You are Beluga, handling a personal DM on behalf of the chat owner (acting as their secretary).
 By default, reply with EXACTLY 1 short line — crunchy, casual, fast, to the point.
@@ -141,6 +141,15 @@ def load_font(style_key: str, size: int):
 
 
 def get_exchange(prefer: str = "bybit"):
+    """
+    Synchronous, blocking network call (ccxt.load_markets()).
+    NEVER call this at module import time — it must only run inside the
+    event loop via init_exchange_async() so it can't delay HTTP port
+    binding or the Telegram polling startup. Render kills deploys that
+    don't open a port quickly, which is what caused 'Application exited
+    early' here: get_exchange() used to run at import time and blocked
+    everything else from starting.
+    """
     exchanges = ["bybit", "okx", "bitget", "kraken", "binance"]
     if prefer in exchanges:
         exchanges.remove(prefer)
@@ -157,7 +166,16 @@ def get_exchange(prefer: str = "bybit"):
     logger.error("No exchange available")
     return None
 
-exchange = get_exchange()
+# `exchange` starts as None. It is populated in the background AFTER the
+# HTTP server is bound and Telegram polling has started (see SECTION 27 /
+# init_exchange_async). All crypto handlers already guard on `if not exchange`.
+exchange = None
+
+async def init_exchange_async():
+    """Run the blocking exchange connection in a thread so it never blocks the event loop."""
+    global exchange
+    loop = asyncio.get_running_loop()
+    exchange = await loop.run_in_executor(None, get_exchange)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION 4: GITHUB FILE I/O (low level read / write helpers)
@@ -2086,27 +2104,4 @@ async def start_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         "📨 *MODES*\n"
         "┣ `/secretary` — Toggle DM auto-handling\n"
         "┗ `/block` `pack` — Ban a sticker pack *(admin)*\n\n"
-        "❝ _Built with 💙 by @BELUGAPY_ ❞"
-    )
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📢 UPDATES CHANNEL", url=UPDATES_CHANNEL)]])
-
-    try:
-        await u.message.reply_video(video=START_VIDEO, caption=text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
-    except Exception:
-        await u.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
-
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 27: MAIN ENTRYPOINT
-# ═══════════════════════════════════════════════════════════════════════════
-async def main():
-    logger.info("STARTING BELUGA BOT v11.4.0")
-    http_runner = await start_http(HTTP_PORT)
-    await asyncio.sleep(0.3)
-
-    app = TGApp.builder().token(BOT_TOKEN).build()
-
-    # ---- Load persistent data: checks GitHub file existence first ----
-    await load_persistent_data()
-
-    # ---- Load both sticker packs (main + staysafe) ----
-    aw
+    
