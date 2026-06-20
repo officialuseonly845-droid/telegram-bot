@@ -67,9 +67,9 @@ ttt_games, mine_games, user_in_game, game_timers, mine_timers, gm_tracker, gm_ms
 mine_play_stats = {}
 wm_sessions = {}
 
-# Secretary mode: uid -> {"owner_name": str, "owner_gender": "male"/"female"/"unknown"}
-# Enabled per Telegram user via Chat Automation (forwarding their DMs to this bot).
-secretary_enabled = {}
+# NOTE: secretary mode's real state dict (secretary_state) is declared in
+# SECTION 22, right above the functions that use it, since it's a single
+# global on/off flag rather than a per-user collection.
 
 sticker_data = {"packs": {}, "banned_packs": []}
 db_needs_sync = False
@@ -88,9 +88,9 @@ UPDATES_CHANNEL = "https://t.me/BELUGAPY"
 START_VIDEO = "https://go.screenpal.com/watch/cO1oqenuAPr"
 
 CHAT_PROMPT = """You are Beluga, a cute female AI cat assistant from @BELUGAPY channel. Stay in character.
-Personality: warm, playful, intelligent, helpful. Reply in EXACTLY 2 short lines maximum.
+Personality: warm, playful, intelligent, helpful. Reply in EXACTLY 2 short lines in 5 to 8 words.
 Always use the user's first name when replying. Be casual and friendly.
-Reply in English always. Never use NLP analysis labels. Just reply naturally."""
+Reply in English and in henglish when user asks anything in henglish else reply in English. Never use NLP analysis labels. Just reply naturally."""
 
 DM_SECRETARY_PROMPT = """You are Beluga, handling a personal DM on behalf of the chat owner (acting as their secretary).
 By default, reply with EXACTLY 1 short line — crunchy, casual, fast, to the point.
@@ -1728,24 +1728,31 @@ async def block_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
 # SECTION 22: SECRETARY MODE (Chat Automation DM handling)
 # ═══════════════════════════════════════════════════════════════════════════
 # Setup (done by the END USER on their own Telegram account, not a bot command):
-#   Settings -> Account -> Chat Automation -> set link to @iSaminaBot (or this
-#   bot's username) -> tap the checkmark top-right -> Done.
-# Once set up, Telegram itself forwards the user's incoming private messages
-# to this bot, which then auto-replies on their behalf.
+#   Settings -> Account -> Chat Automation -> set link to this bot's username
+#   -> tap the checkmark top-right -> Done.
+# Once set up, Telegram forwards the OWNER's incoming private messages to
+# this bot AS THE BOT'S OWN DM. Critically: the `from` field on those forwarded
+# messages is the OTHER PERSON who messaged the owner — NOT the owner's own
+# ID. That means per-sender-ID lookups (secretary_enabled.get(sender_id)) can
+# NEVER match, because the person enabling /secretary and the people whose
+# messages arrive afterward are always different Telegram users.
 #
-# `/secretary` here is just a manual on/off toggle + a one-time setup question
-# (the owner's display name + gender) so Beluga can answer "where is he/she?"
-# correctly when someone DMs the account being covered.
+# Fix: secretary mode is a SINGLE global toggle (this bot serves one owner,
+# identified by OWNER_ID env var). Once turned on, EVERY incoming private
+# message — regardless of who sent it or whether it mentions "beluga" — is
+# treated as a forwarded DM and gets an auto-reply. No keyword/name match
+# is required, exactly as requested.
 #
 # Reply rules:
 #   - Default: ONE short line.
 #   - If the incoming message explicitly asks for more detail / a longer
 #     answer, reply can be up to ~100 words.
-#   - Every reply signs off with "— Beluga (handling chat for <name>)" at the
-#     BOTTOM of the message (Telegram-style signature), never woven into the
-#     AI-generated sentence itself.
+#   - Every reply signs off with "— Beluga is handling this chat for <name>"
+#     at the BOTTOM of the message, never woven into the AI sentence itself.
 #   - If asked "where is he/she/are they", answer using the stored gender:
 #     "He's not home right now" / "She's not home right now".
+secretary_state = {"enabled": False, "owner_name": "the user", "owner_gender": "unknown"}
+
 def _wants_long_reply(text: str) -> bool:
     """Heuristic: does the incoming message ask Beluga to elaborate?"""
     triggers = ["explain", "detail", "elaborate", "more info", "tell me more",
@@ -1758,26 +1765,37 @@ def _asks_where_is_owner(text: str) -> bool:
     return bool(re.search(r"\bwhere\s+(is|are|s)\b", t)) and any(w in t for w in ["he", "she", "they", "him", "her", "owner", "is he", "is she"])
 
 async def secretary_toggle_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Owner-side toggle + setup. DM only."""
+    """
+    Owner-only. Run this from YOUR OWN DM with the bot before relying on
+    Chat Automation. Toggles the single global secretary_state on/off and,
+    on enabling, asks for your gender for the "where is he/she" replies.
+    """
     if not u.message or u.effective_chat.type != "private":
         await u.message.reply_text("📨 Secretary mode only works in DMs!")
         return
-    uid = u.effective_user.id
-    if uid in secretary_enabled:
-        secretary_enabled.pop(uid, None)
-        await u.message.reply_text("❌ *Secretary mode OFF* — I won't auto-handle your DMs anymore.", parse_mode=ParseMode.MARKDOWN)
+    if not is_owner(u.effective_user.id if u.effective_user else 0):
+        await u.message.reply_text("🚫 Only the bot owner can toggle secretary mode.")
+        return
+
+    if secretary_state["enabled"]:
+        secretary_state["enabled"] = False
+        await u.message.reply_text("❌ *Secretary mode OFF* — I won't auto-handle incoming DMs anymore.", parse_mode=ParseMode.MARKDOWN)
         return
 
     owner_name = get_user_name(u.effective_user)
+    secretary_state["enabled"] = True
+    secretary_state["owner_name"] = owner_name
+    secretary_state["owner_gender"] = "unknown"
+
     options = [
-        InlineKeyboardButton("👨 Male", callback_data=f"sec:gender:{uid}:male"),
-        InlineKeyboardButton("👩 Female", callback_data=f"sec:gender:{uid}:female"),
+        InlineKeyboardButton("👨 Male", callback_data="sec:gender:male"),
+        InlineKeyboardButton("👩 Female", callback_data="sec:gender:female"),
     ]
-    secretary_enabled[uid] = {"owner_name": owner_name, "owner_gender": "unknown"}
     await u.message.reply_text(
         "✅ *Secretary mode ON!*\n\n"
-        "I'll reply to your incoming DMs (set up via Settings → Account → Chat Automation) "
-        "on your behalf with short, snappy replies.\n\n"
+        "From now on, EVERY message that arrives in this bot's DM (including "
+        "ones forwarded to you via Settings → Account → Chat Automation) will "
+        "get an automatic reply — no need to mention my name.\n\n"
         "One quick thing — what's your gender, so I answer correctly if someone asks where you are?",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup([options])
@@ -1789,37 +1807,33 @@ async def secretary_gender_callback(update: Update, context: ContextTypes.DEFAUL
         return
     try:
         await q.answer()
-        _, _, uid_str, gender = q.data.split(":", 3)
-        uid = int(uid_str)
-        if q.from_user.id != uid:
-            await q.answer("Not your setup!", show_alert=True)
+        _, _, gender = q.data.split(":", 2)
+        if not is_owner(q.from_user.id):
+            await q.answer("Only the bot owner can set this!", show_alert=True)
             return
-        secretary_enabled.setdefault(uid, {"owner_name": get_user_name(q.from_user), "owner_gender": "unknown"})
-        secretary_enabled[uid]["owner_gender"] = gender
-        await q.edit_message_text(f"✅ *Secretary mode ready!* Replies will be sent on your behalf.", parse_mode=ParseMode.MARKDOWN)
+        secretary_state["owner_gender"] = gender
+        await q.edit_message_text("✅ *Secretary mode ready!* All incoming DMs will be auto-replied.", parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         logger.error(f"[secretary_gender_callback] {e}")
 
 async def monitor_secretary_dm(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """
-    Handles private-chat messages forwarded to this bot via Telegram's
-    Chat Automation feature (or manually while secretary mode is ON for
-    the owning user). This ONLY applies to private chats, and ONLY the AI
-    secretary feature runs here — no other bot feature is active in DMs.
+    Fires on EVERY private-chat text message when secretary mode is globally
+    ON — regardless of sender ID, and regardless of whether the message
+    mentions "beluga" or any keyword at all (per spec: reply to every
+    message, not just ones that name the bot).
     """
     if not u.message or u.effective_chat.type != "private":
         return
-    uid = u.effective_user.id
-    sec = secretary_enabled.get(uid)
-    if not sec:
+    if not secretary_state["enabled"]:
         return
     try:
         text = (u.message.text or u.message.caption or "").strip()
         if text.startswith("/"):
             return
 
-        owner_name = sec.get("owner_name", "the user")
-        gender = sec.get("owner_gender", "unknown")
+        owner_name = secretary_state.get("owner_name", "the user")
+        gender = secretary_state.get("owner_gender", "unknown")
 
         if _asks_where_is_owner(text):
             pronoun = "He's" if gender == "male" else ("She's" if gender == "female" else "They're")
@@ -1854,9 +1868,8 @@ async def monitor_secretary_dm(u: Update, c: ContextTypes.DEFAULT_TYPE):
 async def monitor_private_chat(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message or u.effective_chat.type != "private":
         return
-    uid = u.effective_user.id
-    if uid in secretary_enabled:
-        return  # secretary handler already covers this user's DMs
+    if secretary_state["enabled"]:
+        return  # secretary handler (group 1) already covers every DM while it's globally ON
     try:
         text = (u.message.text or u.message.caption or "").strip()
         if text.startswith("/"):
@@ -2237,3 +2250,4 @@ if __name__ == "__main__":
     except Exception as e:
         logger.critical(f"Fatal: {e}")
         sys.exit(1)
+       
