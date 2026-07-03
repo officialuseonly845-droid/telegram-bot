@@ -26,6 +26,7 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "").strip()
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main").strip()
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
+OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 HTTP_PORT = int(os.environ.get("PORT", "10000"))
 OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
@@ -67,9 +68,9 @@ ttt_games, mine_games, user_in_game, game_timers, mine_timers, gm_tracker, gm_ms
 mine_play_stats = {}
 wm_sessions = {}
 
-# NOTE: secretary mode's real state dict (secretary_state) is declared in
-# SECTION 22, right above the functions that use it, since it's a single
-# global on/off flag rather than a per-user collection.
+# NOTE: DM auto-handling (Chat Automation) has no toggle/state — it's always
+# on and lives in SECTION 22 as monitor_dm(). Owner name/gender for "where is
+# X" replies is stored in dm_owner_info, also declared in SECTION 22.
 
 sticker_data = {"packs": {}, "banned_packs": []}
 db_needs_sync = False
@@ -87,14 +88,34 @@ GM_IMAGE_URL = "https://i.postimg.cc/Fs1h0CPs/file-000000001d7872078a894cdf6f624
 UPDATES_CHANNEL = "https://t.me/BELUGAPY"
 START_VIDEO = "https://go.screenpal.com/watch/cO1oqenuAPr"
 
-CHAT_PROMPT = """You are Beluga, a cute, intelligent female cat assistant from @BELUGAPY. Stay in character and never mention being an AI, chatbot, or bot. Be warm, playful, helpful, and emotionally aware. 
-Remember the user's last 3 messages and use them to understand context, continue conversations naturally, and resolve words like "it", "that", or follow-up questions. 
-Always answer the user's actual intent instead of giving generic replies. Address the user by their first name naturally. Reply in English, or Hinglish if the user speaks Hinglish.
-Keep replies exactly 2 short lines, with 5–8 words per line whenever possible. Make every reply feel connected to the ongoing conversation rather than treating each message as a new chat."""
+CHAT_PROMPT = """You are Beluga, a cute female AI cat assistant from @BELUGAPY channel. Stay in character.
+Personality: warm, playful, intelligent, helpful. Reply in EXACTLY 2 short lines maximum.
+Always use the user's first name when replying. Be casual and friendly.
+Language rules: If the user writes in Hinglish (Hindi+English mixed), reply in Hinglish. If they write in English, reply in English. Never use any other language.
+Use the user's chat memory/history to give context-aware replies — reference what you know about them naturally.
+Never use NLP analysis labels. Just reply naturally."""
 
-DM_SECRETARY_PROMPT = """You are Beluga, handling a personal DM on behalf of the chat owner (acting as their secretary).
-By default, reply with EXACTLY 1 short line — crunchy, casual, fast, to the point.
-Only if the incoming message explicitly asks for detail/explanation should you give a longer answer, and even then stay under 100 words."""
+# Used when OpenRouter model is active — same rules, slightly longer
+CHAT_PROMPT_OR = """You are Beluga, a cute female AI cat assistant from @BELUGAPY channel. Stay in character.
+Personality: warm, playful, intelligent, helpful. Reply in 2-3 lines maximum.
+Always use the user's first name when replying. Be casual and friendly.
+Language rules: If the user writes in Hinglish (Hindi+English mixed), reply in Hinglish. If they write in English, reply in English. Never use any other language.
+Use the user's chat memory/history to give context-aware replies — reference what you know about them naturally.
+Never use NLP analysis labels. Just reply naturally."""
+
+# Secretary mode — Beluga auto-replies to anyone who DMs the bot via Chat Automation.
+# This fires on EVERY incoming DM — no toggle, no command, no keyword needed.
+# Rahul sets Chat Automation → whoever messages Rahul → their message comes here → Beluga replies.
+DM_SECRETARY_PROMPT = """You are BELUGA, an AI assistant handling someone's DMs while they are away.
+Strict rules:
+- Reply with 1 short, crunchy, casual line by default.
+- Only give a longer reply (max 100 words) if the person explicitly asks for more detail.
+- If asked "where is [name]" or "where are you" or similar → reply: "[Name] is not at home right now, [he/she] will be back soon."
+- If asked "who are you" or "are you a bot" or "who is this" → reply exactly: "I am BELUGA, handling this chat."
+- Never reveal you are an AI or a language model.
+- Do NOT add any signature, footnote, or "— Beluga" at the end of messages.
+- Do NOT say "Beluga is handling this chat for..." — just be Beluga naturally.
+- Match the language of the person messaging (Hinglish or English only)."""
 
 BANANA_PROMPT = """You are Beluga from @BELUGAPY answering using web search results. Be concise, accurate, conversational.
 Answer in English only. Summarize relevant facts directly. Don't say you searched. Keep it to 3-4 lines max."""
@@ -410,17 +431,55 @@ def bump_score(cid: str, uid: str, name: str, delta: int) -> int:
     return e["score"]
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 8: GROQ AI ENGINE
+# SECTION 8: AI ENGINE — GROQ + OPENROUTER (dual provider, auto-switch)
 # ═══════════════════════════════════════════════════════════════════════════
-async def _groq_async(system: str, user: str, max_tok: int = 200) -> Optional[str]:
+# Models:
+#   Groq       → llama-3.3-70b-versatile   (fast, free tier)
+#   OpenRouter → openai/gpt-oss-120b:free  (Hinglish+English, 2-3 lines)
+#
+# /model command (owner-only): switch between gro / rou / auto
+# Auto mode: tries current provider; if rate-limited, silently falls back
+# to the other one for that request and remembers the rate-limit cooldown.
+#
+# ENV VARS:
+#   GROQ_API_KEY        → Groq key
+#   OPENROUTER_API_KEY  → OpenRouter key
+
+GROQ_MODEL = "llama-3.3-70b-versatile"
+OR_MODEL = "openai/gpt-oss-120b:free"
+OR_BASE = "https://openrouter.ai/api/v1"
+
+# ai_model_state:
+#   "gro"  = always use Groq
+#   "rou"  = always use OpenRouter
+#   "auto" = try chosen, fall back to other on rate limit
+ai_model_state = {"mode": "auto", "groq_rl_until": 0.0, "or_rl_until": 0.0}
+
+
+def _groq_rate_limited() -> bool:
+    return time.time() < ai_model_state["groq_rl_until"]
+
+def _or_rate_limited() -> bool:
+    return time.time() < ai_model_state["or_rl_until"]
+
+def _set_groq_rl():
+    ai_model_state["groq_rl_until"] = time.time() + 60
+    logger.warning("[AI] Groq rate-limited — backing off 60s")
+
+def _set_or_rl():
+    ai_model_state["or_rl_until"] = time.time() + 60
+    logger.warning("[AI] OpenRouter rate-limited — backing off 60s")
+
+
+async def _call_groq(system: str, user: str, max_tok: int) -> Optional[str]:
     if not GROQ_KEY:
         return None
     bot_status["api_calls"] += 1
     try:
         async with aiohttp.ClientSession() as session:
             payload = {
-                "model": "llama-3.3-70b-versatile",
-                "messages": [{"role":"system","content":system},{"role":"user","content":user}],
+                "model": GROQ_MODEL,
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
                 "max_tokens": max_tok
             }
             async with session.post(
@@ -432,23 +491,103 @@ async def _groq_async(system: str, user: str, max_tok: int = 200) -> Optional[st
                 if r.status == 200:
                     data = await r.json()
                     return data["choices"][0]["message"]["content"].strip()
+                elif r.status == 429:
+                    _set_groq_rl()
+                    return None
                 bot_status["failed_apis"] += 1
     except Exception:
         bot_status["failed_apis"] += 1
     return None
 
-async def ai(system: str, user: str, fallback: str = "Meow! 🐾", max_tok: int = 200) -> str:
+
+async def _call_openrouter(system: str, user: str, max_tok: int) -> Optional[str]:
+    if not OPENROUTER_KEY:
+        return None
+    bot_status["api_calls"] += 1
     try:
-        res = await asyncio.wait_for(_groq_async(system, user, max_tok), timeout=14)
-        if res:
-            return res
+        async with aiohttp.ClientSession() as session:
+            payload = {
+                "model": OR_MODEL,
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                "max_tokens": max_tok
+            }
+            async with session.post(
+                f"{OR_BASE}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_KEY}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://t.me/BELUGAPY",
+                    "X-Title": "BelugaBot"
+                },
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    return data["choices"][0]["message"]["content"].strip()
+                elif r.status == 429:
+                    _set_or_rl()
+                    return None
+                bot_status["failed_apis"] += 1
     except Exception:
-        pass
+        bot_status["failed_apis"] += 1
+    return None
+
+
+async def ai(system: str, user: str, fallback: str = "Meow! 🐾", max_tok: int = 200) -> str:
+    """
+    Smart dual-provider AI call.
+    Mode 'gro' → Groq only (auto-falls back to OR if rate-limited in auto spirit).
+    Mode 'rou' → OpenRouter only (auto-falls back to Groq if rate-limited).
+    Mode 'auto' → tries Groq first, then OR on any failure.
+    If OpenRouter is active, uses CHAT_PROMPT_OR (Hinglish+English, 2-3 lines).
+    """
+    mode = ai_model_state["mode"]
+
+    # If user chose 'rou' but it's rate-limited, auto-fallback to groq
+    # If user chose 'gro' but it's rate-limited, auto-fallback to OR
+    # This way user's manual choice is respected but rate limits never hard-fail
+
+    # Determine call order
+    if mode == "gro":
+        order = ["groq", "or"]
+    elif mode == "rou":
+        order = ["or", "groq"]
+    else:  # auto
+        order = ["groq", "or"]
+
+    for provider in order:
+        try:
+            if provider == "groq":
+                if _groq_rate_limited():
+                    continue
+                res = await asyncio.wait_for(_call_groq(system, user, max_tok), timeout=14)
+            else:
+                if _or_rate_limited():
+                    continue
+                # When the caller passed our standard CHAT_PROMPT, swap in the
+                # OpenRouter-tuned variant (2-3 lines, Hinglish+English) instead.
+                # For any other custom system prompt (e.g. DM_SECRETARY_PROMPT),
+                # use it as-is so callers stay in full control of tone/length.
+                or_system = CHAT_PROMPT_OR if system.startswith(CHAT_PROMPT) else system
+                res = await asyncio.wait_for(_call_openrouter(or_system, user, max_tok), timeout=16)
+            if res:
+                return res
+        except asyncio.TimeoutError:
+            logger.warning(f"[AI] {provider} timed out")
+        except Exception as e:
+            logger.warning(f"[AI] {provider} error: {e}")
+
     return fallback
 
+
 async def ai_emoji(text: str) -> str:
+    """Quick emoji pick — always uses Groq (lightweight, no Hinglish needed)."""
     try:
-        res = await asyncio.wait_for(_groq_async("Output ONE emoji matching emotion. ONLY the emoji, nothing else.", f"Text: '{text[:60]}'", 10), timeout=6)
+        res = await asyncio.wait_for(
+            _call_groq("Output ONE emoji matching emotion. ONLY the emoji, nothing else.", f"Text: '{text[:60]}'", 10),
+            timeout=6
+        )
         if res:
             found = re.findall(r"[^\w\s,.:!?'\"\(\)\-]+", res)
             if found:
@@ -456,6 +595,61 @@ async def ai_emoji(text: str) -> str:
     except Exception:
         pass
     return "😼"
+
+
+async def model_command_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Owner-only: /model — pick Groq, OpenRouter, or Auto via inline keyboard."""
+    if not u.message:
+        return
+    if not is_owner(u.effective_user.id if u.effective_user else 0):
+        await u.message.reply_text("🚫 Owner only.")
+        return
+
+    mode = ai_model_state["mode"]
+    groq_ok = "✅" if not _groq_rate_limited() else "⛔RL"
+    or_ok = "✅" if not _or_rate_limited() else "⛔RL"
+
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"{'▶' if mode=='gro' else ''} GRO {groq_ok}", callback_data="model:gro"),
+        InlineKeyboardButton(f"{'▶' if mode=='rou' else ''} ROU {or_ok}", callback_data="model:rou"),
+        InlineKeyboardButton(f"{'▶' if mode=='auto' else ''} AUTO", callback_data="model:auto"),
+    ]])
+
+    status = (
+        f"🤖 *AI Model Selector*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Current: `{mode.upper()}`\n\n"
+        f"• *GRO* — Groq `{GROQ_MODEL}` {groq_ok}\n"
+        f"• *ROU* — OpenRouter `{OR_MODEL}` {or_ok}\n"
+        f"• *AUTO* — Tries Groq first, falls back to OpenRouter on rate limit\n\n"
+        f"_Rate limit auto-recovers after 60s_"
+    )
+    await u.message.reply_text(status, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+
+
+async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    try:
+        await q.answer()
+        if not is_owner(q.from_user.id):
+            await q.answer("Owner only!", show_alert=True)
+            return
+        _, mode = q.data.split(":", 1)
+        ai_model_state["mode"] = mode
+        label = {"gro": "Groq (GRO)", "rou": "OpenRouter (ROU)", "auto": "Auto Switch"}.get(mode, mode)
+        await q.edit_message_text(
+            f"✅ *AI model switched to: {label}*\n\n"
+            f"GRO → `{GROQ_MODEL}`\n"
+            f"ROU → `{OR_MODEL}`\n"
+            f"AUTO → Groq first, fallback to OpenRouter on rate limit",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        logger.info(f"[AI] Model mode switched to: {mode}")
+    except Exception as e:
+        logger.error(f"[model_callback] {e}")
+
 
 async def save_chat_memory(cid: str, uid: str, name: str, message: str):
     fun_db.setdefault("chat_memory", {})
@@ -1725,158 +1919,111 @@ async def block_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text(f"❌ Error: `{str(e)[:60]}`")
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 22: SECRETARY MODE (Chat Automation DM handling)
+# SECTION 22: DM AUTO-HANDLER (Chat Automation — always on, no command needed)
 # ═══════════════════════════════════════════════════════════════════════════
-# Setup (done by the END USER on their own Telegram account, not a bot command):
-#   Settings -> Account -> Chat Automation -> set link to this bot's username
-#   -> tap the checkmark top-right -> Done.
-# Once set up, Telegram forwards the OWNER's incoming private messages to
-# this bot AS THE BOT'S OWN DM. Critically: the `from` field on those forwarded
-# messages is the OTHER PERSON who messaged the owner — NOT the owner's own
-# ID. That means per-sender-ID lookups (secretary_enabled.get(sender_id)) can
-# NEVER match, because the person enabling /secretary and the people whose
-# messages arrive afterward are always different Telegram users.
+# How Chat Automation works:
+#   1. Rahul goes to Settings → Account → Chat Automation → sets this bot
+#   2. Oldy sends Rahul a DM on Telegram
+#   3. Telegram automatically forwards Oldy's message to this bot
+#   4. Beluga replies → Oldy sees the reply as if it came from Rahul
 #
-# Fix: secretary mode is a SINGLE global toggle (this bot serves one owner,
-# identified by OWNER_ID env var). Once turned on, EVERY incoming private
-# message — regardless of who sent it or whether it mentions "beluga" — is
-# treated as a forwarded DM and gets an auto-reply. No keyword/name match
-# is required, exactly as requested.
-#
-# Reply rules:
-#   - Default: ONE short line.
-#   - If the incoming message explicitly asks for more detail / a longer
-#     answer, reply can be up to ~100 words.
-#   - Every reply signs off with "— Beluga is handling this chat for <name>"
-#     at the BOTTOM of the message, never woven into the AI sentence itself.
-#   - If asked "where is he/she/are they", answer using the stored gender:
-#     "He's not home right now" / "She's not home right now".
-secretary_state = {"enabled": False, "owner_name": "the user", "owner_gender": "unknown"}
+# u.effective_user = the person who messaged the owner (Oldy), NOT the owner.
+# No /secretary command, no toggle, no state — always replies to every DM.
+# Owner can set their name/gender via /setname and /setgender (owner-only).
+
+dm_owner_info = {
+    "name": os.environ.get("OWNER_NAME", "the owner"),    # set OWNER_NAME env var
+    "gender": os.environ.get("OWNER_GENDER", "unknown"),  # set OWNER_GENDER: male/female
+}
+
+
+def _get_owner_pronouns():
+    g = dm_owner_info.get("gender", "unknown").lower()
+    if g == "male":
+        return "he", "him"
+    elif g == "female":
+        return "she", "her"
+    return "they", "them"
+
 
 def _wants_long_reply(text: str) -> bool:
-    """Heuristic: does the incoming message ask Beluga to elaborate?"""
     triggers = ["explain", "detail", "elaborate", "more info", "tell me more",
-                "describe", "in full", "long answer", "why", "how does", "how do"]
+                "describe", "in full", "long answer", "why", "how does", "how do",
+                "bata", "samjha", "samjhao", "kyun", "kaise"]
     t = text.lower()
     return any(trig in t for trig in triggers) or len(text) > 200
 
-def _asks_where_is_owner(text: str) -> bool:
-    t = text.lower()
-    return bool(re.search(r"\bwhere\s+(is|are|s)\b", t)) and any(w in t for w in ["he", "she", "they", "him", "her", "owner", "is he", "is she"])
 
-async def secretary_toggle_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """
-    Owner-only. Run this from YOUR OWN DM with the bot before relying on
-    Chat Automation. Toggles the single global secretary_state on/off and,
-    on enabling, asks for your gender for the "where is he/she" replies.
-    """
-    if not u.message or u.effective_chat.type != "private":
-        await u.message.reply_text("📨 Secretary mode only works in DMs!")
+def _is_asking_where(text: str) -> bool:
+    t = text.lower()
+    return bool(re.search(r"\bwhere\b", t)) and any(w in t for w in ["is", "are", "he", "she", "they", "owner"])
+
+
+def _is_asking_who_are_you(text: str) -> bool:
+    t = text.lower()
+    return any(p in t for p in ["who are you", "who is this", "are you a bot", "kaun ho", "kaun hai", "kya hai ye", "who r u"])
+
+
+async def setgender_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Owner-only: /setgender male|female — sets pronoun for 'where is X' replies."""
+    if not u.message:
         return
     if not is_owner(u.effective_user.id if u.effective_user else 0):
-        await u.message.reply_text("🚫 Only the bot owner can toggle secretary mode.")
+        await u.message.reply_text("🚫 Owner only.")
         return
-
-    if secretary_state["enabled"]:
-        secretary_state["enabled"] = False
-        await u.message.reply_text("❌ *Secretary mode OFF* — I won't auto-handle incoming DMs anymore.", parse_mode=ParseMode.MARKDOWN)
+    parts = u.message.text.split()
+    if len(parts) < 2 or parts[1].lower() not in ("male", "female"):
+        await u.message.reply_text("Usage: `/setgender male` or `/setgender female`", parse_mode=ParseMode.MARKDOWN)
         return
+    dm_owner_info["gender"] = parts[1].lower()
+    await u.message.reply_text(f"✅ Gender set to *{parts[1].lower()}*.", parse_mode=ParseMode.MARKDOWN)
 
-    owner_name = get_user_name(u.effective_user)
-    secretary_state["enabled"] = True
-    secretary_state["owner_name"] = owner_name
-    secretary_state["owner_gender"] = "unknown"
 
-    options = [
-        InlineKeyboardButton("👨 Male", callback_data="sec:gender:male"),
-        InlineKeyboardButton("👩 Female", callback_data="sec:gender:female"),
-    ]
-    await u.message.reply_text(
-        "✅ *Secretary mode ON!*\n\n"
-        "From now on, EVERY message that arrives in this bot's DM (including "
-        "ones forwarded to you via Settings → Account → Chat Automation) will "
-        "get an automatic reply — no need to mention my name.\n\n"
-        "One quick thing — what's your gender, so I answer correctly if someone asks where you are?",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup([options])
-    )
-
-async def secretary_gender_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if not q:
+async def setname_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Owner-only: /setname YourName — sets the name used in 'X is not at home' replies."""
+    if not u.message:
         return
-    try:
-        await q.answer()
-        _, _, gender = q.data.split(":", 2)
-        if not is_owner(q.from_user.id):
-            await q.answer("Only the bot owner can set this!", show_alert=True)
-            return
-        secretary_state["owner_gender"] = gender
-        await q.edit_message_text("✅ *Secretary mode ready!* All incoming DMs will be auto-replied.", parse_mode=ParseMode.MARKDOWN)
-    except Exception as e:
-        logger.error(f"[secretary_gender_callback] {e}")
+    if not is_owner(u.effective_user.id if u.effective_user else 0):
+        await u.message.reply_text("🚫 Owner only.")
+        return
+    parts = u.message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await u.message.reply_text("Usage: `/setname YourName`", parse_mode=ParseMode.MARKDOWN)
+        return
+    dm_owner_info["name"] = parts[1].strip()
+    await u.message.reply_text(f"✅ Owner name set to *{dm_owner_info['name']}*.", parse_mode=ParseMode.MARKDOWN)
 
-async def monitor_secretary_dm(u: Update, c: ContextTypes.DEFAULT_TYPE):
+
+async def monitor_dm(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """
-    Fires on EVERY private-chat text message when secretary mode is globally
-    ON — regardless of sender ID, and regardless of whether the message
-    mentions "beluga" or any keyword at all (per spec: reply to every
-    message, not just ones that name the bot).
+    Fires on EVERY private-chat text message automatically.
+    Via Chat Automation, this means Beluga auto-replies to everyone who DMs
+    the bot owner — no command or toggle needed.
     """
     if not u.message or u.effective_chat.type != "private":
         return
-    if not secretary_state["enabled"]:
-        return
     try:
         text = (u.message.text or u.message.caption or "").strip()
-        if text.startswith("/"):
+        if not text or text.startswith("/"):
             return
 
-        owner_name = secretary_state.get("owner_name", "the user")
-        gender = secretary_state.get("owner_gender", "unknown")
+        owner_name = dm_owner_info.get("name", "the owner")
+        pronoun_s, _ = _get_owner_pronouns()
 
-        if _asks_where_is_owner(text):
-            pronoun = "He's" if gender == "male" else ("She's" if gender == "female" else "They're")
-            reply = f"{pronoun} not home right now."
+        if _is_asking_who_are_you(text):
+            reply = "I am BELUGA, handling this chat. 🐾"
+
+        elif _is_asking_where(text):
+            reply = f"{owner_name} is not at home right now, {pronoun_s} will be back soon."
+
         else:
-            long_reply_allowed = _wants_long_reply(text)
-            max_tok = 220 if long_reply_allowed else 35
+            wants_long = _wants_long_reply(text)
+            max_tok = 220 if wants_long else 40
             prompt = DM_SECRETARY_PROMPT
-            if long_reply_allowed:
-                prompt += "\nThe user asked for more detail — you may reply up to 100 words this time only."
-            reply = await ai(prompt, text, "Got it, thanks!", max_tok=max_tok)
+            if wants_long:
+                prompt += "\nThe user asked for detail — reply up to 100 words this time."
+            reply = await ai(prompt, text, "Okay! 🐾", max_tok=max_tok)
 
-        signed_msg = f"{reply}\n\n_— Beluga is handling this chat for {owner_name}_"
-        await u.message.reply_text(signed_msg, parse_mode=ParseMode.MARKDOWN, reply_to_message_id=u.message.message_id)
-
-        # In DMs, ALWAYS send a sticker from the MAIN pack with every response
-        # (never the "stay safe" pack — that one is group-only, see SECTION 24).
-        stick = await get_random_sticker_from(STICKER_PACK_MAIN)
-        if stick:
-            try:
-                await c.bot.send_sticker(chat_id=u.effective_chat.id, sticker=stick)
-            except Exception:
-                pass
-    except Exception as e:
-        logger.error(f"[monitor_secretary_dm] {e}")
-
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 22b: PLAIN PRIVATE-CHAT AI (no secretary mode active)
-# ═══════════════════════════════════════════════════════════════════════════
-# Per spec: in private chats, NOTHING else works except plain AI replies.
-# A sticker from the MAIN pack accompanies every single response.
-async def monitor_private_chat(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    if not u.message or u.effective_chat.type != "private":
-        return
-    if secretary_state["enabled"]:
-        return  # secretary handler (group 1) already covers every DM while it's globally ON
-    try:
-        text = (u.message.text or u.message.caption or "").strip()
-        if text.startswith("/"):
-            return
-        user_name = get_user_name(u.effective_user)
-        system = f"{CHAT_PROMPT}\nThe user's name is {user_name}. Always address them by name.\nReply in EXACTLY 2 lines."
-        reply = await ai(system, text, f"Meow {user_name}! 🐾", max_tok=120)
         await u.message.reply_text(reply, reply_to_message_id=u.message.message_id)
 
         stick = await get_random_sticker_from(STICKER_PACK_MAIN)
@@ -1885,35 +2032,48 @@ async def monitor_private_chat(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 await c.bot.send_sticker(chat_id=u.effective_chat.id, sticker=stick)
             except Exception:
                 pass
-        bot_status["message_count"] += 1
     except Exception as e:
-        logger.error(f"[monitor_private_chat] {e}")
+        logger.error(f"[monitor_dm] {e}")
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 23: GHOST MODE (@smartbeluga_bot mention, groups only)
+# SECTION 23: GHOST MODE (@botusername mention in groups)
 # ═══════════════════════════════════════════════════════════════════════════
+# When anyone tags the bot in a group (even groups it hasn't been added to),
+# Beluga replies. Checks both the actual bot username AND @smartbeluga_bot.
 async def monitor_ghost_mode(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """
-    Listens for the literal text '@smartbeluga_bot' anywhere in a GROUP message.
-    Works even in groups Beluga hasn't been formally added to, as long as
-    Telegram still delivers the update (e.g. bot has privacy mode disabled).
-    Groups only — never fires in private chats.
-    """
     if not u.message or u.effective_chat.type == "private":
         return
     text = (u.message.text or "").strip()
-    if "@smartbeluga_bot" not in text.lower():
+    if not text:
         return
-    msg_content = re.sub(r"@smartbeluga_bot", "", text, flags=re.IGNORECASE).strip()
+
+    bot_username = bot_status.get("username", "")
+    text_lower = text.lower()
+
+    mentioned = False
+    if bot_username and f"@{bot_username}" in text_lower:
+        mentioned = True
+    if "@smartbeluga_bot" in text_lower:
+        mentioned = True
+    if not mentioned:
+        return
+
+    # Strip all @mentions so we get the pure message content
+    msg_content = re.sub(r"@\w+", "", text, flags=re.IGNORECASE).strip()
     if not msg_content:
         return
+
     try:
         user_name = get_user_name(u.effective_user)
-        system = f"{CHAT_PROMPT}\nThe user's name is {user_name}. Address them by name.\nReply in EXACTLY 2 lines."
+        memory = await get_user_memory(u.effective_user.id)
+        mem_ctx = build_memory_context(memory)
+        system = (f"{CHAT_PROMPT}\nThe user's name is {user_name}. Address them by name.\n"
+                  f"Reply in EXACTLY 2 lines.{mem_ctx}")
         reply = await ai(system, msg_content, f"Meow {user_name}! 🐾", max_tok=120)
         await u.message.reply_text(reply, reply_to_message_id=u.message.message_id)
     except Exception as e:
         logger.error(f"[monitor_ghost_mode] {e}")
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION 24: GENERAL GROUP CHAT MONITOR (groups ONLY)
@@ -2001,7 +2161,9 @@ async def monitor_group(u: Update, c: ContextTypes.DEFAULT_TYPE):
             except Exception: pass
 
             user_name = get_user_name(u.effective_user)
-            system = f"{CHAT_PROMPT}\nThe user's name is {user_name}. Always address them by name.\nReply in EXACTLY 2 lines."
+            memory = await get_user_memory(uid)
+            system = (f"{CHAT_PROMPT}\nThe user's name is {user_name}. Always address them by name.\n"
+                      f"Reply in EXACTLY 2 lines.{build_memory_context(memory)}")
             reply = await ai(system, text, f"Meow {user_name}! 🐾", max_tok=120)
 
             if len(text) > 5:
@@ -2114,8 +2276,11 @@ async def start_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         "┣ `/nw` — New Week Reset *(admin)*\n"
         "┗ `/pump` `/dump` — Edit Points *(admin)*\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "📨 *MODES*\n"
-        "┣ `/secretary` — Toggle DM auto-handling\n"
+        "📨 *DM & ADMIN*\n"
+        "┣ _DMs are auto-handled — no command needed!_\n"
+        "┣ `/setname` `/setgender` — Configure DM replies *(admin)*\n"
+        "┣ `/model` — Switch AI model *(admin)*\n"
+        "┣ `/clearmemory` — Wipe all memory *(admin)*\n"
         "┗ `/block` `pack` — Ban a sticker pack *(admin)*\n\n"
         "❝ _Built with 💙 by @BELUGAPY_ ❞"
     )
@@ -2125,6 +2290,339 @@ async def start_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_video(video=START_VIDEO, caption=text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
     except Exception:
         await u.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 28: GITHUB-BACKED LONG-TERM USER MEMORY (+ /clearmemory)
+# ═══════════════════════════════════════════════════════════════════════════
+# Gives Beluga a per-user "long term memory" that persists indefinitely:
+#   - One JSON file per Telegram user: memory/<user_id>.json in the SAME
+#     GitHub repo already configured via GITHUB_TOKEN / GITHUB_REPO /
+#     GITHUB_BRANCH (Section 1) — no separate credentials needed.
+#   - Read before every AI reply and folded into the system prompt, so
+#     Beluga can recall what it knows about that user.
+#   - Never auto-expires. Only cleared by:
+#       * delete_user_memory(user_id)  -> wipes ONE user's file
+#       * clear_all_memory()           -> wipes EVERY user's file, via the
+#         owner-only /clearmemory command (gated by OWNER_ID / is_owner(),
+#         same as /nw, /gm, /pump, /dump, /block).
+MEMORY_FOLDER = "memory"  # folder in the repo that holds all per-user memory files
+
+# Reuse Section 4's _memory-style folder-confirmation pattern, but scoped
+# to this feature so it only logs once per process.
+_memory_folder_confirmed = False
+_memory_folder_lock = asyncio.Lock()
+_memory_rate_limit_reset_at: Optional[float] = None
+
+
+def _memory_file_path(user_id) -> str:
+    return f"{MEMORY_FOLDER}/{user_id}.json"
+
+
+async def _memory_respect_rate_limit():
+    global _memory_rate_limit_reset_at
+    if _memory_rate_limit_reset_at:
+        now = datetime.now().timestamp()
+        wait = _memory_rate_limit_reset_at - now
+        if wait > 0:
+            logger.warning(f"[memory] Rate limited — waiting {wait:.1f}s before next call.")
+            await asyncio.sleep(min(wait, 30))
+        _memory_rate_limit_reset_at = None
+
+
+def _memory_note_rate_limit(headers) -> None:
+    global _memory_rate_limit_reset_at
+    try:
+        remaining = int(headers.get("X-RateLimit-Remaining", "1"))
+        reset_ts = int(headers.get("X-RateLimit-Reset", "0"))
+        if remaining <= 1 and reset_ts:
+            _memory_rate_limit_reset_at = float(reset_ts)
+    except Exception:
+        pass
+
+
+async def _memory_gh_get_file(session: aiohttp.ClientSession, path: str):
+    """Fetch a file's content + sha. Returns (parsed_dict_or_None, sha_or_None). 404 is expected/normal."""
+    await _memory_respect_rate_limit()
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+    try:
+        async with session.get(url, headers=headers, params={"ref": GITHUB_BRANCH}, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            _memory_note_rate_limit(resp.headers)
+            if resp.status == 200:
+                data = await resp.json()
+                sha = data.get("sha")
+                raw = base64.b64decode(data.get("content", "")).decode("utf-8")
+                try:
+                    parsed = json.loads(raw) if raw.strip() else {}
+                except json.JSONDecodeError:
+                    logger.error(f"[memory] Corrupt JSON in {path}, treating as empty.")
+                    parsed = {}
+                return parsed, sha
+            elif resp.status == 404:
+                return None, None
+            elif resp.status == 403:
+                logger.error(f"[memory] 403 Forbidden reading {path} — check token scope or rate limit.")
+                return None, None
+            else:
+                body = await resp.text()
+                logger.error(f"[memory] GET {path} failed: {resp.status} {body[:200]}")
+                return None, None
+    except asyncio.TimeoutError:
+        logger.error(f"[memory] Timeout reading {path} from GitHub.")
+        return None, None
+    except Exception as e:
+        logger.error(f"[memory] Error reading {path}: {e}")
+        return None, None
+
+
+async def _memory_gh_put_file(session: aiohttp.ClientSession, path: str, content_dict: dict,
+                               commit_message: str, sha: Optional[str] = None) -> bool:
+    """Create or update a file. If sha is None but the file already exists (422), retries once as an update."""
+    await _memory_respect_rate_limit()
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+    content_str = json.dumps(content_dict, indent=2, ensure_ascii=False, sort_keys=True)
+    content_b64 = base64.b64encode(content_str.encode("utf-8")).decode("utf-8")
+    payload = {"message": commit_message, "content": content_b64, "branch": GITHUB_BRANCH}
+    if sha:
+        payload["sha"] = sha
+    try:
+        async with session.put(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            _memory_note_rate_limit(resp.headers)
+            if resp.status in (200, 201):
+                return True
+            elif resp.status == 409:
+                logger.warning(f"[memory] Conflict (409) writing {path} — sha was stale.")
+                return False
+            elif resp.status == 422 and sha is None:
+                logger.info(f"[memory] {path} already exists, retrying as update.")
+                _, existing_sha = await _memory_gh_get_file(session, path)
+                if existing_sha:
+                    return await _memory_gh_put_file(session, path, content_dict, commit_message, sha=existing_sha)
+                return False
+            else:
+                body = await resp.text()
+                logger.error(f"[memory] PUT {path} failed: {resp.status} {body[:200]}")
+                return False
+    except asyncio.TimeoutError:
+        logger.error(f"[memory] Timeout writing {path} to GitHub.")
+        return False
+    except Exception as e:
+        logger.error(f"[memory] Error writing {path}: {e}")
+        return False
+
+
+async def _memory_gh_delete_file(session: aiohttp.ClientSession, path: str, sha: str, commit_message: str) -> bool:
+    await _memory_respect_rate_limit()
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+    payload = {"message": commit_message, "sha": sha, "branch": GITHUB_BRANCH}
+    try:
+        async with session.delete(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            _memory_note_rate_limit(resp.headers)
+            if resp.status in (200, 204):
+                return True
+            body = await resp.text()
+            logger.error(f"[memory] DELETE {path} failed: {resp.status} {body[:200]}")
+            return False
+    except asyncio.TimeoutError:
+        logger.error(f"[memory] Timeout deleting {path} from GitHub.")
+        return False
+    except Exception as e:
+        logger.error(f"[memory] Error deleting {path}: {e}")
+        return False
+
+
+async def _memory_list_files(session: aiohttp.ClientSession) -> list:
+    """Directory-listing form of the Contents API: GET on a folder path returns an array of entries."""
+    await _memory_respect_rate_limit()
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{MEMORY_FOLDER}"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+    try:
+        async with session.get(url, headers=headers, params={"ref": GITHUB_BRANCH}, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            _memory_note_rate_limit(resp.headers)
+            if resp.status == 200:
+                entries = await resp.json()
+                return [e for e in entries if e.get("type") == "file" and e.get("name", "").endswith(".json")]
+            elif resp.status == 404:
+                return []  # folder doesn't exist yet — nothing to list
+            else:
+                body = await resp.text()
+                logger.error(f"[memory] Listing {MEMORY_FOLDER}/ failed: {resp.status} {body[:200]}")
+                return []
+    except Exception as e:
+        logger.error(f"[memory] Error listing {MEMORY_FOLDER}/: {e}")
+        return []
+
+
+async def _memory_ensure_repo_reachable(session: aiohttp.ClientSession) -> None:
+    """Confirm GitHub repo access once per process (clear log message if misconfigured)."""
+    global _memory_folder_confirmed
+    if _memory_folder_confirmed:
+        return
+    async with _memory_folder_lock:
+        if _memory_folder_confirmed:
+            return
+        if not (GITHUB_TOKEN and GITHUB_REPO):
+            logger.error("[memory] GITHUB_TOKEN / GITHUB_REPO not configured — memory disabled.")
+            return
+        url = f"https://api.github.com/repos/{GITHUB_REPO}"
+        headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+        try:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    logger.info(f"[memory] Connected to repo {GITHUB_REPO} — memory files live under '{MEMORY_FOLDER}/'.")
+                    _memory_folder_confirmed = True
+                elif resp.status == 404:
+                    logger.error(f"[memory] Repo {GITHUB_REPO} not found — check GITHUB_REPO.")
+                elif resp.status == 401:
+                    logger.error("[memory] GitHub auth failed (401) — check GITHUB_TOKEN.")
+                else:
+                    logger.warning(f"[memory] Unexpected status {resp.status} confirming repo access.")
+        except Exception as e:
+            logger.error(f"[memory] Could not reach GitHub to confirm repo: {e}")
+
+
+def _memory_is_configured() -> bool:
+    ok = bool(GITHUB_TOKEN and GITHUB_REPO)
+    if not ok:
+        logger.error("[memory] GITHUB_TOKEN / GITHUB_REPO not fully configured — memory disabled.")
+    return ok
+
+
+# ───────────────────────────── PUBLIC MEMORY API ─────────────────────────────
+async def get_user_memory(user_id) -> dict:
+    """
+    Fetch a user's long-term memory dict (empty {} if none exists yet).
+    Call this right before building the AI prompt so Beluga can recall
+    what it already knows about the user. Memory persists indefinitely.
+    """
+    if not _memory_is_configured():
+        return {}
+    path = _memory_file_path(user_id)
+    async with aiohttp.ClientSession() as session:
+        await _memory_ensure_repo_reachable(session)
+        data, _sha = await _memory_gh_get_file(session, path)
+        return data if data is not None else {}
+
+
+async def save_user_memory(user_id, memory_data: dict) -> bool:
+    """Overwrite a user's ENTIRE memory file with memory_data (fetches sha first if it exists)."""
+    if not _memory_is_configured():
+        return False
+    path = _memory_file_path(user_id)
+    async with aiohttp.ClientSession() as session:
+        await _memory_ensure_repo_reachable(session)
+        _, sha = await _memory_gh_get_file(session, path)
+        payload = dict(memory_data)
+        payload["_last_updated"] = datetime.now().isoformat()
+        payload.setdefault("_user_id", str(user_id))
+        commit_msg = f"Update memory for user {user_id} [skip ci]" if sha else f"Create memory for user {user_id} [skip ci]"
+        success = await _memory_gh_put_file(session, path, payload, commit_msg, sha=sha)
+        if success:
+            logger.info(f"[memory] Saved memory for user {user_id} ({len(payload)} keys).")
+        return success
+
+
+async def update_user_memory(user_id, key: str, value) -> bool:
+    """Update (or add) a SINGLE key in a user's memory, preserving everything else already stored."""
+    if not _memory_is_configured():
+        return False
+    path = _memory_file_path(user_id)
+    async with aiohttp.ClientSession() as session:
+        await _memory_ensure_repo_reachable(session)
+        data, sha = await _memory_gh_get_file(session, path)
+        if data is None:
+            data, sha = {}, None
+        data[key] = value
+        data["_last_updated"] = datetime.now().isoformat()
+        data.setdefault("_user_id", str(user_id))
+        commit_msg = f"Update memory key '{key}' for user {user_id} [skip ci]"
+        success = await _memory_gh_put_file(session, path, data, commit_msg, sha=sha)
+        if success:
+            logger.info(f"[memory] Updated key '{key}' for user {user_id}.")
+        return success
+
+
+async def delete_user_memory(user_id) -> bool:
+    """Permanently delete a single user's memory file. Returns True even if there was nothing to delete."""
+    if not _memory_is_configured():
+        return False
+    path = _memory_file_path(user_id)
+    async with aiohttp.ClientSession() as session:
+        await _memory_ensure_repo_reachable(session)
+        _, sha = await _memory_gh_get_file(session, path)
+        if not sha:
+            return True  # nothing existed — desired end-state already achieved
+        success = await _memory_gh_delete_file(session, path, sha, f"Delete memory for user {user_id} [skip ci]")
+        if success:
+            logger.info(f"[memory] Deleted memory for user {user_id}.")
+        return success
+
+
+async def clear_all_memory() -> tuple:
+    """
+    Wipe the ENTIRE memory store — every user's memory/<id>.json file is
+    permanently deleted from GitHub. Returns (deleted_count, failed_count).
+    No permission check here by design — gating belongs at the command
+    layer (see clearmemory_handler below, which is owner-only).
+    """
+    if not _memory_is_configured():
+        return (0, 0)
+    async with aiohttp.ClientSession() as session:
+        await _memory_ensure_repo_reachable(session)
+        entries = await _memory_list_files(session)
+        if not entries:
+            logger.info("[memory] clear_all_memory: no memory files found — nothing to clear.")
+            return (0, 0)
+        deleted, failed = 0, 0
+        for entry in entries:
+            ok = await _memory_gh_delete_file(session, entry["path"], entry["sha"], f"Clear all memory: remove {entry['name']} [skip ci]")
+            if ok:
+                deleted += 1
+            else:
+                failed += 1
+        logger.info(f"[memory] clear_all_memory: deleted {deleted} file(s), {failed} failure(s).")
+        return (deleted, failed)
+
+
+def build_memory_context(memory: dict) -> str:
+    """
+    Turn a memory dict into a short text block to append to an AI system
+    prompt. Internal bookkeeping keys (prefixed with "_") are skipped.
+    Returns "" if there's nothing meaningful to recall yet.
+    """
+    lines = [f"- {k}: {v}" for k, v in memory.items() if not str(k).startswith("_")]
+    if not lines:
+        return ""
+    return "\n\nWhat you remember about this user:\n" + "\n".join(lines)
+
+
+# ───────────────────────────── /clearmemory COMMAND (owner-only) ─────────────────────────────
+async def clearmemory_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """
+    Owner-only. Wipes EVERY user's memory file from GitHub.
+    Gated by the existing OWNER_ID env var / is_owner() helper — same
+    pattern as /nw, /gm, /pump, /dump, /block.
+    """
+    if not u.message:
+        return
+    if not is_owner(u.effective_user.id if u.effective_user else 0):
+        await u.message.reply_text("🚫 Owner only.")
+        return
+
+    status_msg = await u.message.reply_text("CLEARING MEMORY 🧹......")
+    deleted, failed = await clear_all_memory()
+
+    if failed == 0:
+        result_text = f"✅ Memory cleared! Removed {deleted} file(s) from GitHub."
+    else:
+        result_text = f"⚠️ Cleared {deleted} file(s), but {failed} failed to delete — check logs."
+
+    try:
+        await status_msg.edit_text(f"CLEARING MEMORY 🧹......\n\n{result_text}")
+    except Exception:
+        await u.message.reply_text(result_text)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION 27: MAIN ENTRYPOINT
@@ -2169,15 +2667,18 @@ async def main():
     app.add_handler(CommandHandler("mine", mine_handler))
     app.add_handler(CommandHandler("gm", gm_handler))
     app.add_handler(CommandHandler(["gay", "couple"], fun_dispatcher))
-    app.add_handler(CommandHandler("secretary", secretary_toggle_handler))
     app.add_handler(CommandHandler("block", block_handler))
+    app.add_handler(CommandHandler("clearmemory", clearmemory_handler))
+    app.add_handler(CommandHandler("model", model_command_handler))
+    app.add_handler(CommandHandler("setname", setname_handler))
+    app.add_handler(CommandHandler("setgender", setgender_handler))
 
     # ---- Callback query handlers ----
     app.add_handler(CallbackQueryHandler(ttt_callback, pattern=r"^ttt:"))
     app.add_handler(CallbackQueryHandler(gm_callback, pattern=r"^gm:"))
     app.add_handler(CallbackQueryHandler(mine_callback, pattern=r"^mine:"))
     app.add_handler(CallbackQueryHandler(watermark_callback, pattern=r"^wm:"))
-    app.add_handler(CallbackQueryHandler(secretary_gender_callback, pattern=r"^sec:"))
+    app.add_handler(CallbackQueryHandler(model_callback, pattern=r"^model:"))
     app.add_handler(PollAnswerHandler(poll_answer_handler))
 
     # ---- Message handlers ----
@@ -2188,15 +2689,13 @@ async def main():
     # both need to run on the same group text message).
     #
     #   group 0: incoming STICKERS in groups -> banned-pack auto-delete check
-    #   group 1: private-chat text  -> secretary DM handling (if enabled)
-    #   group 2: private-chat text  -> plain AI handling (if secretary NOT enabled)
-    #   group 3: group-chat text    -> ghost mode (@smartbeluga_bot mention)
-    #   group 4: group-chat text/stickers -> general group monitor (AI + sticker cadence)
+    #   group 1: private-chat text  -> DM auto-handler (Chat Automation, always on)
+    #   group 2: group-chat text    -> ghost mode (@botusername mention)
+    #   group 3: group-chat text/stickers -> general group monitor (AI + sticker cadence)
     app.add_handler(MessageHandler(filters.Sticker.ALL & filters.ChatType.GROUPS, monitor_group), group=0)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, monitor_secretary_dm), group=1)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, monitor_private_chat), group=2)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, monitor_ghost_mode), group=3)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, monitor_group), group=4)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, monitor_dm), group=1)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, monitor_ghost_mode), group=2)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, monitor_group), group=3)
 
     app.add_error_handler(error_handler)
 
@@ -2250,4 +2749,3 @@ if __name__ == "__main__":
     except Exception as e:
         logger.critical(f"Fatal: {e}")
         sys.exit(1)
-       
