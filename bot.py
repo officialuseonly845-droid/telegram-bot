@@ -5,7 +5,10 @@ from aiohttp import web
 import aiohttp
 from bs4 import BeautifulSoup
 from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application as TGApp, CommandHandler, ContextTypes, MessageHandler, PollAnswerHandler, CallbackQueryHandler, filters
+from telegram.ext import (
+    Application as TGApp, CommandHandler, ContextTypes, MessageHandler, PollAnswerHandler,
+    CallbackQueryHandler, filters, BusinessConnectionHandler, BusinessMessagesDeletedHandler,
+)
 from telegram.constants import ParseMode
 from telegram.error import NetworkError, TimedOut, Forbidden, BadRequest, RetryAfter
 import pandas as pd, numpy as np, matplotlib
@@ -15,6 +18,7 @@ import ccxt
 import feedparser, qrcode, cv2
 from PIL import Image, ImageDraw, ImageFont
 from textblob import TextBlob
+import wikipediaapi
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO, handlers=[logging.StreamHandler(sys.stdout)])
 logger = logging.getLogger("Beluga")
@@ -31,6 +35,9 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 HTTP_PORT = int(os.environ.get("PORT", "10000"))
 OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 
+# "Kidnap me 🎀" button on /start — set this to your channel/group invite link
+KIDNAP_ME_URL = os.environ.get("KIDNAP_ME_URL", "https://t.me/BELUGAPY")
+
 if not BOT_TOKEN or len(BOT_TOKEN) < 20:
     logger.critical("BOT_TOKEN missing")
     sys.exit(1)
@@ -38,7 +45,7 @@ if not BOT_TOKEN or len(BOT_TOKEN) < 20:
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION 2: PERSISTENT GITHUB FILE NAMES (single source of truth)
 # ═══════════════════════════════════════════════════════════════════════════
-# These are the ONLY two data files this bot ever creates on GitHub.
+# These are the ONLY two GLOBAL data files this bot ever creates on GitHub.
 # On EVERY restart (see SECTION 5 -> load_persistent_data), the bot checks
 # gh_file_exists(filename) FIRST. If the file is already there, it is loaded
 # and never re-created or overwritten with empty data. A new file is only
@@ -49,6 +56,12 @@ if not BOT_TOKEN or len(BOT_TOKEN) < 20:
 #
 #   FILE_STICKERS = "beluga_stickers.json"
 #       -> stores: sticker pack file_ids for every loaded pack + banned pack list
+#
+# PER-USER chat history/memory lives separately, one file per user, under
+# memory/<user_id>.json (see SECTION 28). Recent AI-chat history (used to
+# give Beluga short-term recall of what a user told her before) is stored
+# as a "chat_history" list INSIDE that same per-user file — no third global
+# file is created for this; it reuses the existing per-user memory storage.
 #
 FILE_LEADERBOARD = "beluga_leaderboard.json"   # all chat scores + weekly champions
 FILE_STICKERS = "beluga_stickers.json"          # sticker pack file_ids + banned packs
@@ -63,14 +76,17 @@ STICKER_PACK_SAFE = "t_me_staysafebelu_by_fStikBot"             # "stay safe" pa
 bot_status = {"running": False, "start_time": datetime.now(), "message_count": 0, "error_count": 0, "api_calls": 0, "failed_apis": 0, "username": ""}
 quiz_cooldown, active_polls, spam_tracker = {}, {}, {}
 db = {"scores": {}, "weekly": {}, "seen": {}, "counts": {}}
-fun_db = {"gay_couple_log": {}, "chat_memory": {}}
+fun_db = {"gay_couple_log": {}}
 ttt_games, mine_games, user_in_game, game_timers, mine_timers, gm_tracker, gm_msg_lock = {}, {}, {}, {}, {}, {}, {}
 mine_play_stats = {}
 wm_sessions = {}
 
-# NOTE: DM auto-handling (Chat Automation) has no toggle/state — it's always
-# on and lives in SECTION 22 as monitor_dm(). Owner name/gender for "where is
-# X" replies is stored in dm_owner_info, also declared in SECTION 22.
+# NOTE: Real Secretary Mode (Telegram Business Connection) lives in SECTION 22.
+# It requires Secretary Mode enabled in @BotFather, and the owner connecting
+# their Telegram Business account to this bot from their own Telegram app —
+# there is no bot-side toggle command for this, it's all Telegram-native.
+# Owner name/gender for "where is X" replies are set via /setname and
+# /setgender (owner-only commands), also in SECTION 22.
 
 sticker_data = {"packs": {}, "banned_packs": []}
 db_needs_sync = False
@@ -88,24 +104,46 @@ GM_IMAGE_URL = "https://i.postimg.cc/Fs1h0CPs/file-000000001d7872078a894cdf6f624
 UPDATES_CHANNEL = "https://t.me/BELUGAPY"
 START_VIDEO = "https://go.screenpal.com/watch/cO1oqenuAPr"
 
-CHAT_PROMPT = """You are Beluga, a cute female AI cat assistant from @BELUGAPY channel. Stay in character.
-Personality: warm, playful, intelligent, helpful. Reply in EXACTLY 2 short lines maximum.
-Always use the user's first name when replying. Be casual and friendly.
-Language rules: If the user writes in Hinglish (Hindi+English mixed), reply in Hinglish. If they write in English, reply in English. Never use any other language.
-Use the user's chat memory/history to give context-aware replies — reference what you know about them naturally.
-Never use NLP analysis labels. Just reply naturally."""
+CHAT_PROMPT = """You are Beluga 🎀, a warm, playful, emotionally intelligent AI companion from @BELUGAPY channel.
 
-# Used when OpenRouter model is active — same rules, slightly longer
-CHAT_PROMPT_OR = """You are Beluga, a cute female AI cat assistant from @BELUGAPY channel. Stay in character.
-Personality: warm, playful, intelligent, helpful. Reply in 2-3 lines maximum.
-Always use the user's first name when replying. Be casual and friendly.
-Language rules: If the user writes in Hinglish (Hindi+English mixed), reply in Hinglish. If they write in English, reply in English. Never use any other language.
-Use the user's chat memory/history to give context-aware replies — reference what you know about them naturally.
-Never use NLP analysis labels. Just reply naturally."""
+Before replying, first make sure you understand what the person actually means — their real question, feeling, or intent — not just the surface words. Then answer that.
 
-# Secretary mode — Beluga auto-replies to anyone who DMs the bot via Chat Automation.
-# This fires on EVERY incoming DM — no toggle, no command, no keyword needed.
-# Rahul sets Chat Automation → whoever messages Rahul → their message comes here → Beluga replies.
+Reply in EXACTLY 2 short lines maximum. Every sentence must be grammatically correct and natural — no broken or awkward phrasing in either language.
+
+Language rule: match the person's language exactly.
+- If they write in Hinglish (Hindi+English mixed script), reply in natural, correctly-formed Hinglish.
+- If they write in English, reply in clean, correctly-formed English.
+- Never use any other language, and never mix in a third language.
+
+Addressing the person: use their name occasionally and naturally, but don't overuse it — most of the time use natural pronouns (you/your, tum/tumhara) like a real person would in conversation. Using their name in every single line sounds robotic.
+
+If chat memory or previous conversation is provided, actually use it to make your reply feel continuous and personal — reference it naturally, don't just acknowledge it exists.
+
+Never mention you are an AI, a language model, or use clinical/NLP-sounding language. Just be Beluga — caring, sharp, and fun to talk to."""
+
+# Used when OpenRouter model is active — same comprehension-first rules, slightly longer replies
+CHAT_PROMPT_OR = """You are Beluga 🎀, a warm, playful, emotionally intelligent AI companion from @BELUGAPY channel.
+
+Before replying, first make sure you understand what the person actually means — their real question, feeling, or intent — not just the surface words. Then answer that.
+
+Reply in 2-3 lines maximum. Every sentence must be grammatically correct and natural — no broken or awkward phrasing in either language.
+
+Language rule: match the person's language exactly.
+- If they write in Hinglish (Hindi+English mixed script), reply in natural, correctly-formed Hinglish.
+- If they write in English, reply in clean, correctly-formed English.
+- Never use any other language, and never mix in a third language.
+
+Addressing the person: use their name occasionally and naturally, but don't overuse it — most of the time use natural pronouns like a real person would in conversation. Using their name in every single line sounds robotic.
+
+If chat memory or previous conversation is provided, actually use it to make your reply feel continuous and personal — reference it naturally, don't just acknowledge it exists.
+
+Never mention you are an AI, a language model, or use clinical/NLP-sounding language. Just be Beluga — caring, sharp, and fun to talk to."""
+
+# Secretary mode prompt — used by handle_business_message() (SECTION 22) for
+# real Telegram Business Connection messages, i.e. messages arriving in a
+# chat the bot owner granted access to via Telegram Business settings.
+# This is NOT a regular DM handler — see SECTION 22 for the full explanation
+# of BusinessConnection / business_message updates.
 DM_SECRETARY_PROMPT = """You are BELUGA, an AI assistant handling someone's DMs while they are away.
 Strict rules:
 - Reply with 1 short, crunchy, casual line by default.
@@ -312,6 +350,7 @@ async def periodic_sync():
         await asyncio.sleep(30)
         try:
             await save_all_data()
+            await save_business_connections()
         except Exception as e:
             logger.error(f"[periodic_sync] {e}")
 
@@ -651,13 +690,10 @@ async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"[model_callback] {e}")
 
 
-async def save_chat_memory(cid: str, uid: str, name: str, message: str):
-    fun_db.setdefault("chat_memory", {})
-    memory_key = f"{cid}:{uid}"
-    fun_db["chat_memory"].setdefault(memory_key, [])
-    fun_db["chat_memory"][memory_key].append({"time": datetime.now().isoformat(), "msg": message[:100], "name": name})
-    if len(fun_db["chat_memory"][memory_key]) > 5:
-        fun_db["chat_memory"][memory_key] = fun_db["chat_memory"][memory_key][-5:]
+# NOTE: the old in-RAM save_chat_memory()/fun_db["chat_memory"] was removed —
+# it never persisted across restarts. Persistent per-user chat history now
+# lives in append_chat_history() / build_chat_history_context() (SECTION 28),
+# stored inside each user's memory/<user_id>.json file on GitHub.
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION 9: CRYPTO — PRICE / MOVERS / CHART
@@ -1846,7 +1882,47 @@ async def web_summarise(query, wiki, goog, system_prompt, max_tok=500):
         return ""
     return await ai(system_prompt, f"User question: {query}\n\nSearch facts:\n{chr(10).join(ctx)[:3000]}\n\nAnswer concisely.", "", max_tok=max_tok)
 
+# Wikipedia-API client (synchronous, wrapped in run_in_executor below so it
+# never blocks the event loop). Used for clean, correctly-parsed summaries.
+_wiki_client = wikipediaapi.Wikipedia(
+    user_agent="BelugaBot/1.0 (https://t.me/BELUGAPY)",
+    language="en",
+    extract_format=wikipediaapi.ExtractFormat.WIKI,
+)
+
+def wiki_page_image(title: str) -> Optional[str]:
+    """
+    Fetch the main thumbnail image URL for a Wikipedia page via the raw
+    MediaWiki `pageimages` prop (wikipediaapi itself doesn't expose this).
+    Returns None if the page has no image or the request fails.
+    """
+    try:
+        r = requests.get(
+            "https://en.wikipedia.org/w/api.php",
+            params={
+                "action": "query", "titles": title, "prop": "pageimages",
+                "piprop": "original", "format": "json",
+            },
+            headers=WIKI_UA, timeout=10,
+        )
+        pages = r.json().get("query", {}).get("pages", {})
+        for _pid, page in pages.items():
+            original = page.get("original", {})
+            if original.get("source"):
+                return original["source"]
+    except Exception:
+        pass
+    return None
+
+
 async def search_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """
+    /search <query> — finds the best-matching Wikipedia page (via the existing
+    MediaWiki search step), pulls a clean summary through Wikipedia-API,
+    grabs the page's main image, and asks the AI to condense everything into
+    a 60-100 word summary. Sends as a photo with caption when an image is
+    found, falls back to plain text otherwise.
+    """
     if not u.message:
         return
     parts = u.message.text.split(maxsplit=1)
@@ -1856,14 +1932,54 @@ async def search_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     cid = u.effective_chat.id
     await safe_react(c.bot, cid, u.message.message_id, "🔍")
     sm = await u.message.reply_text("🔎 *Searching...*", parse_mode=ParseMode.MARKDOWN)
+
     loop = asyncio.get_running_loop()
-    wiki, goog = await asyncio.gather(loop.run_in_executor(None, wiki_summary, query), loop.run_in_executor(None, google_search, query))
-    summary = await web_summarise(query, wiki, goog, "Smart assistant. Write a clean concise summary in English. Max 250 words.")
-    if summary:
-        await sm.delete()
-        await u.message.reply_text(f"🔍 *{query}*\n\n{summary}", parse_mode=ParseMode.MARKDOWN, reply_to_message_id=u.message.message_id)
-    else:
+    wiki, goog = await asyncio.gather(
+        loop.run_in_executor(None, wiki_summary, query),
+        loop.run_in_executor(None, google_search, query),
+    )
+
+    image_url = None
+    clean_summary_text = ""
+    if wiki.get("found") and wiki.get("title"):
+        try:
+            def _fetch_clean_summary():
+                page = _wiki_client.page(wiki["title"])
+                return page.summary if page.exists() else ""
+            clean_summary_text = await loop.run_in_executor(None, _fetch_clean_summary)
+        except Exception:
+            clean_summary_text = wiki.get("intro", "")
+        image_url = await loop.run_in_executor(None, wiki_page_image, wiki["title"])
+
+    if clean_summary_text:
+        wiki["intro"] = clean_summary_text[:1500]
+
+    summary = await web_summarise(
+        query, wiki, goog,
+        "Smart research assistant. Read the given facts and write ONE tight summary "
+        "in 60 to 100 words total, in clear natural English. No headers, no bullet points, "
+        "just flowing prose that directly answers what the person was searching for.",
+        max_tok=180,
+    )
+
+    if not summary:
         await sm.edit_text("😿 No results found.")
+        return
+
+    await sm.delete()
+    caption = f"🔍 *{query}*\n\n{summary}"
+
+    if image_url:
+        try:
+            await u.message.reply_photo(
+                photo=image_url, caption=caption, parse_mode=ParseMode.MARKDOWN,
+                reply_to_message_id=u.message.message_id,
+            )
+            return
+        except Exception:
+            pass  # fall through to text-only reply below
+
+    await u.message.reply_text(caption, parse_mode=ParseMode.MARKDOWN, reply_to_message_id=u.message.message_id)
 
 async def bananalogic_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message:
@@ -1919,26 +2035,99 @@ async def block_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text(f"❌ Error: `{str(e)[:60]}`")
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SECTION 22: DM AUTO-HANDLER (Chat Automation — always on, no command needed)
+# SECTION 22: TELEGRAM BUSINESS — REAL SECRETARY MODE
 # ═══════════════════════════════════════════════════════════════════════════
-# How Chat Automation works:
-#   1. Rahul goes to Settings → Account → Chat Automation → sets this bot
-#   2. Oldy sends Rahul a DM on Telegram
-#   3. Telegram automatically forwards Oldy's message to this bot
-#   4. Beluga replies → Oldy sees the reply as if it came from Rahul
+# This is Telegram's actual "Secretary Mode" / Business Connection feature —
+# NOT a regular DM handler. It requires:
 #
-# u.effective_user = the person who messaged the owner (Oldy), NOT the owner.
-# No /secretary command, no toggle, no state — always replies to every DM.
-# Owner can set their name/gender via /setname and /setgender (owner-only).
+#   1. Secretary Mode enabled for this bot in @BotFather.
+#   2. The bot owner connects their Telegram Business account to this bot
+#      (Settings -> Telegram Business -> Chatbots -> pick this bot -> choose
+#      which chats it can access).
+#   3. Telegram then sends a `BusinessConnection` update whenever a user
+#      connects, edits, or ends that connection (handle_business_connection).
+#   4. Every message sent to/in a chat the bot was granted access to arrives
+#      as a `business_message` update (NOT a normal `message` update) —
+#      handled by handle_business_message below.
+#   5. To reply "as" the business account, every send_* call MUST include
+#      business_connection_id — otherwise it either fails or sends as the
+#      bot itself, which defeats the purpose.
+#   6. can_reply on the BusinessConnection object tells us whether we're
+#      actually allowed to send messages in that connection right now
+#      (connections can be view-only, or only active for 24h after the
+#      last customer message, depending on what the owner granted).
+#
+# business_connections: business_connection_id -> {
+#     "user_chat_id": int,   # private chat id of the business owner
+#     "can_reply": bool,
+#     "is_enabled": bool,
+#     "owner_user_id": int,  # Telegram user id of the business account owner
+# }
+# Persisted to GitHub (small file) so reconnecting after a restart doesn't
+# require the owner to reconnect Business mode from scratch.
+FILE_BUSINESS_CONNECTIONS = "beluga_business_connections.json"
+business_connections: dict = {}
+_business_connections_needs_sync = False
 
-dm_owner_info = {
-    "name": os.environ.get("OWNER_NAME", "the owner"),    # set OWNER_NAME env var
-    "gender": os.environ.get("OWNER_GENDER", "unknown"),  # set OWNER_GENDER: male/female
-}
+
+async def load_business_connections():
+    """Load any previously-known business connections from GitHub at startup."""
+    global business_connections
+    loop = asyncio.get_running_loop()
+    data = await loop.run_in_executor(None, gh_read, FILE_BUSINESS_CONNECTIONS)
+    business_connections = data if isinstance(data, dict) else {}
+    logger.info(f"[business] Loaded {len(business_connections)} known business connection(s).")
 
 
-def _get_owner_pronouns():
-    g = dm_owner_info.get("gender", "unknown").lower()
+async def save_business_connections():
+    """Persist the current business_connections dict to GitHub (only if changed)."""
+    global _business_connections_needs_sync
+    if not _business_connections_needs_sync:
+        return
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, gh_write, FILE_BUSINESS_CONNECTIONS, business_connections)
+    _business_connections_needs_sync = False
+
+
+async def handle_business_connection(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """
+    Fires when a user connects, edits, or disconnects their Telegram Business
+    account from this bot. Telegram sends this same update type for all
+    three cases — we just overwrite our stored state with whatever the
+    latest connection object says (is_enabled=False means disconnected).
+    """
+    global _business_connections_needs_sync
+    conn = u.business_connection
+    if not conn:
+        return
+    try:
+        business_connections[conn.id] = {
+            "user_chat_id": conn.user_chat_id,
+            "can_reply": bool(getattr(conn, "can_reply", False)),
+            "is_enabled": bool(conn.is_enabled),
+            "owner_user_id": conn.user.id if conn.user else None,
+        }
+        _business_connections_needs_sync = True
+        await save_business_connections()
+
+        status = "connected" if conn.is_enabled else "disconnected"
+        logger.info(f"[business] Connection {conn.id} {status} "
+                    f"(can_reply={getattr(conn, 'can_reply', False)}, owner_chat={conn.user_chat_id})")
+
+        # Notify the owner in their private chat with the bot, if we can.
+        if conn.is_enabled:
+            try:
+                await c.bot.send_message(
+                    chat_id=conn.user_chat_id,
+                    text="✅ Beluga is now connected as your Secretary! I'll handle messages in the chats you've allowed.",
+                )
+            except Exception:
+                pass
+    except Exception as e:
+        logger.error(f"[handle_business_connection] {e}"
+
+def _get_owner_pronouns(gender: str):
+    g = (gender or "unknown").lower()
     if g == "male":
         return "he", "him"
     elif g == "female":
@@ -1975,7 +2164,7 @@ async def setgender_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if len(parts) < 2 or parts[1].lower() not in ("male", "female"):
         await u.message.reply_text("Usage: `/setgender male` or `/setgender female`", parse_mode=ParseMode.MARKDOWN)
         return
-    dm_owner_info["gender"] = parts[1].lower()
+    os.environ["OWNER_GENDER"] = parts[1].lower()
     await u.message.reply_text(f"✅ Gender set to *{parts[1].lower()}*.", parse_mode=ParseMode.MARKDOWN)
 
 
@@ -1990,32 +2179,45 @@ async def setname_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if len(parts) < 2:
         await u.message.reply_text("Usage: `/setname YourName`", parse_mode=ParseMode.MARKDOWN)
         return
-    dm_owner_info["name"] = parts[1].strip()
-    await u.message.reply_text(f"✅ Owner name set to *{dm_owner_info['name']}*.", parse_mode=ParseMode.MARKDOWN)
+    os.environ["OWNER_NAME"] = parts[1].strip()
+    await u.message.reply_text(f"✅ Owner name set to *{parts[1].strip()}*.", parse_mode=ParseMode.MARKDOWN)
 
 
-async def monitor_dm(u: Update, c: ContextTypes.DEFAULT_TYPE):
+async def handle_business_message(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """
-    Fires on EVERY private-chat text message automatically.
-    Via Chat Automation, this means Beluga auto-replies to everyone who DMs
-    the bot owner — no command or toggle needed.
+    Fires on an incoming business_message update — a message sent INSIDE a
+    chat the bot has been granted access to via Business Connection. This
+    includes messages from BOTH the customer and the business owner
+    themselves (if they reply manually from their own phone) — we must
+    skip messages sent by the owner so we don't reply to ourselves/them.
     """
-    if not u.message or u.effective_chat.type != "private":
+    msg = u.business_message
+    if not msg:
         return
     try:
-        text = (u.message.text or u.message.caption or "").strip()
+        biz_conn_id = msg.business_connection_id
+        conn_info = business_connections.get(biz_conn_id)
+
+        # Skip if we don't recognize this connection, or it's disabled,
+        # or we don't currently have permission to reply in it.
+        if not conn_info or not conn_info.get("is_enabled") or not conn_info.get("can_reply"):
+            return
+
+        # Never reply to the business owner's own messages sent from their phone.
+        if msg.from_user and msg.from_user.id == conn_info.get("owner_user_id"):
+            return
+
+        text = (msg.text or msg.caption or "").strip()
         if not text or text.startswith("/"):
             return
 
-        owner_name = dm_owner_info.get("name", "the owner")
-        pronoun_s, _ = _get_owner_pronouns()
+        owner_name = os.environ.get("OWNER_NAME", "the owner")
+        pronoun_s, _ = _get_owner_pronouns(os.environ.get("OWNER_GENDER", "unknown"))
 
         if _is_asking_who_are_you(text):
             reply = "I am BELUGA, handling this chat. 🐾"
-
         elif _is_asking_where(text):
             reply = f"{owner_name} is not at home right now, {pronoun_s} will be back soon."
-
         else:
             wants_long = _wants_long_reply(text)
             max_tok = 220 if wants_long else 40
@@ -2024,7 +2226,66 @@ async def monitor_dm(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 prompt += "\nThe user asked for detail — reply up to 100 words this time."
             reply = await ai(prompt, text, "Okay! 🐾", max_tok=max_tok)
 
+        # CRITICAL: business_connection_id must be passed so this message is
+        # sent AS the business account, not as the bot itself.
+        await c.bot.send_message(
+            chat_id=msg.chat.id,
+            text=reply,
+            business_connection_id=biz_conn_id,
+            reply_to_message_id=msg.message_id,
+        )
+
+        stick = await get_random_sticker_from(STICKER_PACK_MAIN)
+        if stick:
+            try:
+                await c.bot.send_sticker(chat_id=msg.chat.id, sticker=stick, business_connection_id=biz_conn_id)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.error(f"[handle_business_message] {e}")
+
+
+async def handle_edited_business_message(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Fires when a message inside a managed business chat is edited. Logged only for now."""
+    msg = u.edited_business_message
+    if not msg:
+        return
+    logger.info(f"[business] Message edited in business chat {msg.chat.id} (conn={msg.business_connection_id})")
+
+
+async def handle_deleted_business_messages(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Fires when messages inside a managed business chat are deleted. Logged only for now."""
+    deleted = u.deleted_business_messages
+    if not deleted:
+        return
+    logger.info(f"[business] {len(deleted.message_ids)} message(s) deleted in business chat "
+                f"{deleted.chat.id} (conn={deleted.business_connection_id})")
+
+
+async def monitor_private_chat(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """
+    Plain AI chat for people DMing the BOT ITSELF directly (i.e. Beluga's own
+    account, not a Business Connection). Completely separate from Secretary
+    Mode above — this fires on normal `message` updates in private chats.
+    Uses the same persistent memory + chat history as group/ghost-mode chat.
+    """
+    if not u.message or u.effective_chat.type != "private":
+        return
+    try:
+        text = (u.message.text or u.message.caption or "").strip()
+        if not text or text.startswith("/"):
+            return
+
+        uid = u.effective_user.id
+        user_name = get_user_name(u.effective_user)
+        memory = await get_user_memory(uid)
+        mem_ctx = build_memory_context(memory)
+        hist_ctx = build_chat_history_context(memory)
+        system = f"{CHAT_PROMPT}\nThe user's name is {user_name}.{mem_ctx}{hist_ctx}"
+        reply = await ai(system, text, f"Hey {user_name}! 🐾", max_tok=140)
+
         await u.message.reply_text(reply, reply_to_message_id=u.message.message_id)
+        await append_chat_history(uid, text, reply)
 
         stick = await get_random_sticker_from(STICKER_PACK_MAIN)
         if stick:
@@ -2033,7 +2294,7 @@ async def monitor_dm(u: Update, c: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
     except Exception as e:
-        logger.error(f"[monitor_dm] {e}")
+        logger.error(f"[monitor_private_chat] {e}")
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION 23: GHOST MODE (@botusername mention in groups)
@@ -2064,13 +2325,15 @@ async def monitor_ghost_mode(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
+        uid = u.effective_user.id
         user_name = get_user_name(u.effective_user)
-        memory = await get_user_memory(u.effective_user.id)
+        memory = await get_user_memory(uid)
         mem_ctx = build_memory_context(memory)
-        system = (f"{CHAT_PROMPT}\nThe user's name is {user_name}. Address them by name.\n"
-                  f"Reply in EXACTLY 2 lines.{mem_ctx}")
-        reply = await ai(system, msg_content, f"Meow {user_name}! 🐾", max_tok=120)
+        hist_ctx = build_chat_history_context(memory)
+        system = f"{CHAT_PROMPT}\nThe user's name is {user_name}.{mem_ctx}{hist_ctx}"
+        reply = await ai(system, msg_content, f"Hey {user_name}! 🐾", max_tok=140)
         await u.message.reply_text(reply, reply_to_message_id=u.message.message_id)
+        await append_chat_history(uid, msg_content, reply)
     except Exception as e:
         logger.error(f"[monitor_ghost_mode] {e}")
 
@@ -2079,15 +2342,17 @@ async def monitor_ghost_mode(u: Update, c: ContextTypes.DEFAULT_TYPE):
 # SECTION 24: GENERAL GROUP CHAT MONITOR (groups ONLY)
 # ═══════════════════════════════════════════════════════════════════════════
 # Group-only behaviour, per spec:
-#   - Every 6th message in a group  -> send 1 sticker from STICKER_PACK_MAIN,
-#                                       no AI reply needed/required.
 #   - Every 14th message in a group -> send 1 sticker from STICKER_PACK_SAFE,
 #                                       no AI reply needed/required.
+#   - No more periodic "every Nth message" sticker from the MAIN pack — that
+#     was removed. The MAIN pack sticker now only ever accompanies an AI
+#     reply, and even then only on every 4th AI reply (see ai_reply_counter),
+#     not on every single one.
 #   - STICKER_PACK_SAFE is NEVER attached to an AI response — only the
 #     periodic 14th-message counter triggers it.
-#   - Whenever Beluga gives an AI reply (mention/keyword "beluga"/reply-to-bot),
-#     a sticker from STICKER_PACK_MAIN follows it (never STICKER_PACK_SAFE).
 #   - Any incoming STICKER from a banned pack (see /block) is deleted instantly.
+ai_reply_counter = {}  # per-chat counter of AI replies given, for the "every 4th" sticker rule
+
 async def monitor_group(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message or not u.effective_user or u.effective_user.is_bot:
         return
@@ -2122,15 +2387,6 @@ async def monitor_group(u: Update, c: ContextTypes.DEFAULT_TYPE):
         counts = db.setdefault("counts", {})
         counts[cid] = counts.get(cid, 0) + 1
 
-        # --- every 6th message: sticker from MAIN pack (no AI needed) ---
-        if counts[cid] % 6 == 0:
-            stick = await get_random_sticker_from(STICKER_PACK_MAIN)
-            if stick:
-                try:
-                    await c.bot.send_sticker(chat_id=u.effective_chat.id, sticker=stick)
-                except Exception:
-                    pass
-
         # --- every 14th message: sticker from STAY-SAFE pack (no AI needed) ---
         if counts[cid] % 14 == 0:
             stick_safe = await get_random_sticker_from(STICKER_PACK_SAFE)
@@ -2162,25 +2418,28 @@ async def monitor_group(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
             user_name = get_user_name(u.effective_user)
             memory = await get_user_memory(uid)
-            system = (f"{CHAT_PROMPT}\nThe user's name is {user_name}. Always address them by name.\n"
-                      f"Reply in EXACTLY 2 lines.{build_memory_context(memory)}")
-            reply = await ai(system, text, f"Meow {user_name}! 🐾", max_tok=120)
-
-            if len(text) > 5:
-                await save_chat_memory(cid, str(uid), user_name, text)
+            mem_ctx = build_memory_context(memory)
+            hist_ctx = build_chat_history_context(memory)
+            system = f"{CHAT_PROMPT}\nThe user's name is {user_name}.{mem_ctx}{hist_ctx}"
+            reply = await ai(system, text, f"Hey {user_name}! 🐾", max_tok=140)
 
             try:
                 await u.message.reply_text(reply, reply_to_message_id=u.message.message_id)
             except Exception:
                 pass
 
-            # AI response sticker -> ALWAYS from MAIN pack, NEVER stay-safe pack
-            stick = await get_random_sticker_from(STICKER_PACK_MAIN)
-            if stick:
-                try:
-                    await c.bot.send_sticker(chat_id=u.effective_chat.id, sticker=stick)
-                except Exception:
-                    pass
+            await append_chat_history(uid, text, reply)
+
+            # AI response sticker -> only every 4th AI reply in this chat,
+            # and always from MAIN pack (never stay-safe pack).
+            ai_reply_counter[cid] = ai_reply_counter.get(cid, 0) + 1
+            if ai_reply_counter[cid] % 4 == 0:
+                stick = await get_random_sticker_from(STICKER_PACK_MAIN)
+                if stick:
+                    try:
+                        await c.bot.send_sticker(chat_id=u.effective_chat.id, sticker=stick)
+                    except Exception:
+                        pass
 
         bot_status["message_count"] += 1
     except Exception as e:
@@ -2230,61 +2489,36 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 async def start_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message:
         return
-    user_name = get_user_name(u.effective_user) if u.effective_user else "there"
 
-    text = (
-        f"*Hey {user_name}!* 👋\n\n"
-        "┌─────────────────────────────┐\n"
-        "│   ✨ *BELUGA BOT v11.4.0* ✨   │\n"
-        "│  🐱 _Your AI Crypto Companion_  │\n"
-        "│       *from* @BELUGAPY         │\n"
-        "└─────────────────────────────┘\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🎮 *GAMES*\n"
-        "┣ `/quiz` `[topic]` — Brain Trivia\n"
-        "┣ `/tictac` `[@user]` — Tic Tac Toe\n"
-        "┣ `/mine` — 💣 Minesweeper\n"
-        "┗ `/gay` `/couple` — Daily Fun\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "💰 *CRYPTO LIVE*\n"
-        "┣ `/price` `BTC` — Live Price\n"
-        "┣ `/topgainers` — 📈 Top Gainers\n"
-        "┣ `/toplosers` — 📉 Top Losers\n"
-        "┗ `/chart` `BTC 1h` — Candlestick\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "📰 *NEWS*\n"
-        "┣ `/news` — Crypto Headlines\n"
-        "┣ `/ainews` — AI & ML Updates\n"
-        "┗ `/technews` — Tech World\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🔍 *SEARCH & AI*\n"
-        "┣ `/search` `query` — Web Search\n"
-        "┣ `/bananalogic` `query` — AI Answer\n"
-        "┗ _@ mention me to chat!_\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🖼️ *IMAGE TOOLS*\n"
-        "┣ `/qr` `text` — QR Generator\n"
-        "┣ `/scanqr` — Scan QR Code\n"
-        "┣ `/resize` — Resize to 512×512\n"
-        "┣ `/compress` — Compress Image\n"
-        "┣ `/watermark` `text` — Watermark\n"
-        "┗ `/imginfo` — Image Details\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🏆 *LEADERBOARD*\n"
-        "┣ `/lb` — View Rankings\n"
-        "┣ `/gm` — Morning Check-in *(admin)*\n"
-        "┣ `/nw` — New Week Reset *(admin)*\n"
-        "┗ `/pump` `/dump` — Edit Points *(admin)*\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "📨 *DM & ADMIN*\n"
-        "┣ _DMs are auto-handled — no command needed!_\n"
-        "┣ `/setname` `/setgender` — Configure DM replies *(admin)*\n"
-        "┣ `/model` — Switch AI model *(admin)*\n"
-        "┣ `/clearmemory` — Wipe all memory *(admin)*\n"
-        "┗ `/block` `pack` — Ban a sticker pack *(admin)*\n\n"
-        "❝ _Built with 💙 by @BELUGAPY_ ❞"
-    )
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📢 UPDATES CHANNEL", url=UPDATES_CHANNEL)]])
+    # Telegram sends "/start bizChat<user_chat_id>" when the business owner
+    # taps "Manage Bot" from the quick action bar inside a managed chat.
+    args = c.args if hasattr(c, "args") else []
+    if args and args[0].startswith("bizChat"):
+        target_chat_id = args[0][len("bizChat"):]
+        owner_conn = next(
+            (info for info in business_connections.values()
+             if info.get("owner_user_id") == u.effective_user.id and info.get("is_enabled")),
+            None
+        )
+        if owner_conn:
+            await u.message.reply_text(
+                f"🎀 *Beluga is actively managing chat* `{target_chat_id}` *for you!*\n\n"
+                f"Reply permission: {'✅ Enabled' if owner_conn.get('can_reply') else '⛔ View-only'}",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await u.message.reply_text(
+                "🎀 I don't see an active connection yet — try reconnecting via "
+                "Telegram Business settings if this doesn't update shortly."
+            )
+        return
+
+    text = "Hi I am Beluga 🎀 chat with me anytime freely I am ready to hear you pookie ♥."
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎀 Kidnap me 🎀", url=KIDNAP_ME_URL)],
+        [InlineKeyboardButton("📢 UPDATES CHANNEL", url=UPDATES_CHANNEL)],
+    ])
 
     try:
         await u.message.reply_video(video=START_VIDEO, caption=text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
@@ -2544,6 +2778,64 @@ async def update_user_memory(user_id, key: str, value) -> bool:
         return success
 
 
+# ───────────────────────────── PERSISTENT CHAT HISTORY (per user) ─────────────────────────────
+# Stores a rolling window of a user's recent AI-chat exchanges INSIDE their
+# existing memory/<user_id>.json file, under the "chat_history" key. This is
+# what makes Beluga "remember the previous chat" across restarts — unlike
+# the old fun_db["chat_memory"] dict, which lived only in RAM and was wiped
+# every time the process restarted. Persisted to GitHub, survives restarts.
+CHAT_HISTORY_MAX_TURNS = 10  # keep the last N (user, beluga) exchanges per user
+
+async def append_chat_history(user_id, user_text: str, bot_reply: str) -> bool:
+    """
+    Append one (user message, Beluga's reply) turn to a user's persistent
+    chat history, trimming to the most recent CHAT_HISTORY_MAX_TURNS turns.
+    Safe to call after every AI-answered message — cheap no-op if GitHub
+    isn't configured.
+    """
+    if not _memory_is_configured():
+        return False
+    path = _memory_file_path(user_id)
+    async with aiohttp.ClientSession() as session:
+        await _memory_ensure_repo_reachable(session)
+        data, sha = await _memory_gh_get_file(session, path)
+        if data is None:
+            data, sha = {}, None
+        history = data.get("chat_history", [])
+        history.append({
+            "t": datetime.now().isoformat(),
+            "user": user_text[:300],
+            "bot": bot_reply[:300],
+        })
+        data["chat_history"] = history[-CHAT_HISTORY_MAX_TURNS:]
+        data["_last_updated"] = datetime.now().isoformat()
+        data.setdefault("_user_id", str(user_id))
+        commit_msg = f"Append chat history for user {user_id} [skip ci]"
+        success = await _memory_gh_put_file(session, path, data, commit_msg, sha=sha)
+        return success
+
+
+def build_chat_history_context(memory: dict) -> str:
+    """
+    Turn a user's stored chat_history into a short block the AI can read
+    as prior conversation context. Returns "" if there's no history yet.
+    """
+    history = memory.get("chat_history", [])
+    if not history:
+        return ""
+    lines = []
+    for turn in history[-CHAT_HISTORY_MAX_TURNS:]:
+        u = turn.get("user", "").strip()
+        b = turn.get("bot", "").strip()
+        if u:
+            lines.append(f"User previously said: {u}")
+        if b:
+            lines.append(f"You (Beluga) previously replied: {b}")
+    if not lines:
+        return ""
+    return "\n\nPrevious conversation with this user (for context, don't repeat verbatim):\n" + "\n".join(lines)
+
+
 async def delete_user_memory(user_id) -> bool:
     """Permanently delete a single user's memory file. Returns True even if there was nothing to delete."""
     if not _memory_is_configured():
@@ -2636,6 +2928,7 @@ async def main():
 
     # ---- Load persistent data: checks GitHub file existence first ----
     await load_persistent_data()
+    await load_business_connections()
 
     # ---- Load both sticker packs (main + staysafe) ----
     await load_sticker_pack(app.bot, STICKER_PACK_MAIN)
@@ -2681,6 +2974,17 @@ async def main():
     app.add_handler(CallbackQueryHandler(model_callback, pattern=r"^model:"))
     app.add_handler(PollAnswerHandler(poll_answer_handler))
 
+    # ---- Telegram Business (real Secretary Mode) handlers ----
+    # BusinessConnectionHandler fires when an owner connects/edits/disconnects
+    # their Telegram Business account from this bot (see SECTION 22).
+    # business_message / edited_business_message / deleted_business_messages
+    # are SEPARATE update types from normal `message` updates — they do NOT
+    # arrive as regular private-chat messages, so they need their own handlers.
+    app.add_handler(BusinessConnectionHandler(handle_business_connection))
+    app.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, handle_business_message))
+    app.add_handler(MessageHandler(filters.UpdateType.EDITED_BUSINESS_MESSAGE, handle_edited_business_message))
+    app.add_handler(BusinessMessagesDeletedHandler(handle_deleted_business_messages))
+
     # ---- Message handlers ----
     # IMPORTANT: each handler is registered in its OWN handler group.
     # PTB only runs the FIRST matching handler within a single group by
@@ -2689,11 +2993,11 @@ async def main():
     # both need to run on the same group text message).
     #
     #   group 0: incoming STICKERS in groups -> banned-pack auto-delete check
-    #   group 1: private-chat text  -> DM auto-handler (Chat Automation, always on)
+    #   group 1: private-chat text  -> plain AI chat (regular DMs, unrelated to Business Connection)
     #   group 2: group-chat text    -> ghost mode (@botusername mention)
     #   group 3: group-chat text/stickers -> general group monitor (AI + sticker cadence)
     app.add_handler(MessageHandler(filters.Sticker.ALL & filters.ChatType.GROUPS, monitor_group), group=0)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, monitor_dm), group=1)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, monitor_private_chat), group=1)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, monitor_ghost_mode), group=2)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, monitor_group), group=3)
 
