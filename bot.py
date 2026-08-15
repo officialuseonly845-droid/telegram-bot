@@ -7,7 +7,7 @@ from bs4 import BeautifulSoup
 from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application as TGApp, CommandHandler, ContextTypes, MessageHandler, PollAnswerHandler,
-    CallbackQueryHandler, filters, BusinessConnectionHandler, BusinessMessagesDeletedHandler,
+    CallbackQueryHandler, filters,
 )
 from telegram.constants import ParseMode
 from telegram.error import NetworkError, TimedOut, Forbidden, BadRequest, RetryAfter
@@ -18,61 +18,32 @@ import ccxt
 import feedparser, qrcode, cv2
 from PIL import Image, ImageDraw, ImageFont
 from textblob import TextBlob
-import wikipediaapi
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO, handlers=[logging.StreamHandler(sys.stdout)])
 logger = logging.getLogger("Beluga")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 1: ENVIRONMENT & CONFIG
-# ═══════════════════════════════════════════════════════════════════════════
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "").strip()
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main").strip()
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 HTTP_PORT = int(os.environ.get("PORT", "10000"))
 OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 
-# "Kidnap me 🎀" button on /start — set this to your channel/group invite link
 KIDNAP_ME_URL = os.environ.get("KIDNAP_ME_URL", "https://t.me/BELUGAPY")
 
 if not BOT_TOKEN or len(BOT_TOKEN) < 20:
     logger.critical("BOT_TOKEN missing")
     sys.exit(1)
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 2: PERSISTENT GITHUB FILE NAMES (single source of truth)
-# ═══════════════════════════════════════════════════════════════════════════
-# These are the ONLY two GLOBAL data files this bot ever creates on GitHub.
-# On EVERY restart (see SECTION 5 -> load_persistent_data), the bot checks
-# gh_file_exists(filename) FIRST. If the file is already there, it is loaded
-# and never re-created or overwritten with empty data. A new file is only
-# written the very first time a deployment runs with no existing file.
-#
-#   FILE_LEADERBOARD = "beluga_leaderboard.json"
-#       -> stores: all chat scores (db["scores"]) + weekly champions (db["weekly"])
-#
-#   FILE_STICKERS = "beluga_stickers.json"
-#       -> stores: sticker pack file_ids for every loaded pack + banned pack list
-#
-# PER-USER chat history/memory lives separately, one file per user, under
-# memory/<user_id>.json (see SECTION 28). Recent AI-chat history (used to
-# give Beluga short-term recall of what a user told her before) is stored
-# as a "chat_history" list INSIDE that same per-user file — no third global
-# file is created for this; it reuses the existing per-user memory storage.
-#
-FILE_LEADERBOARD = "beluga_leaderboard.json"   # all chat scores + weekly champions
-FILE_STICKERS = "beluga_stickers.json"          # sticker pack file_ids + banned packs
+FILE_LEADERBOARD = "beluga_leaderboard.json"
+FILE_STICKERS = "beluga_stickers.json"
 
-# Sticker packs this bot manages
-STICKER_PACK_MAIN = "t_me_belugapack_mystickers_by_fStikBot"   # normal Beluga pack
-STICKER_PACK_SAFE = "t_me_staysafebelu_by_fStikBot"             # "stay safe" pack
+STICKER_PACK_MAIN = "t_me_belugapack_mystickers_by_fStikBot"
+STICKER_PACK_SAFE = "t_me_staysafebelu_by_fStikBot"
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 3: IN-MEMORY STATE
-# ═══════════════════════════════════════════════════════════════════════════
 bot_status = {"running": False, "start_time": datetime.now(), "message_count": 0, "error_count": 0, "api_calls": 0, "failed_apis": 0, "username": ""}
 quiz_cooldown, active_polls, spam_tracker = {}, {}, {}
 db = {"scores": {}, "weekly": {}, "seen": {}, "counts": {}}
@@ -81,17 +52,10 @@ ttt_games, mine_games, user_in_game, game_timers, mine_timers, gm_tracker, gm_ms
 mine_play_stats = {}
 wm_sessions = {}
 
-# NOTE: Real Secretary Mode (Telegram Business Connection) lives in SECTION 22.
-# It requires Secretary Mode enabled in @BotFather, and the owner connecting
-# their Telegram Business account to this bot from their own Telegram app —
-# there is no bot-side toggle command for this, it's all Telegram-native.
-# Owner name/gender for "where is X" replies are set via /setname and
-# /setgender (owner-only commands), also in SECTION 22.
-
 sticker_data = {"packs": {}, "banned_packs": []}
 db_needs_sync = False
 sticker_data_needs_sync = False
-sticker_file_exists_on_github = False  # tracked so we never re-create the file
+sticker_file_exists_on_github = False
 
 fun_cache_lock = asyncio.Lock()
 exchange_cache = {}
@@ -103,6 +67,31 @@ MINE_IMAGE_URL = "https://i.postimg.cc/hjCftW5b/file-0000000079a071fa95971d3b700
 GM_IMAGE_URL = "https://i.postimg.cc/Fs1h0CPs/file-000000001d7872078a894cdf6f6247c9.png"
 UPDATES_CHANNEL = "https://t.me/BELUGAPY"
 START_VIDEO = "https://go.screenpal.com/watch/cO1oqenuAPr"
+
+START_MENU_IMAGE_PAGE = "https://postimg.cc/HrV5wnj0"
+WORKFLOW_IMAGE_PAGE = "https://postimg.cc/Q9bk6PD1"
+
+WORKFLOW_TEXT = (
+    "*How BELUGA Works — Explained by Beluga.py* 😼\n\n"
+    "When you give me an input, like \u201cWhat is Newton\u2019s law?\u201d, I process it through several stages:\n\n"
+    "*1. Input Layer*\n"
+    "Your words are broken into small pieces called tokens and converted into numbers.\n\n"
+    "*2. Hidden Layers*\n"
+    "These numbers pass through many neural-network layers. The model uses attention to understand how different words relate to each other and uses patterns learned during training.\n\n"
+    "*3. Reasoning/Processing*\n"
+    "The model mathematically processes the context and determines what information and relationships are relevant to producing an answer. I can explain the resulting logical steps, but I can't provide private hidden chain-of-thought.\n\n"
+    "*4. Output Layer*\n"
+    "The model calculates probabilities for possible next tokens. For example:\n\n"
+    "\"force → 45%\"\n"
+    "\"mass → 20%\"\n"
+    "\"acceleration → 15%\"\n\n"
+    "It selects a suitable token, then repeats the process for the next token.\n\n"
+    "*5. Final Answer*\n"
+    "Thousands of these predictions combine to form the sentence you're reading.\n\n"
+    "*In one line:*\n\n"
+    "Your words → Tokens → Embeddings → Hidden/Transformer Layers → Attention & Processing → Probability of next token → Next token → Repeat → Answer\n\n"
+    "So I don't simply \u201clook up\u201d a sentence. I generate the response token by token using patterns learned during training. 😺🎀"
+)
 
 CHAT_PROMPT = """You are Beluga 🎀, a warm, playful, emotionally intelligent AI companion from @BELUGAPY channel.
 
@@ -121,7 +110,6 @@ If chat memory or previous conversation is provided, actually use it to make you
 
 Never mention you are an AI, a language model, or use clinical/NLP-sounding language. Just be Beluga — caring, sharp, and fun to talk to."""
 
-# Used when OpenRouter model is active — same comprehension-first rules, slightly longer replies
 CHAT_PROMPT_OR = """You are Beluga 🎀, a warm, playful, emotionally intelligent AI companion from @BELUGAPY channel.
 
 Before replying, first make sure you understand what the person actually means — their real question, feeling, or intent — not just the surface words. Then answer that.
@@ -139,11 +127,6 @@ If chat memory or previous conversation is provided, actually use it to make you
 
 Never mention you are an AI, a language model, or use clinical/NLP-sounding language. Just be Beluga — caring, sharp, and fun to talk to."""
 
-# Secretary mode prompt — used by handle_business_message() (SECTION 22) for
-# real Telegram Business Connection messages, i.e. messages arriving in a
-# chat the bot owner granted access to via Telegram Business settings.
-# This is NOT a regular DM handler — see SECTION 22 for the full explanation
-# of BusinessConnection / business_message updates.
 DM_SECRETARY_PROMPT = """You are BELUGA, an AI assistant handling someone's DMs while they are away.
 Strict rules:
 - Reply with 1 short, crunchy, casual line by default.
@@ -198,7 +181,6 @@ def load_font(style_key: str, size: int):
             continue
     return ImageFont.load_default()
 
-
 def get_exchange(prefer: str = "bybit"):
     """
     Synchronous, blocking network call (ccxt.load_markets()).
@@ -225,9 +207,6 @@ def get_exchange(prefer: str = "bybit"):
     logger.error("No exchange available")
     return None
 
-# `exchange` starts as None. It is populated in the background AFTER the
-# HTTP server is bound and Telegram polling has started (see SECTION 27 /
-# init_exchange_async). All crypto handlers already guard on `if not exchange`.
 exchange = None
 
 async def init_exchange_async():
@@ -236,9 +215,6 @@ async def init_exchange_async():
     loop = asyncio.get_running_loop()
     exchange = await loop.run_in_executor(None, get_exchange)
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 4: GITHUB FILE I/O (low level read / write helpers)
-# ═══════════════════════════════════════════════════════════════════════════
 def gh_file_exists(fname: str) -> bool:
     """Check whether a file already exists in the GitHub repo."""
     if not GITHUB_TOKEN or not GITHUB_REPO:
@@ -287,9 +263,6 @@ def gh_write(fname: str, data: dict) -> bool:
         logger.error(f"[gh_write {fname}] {e}")
     return False
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 5: STARTUP DATA LOADER — checks file existence, never duplicates
-# ═══════════════════════════════════════════════════════════════════════════
 async def load_persistent_data():
     """
     Runs once at startup.
@@ -302,7 +275,6 @@ async def load_persistent_data():
     global sticker_data, db_needs_sync, sticker_data_needs_sync, sticker_file_exists_on_github
     loop = asyncio.get_running_loop()
 
-    # ---- 5a. Leaderboard file ----
     lb_exists = await loop.run_in_executor(None, gh_file_exists, FILE_LEADERBOARD)
     if lb_exists:
         lb_data = await loop.run_in_executor(None, gh_read, FILE_LEADERBOARD)
@@ -314,7 +286,6 @@ async def load_persistent_data():
         await loop.run_in_executor(None, gh_write, FILE_LEADERBOARD, {"scores": {}, "weekly": {}})
         logger.info(f"[{FILE_LEADERBOARD}] not found -> created fresh")
 
-    # ---- 5b. Sticker file (packs + banned list) ----
     stick_exists = await loop.run_in_executor(None, gh_file_exists, FILE_STICKERS)
     sticker_file_exists_on_github = stick_exists
     if stick_exists:
@@ -350,22 +321,9 @@ async def periodic_sync():
         await asyncio.sleep(30)
         try:
             await save_all_data()
-            await save_business_connections()
         except Exception as e:
             logger.error(f"[periodic_sync] {e}")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 6: STICKER PACK MANAGEMENT
-# ═══════════════════════════════════════════════════════════════════════════
-# sticker_data["packs"]        : { pack_name: [file_id, file_id, ...] }
-# sticker_data["banned_packs"] : [ pack_name, pack_name, ... ]
-#
-# IMPORTANT for /block: every sticker a user SENDS in a group carries a
-# `set_name` field (the pack name it belongs to) directly on the Sticker
-# object — we do NOT need to have pre-loaded that pack ourselves to detect
-# and delete it. ban_sticker_pack() just adds the name to banned_packs, and
-# the group message handler (SECTION 24) checks any incoming sticker's
-# `.set_name` against that list on every message.
 async def load_sticker_pack(bot, pack_name: str):
     """
     Fetch a sticker pack's file_ids from Telegram and store them in memory.
@@ -413,9 +371,6 @@ async def get_random_sticker_any() -> Optional[str]:
             pool.extend(stickers)
     return random.choice(pool) if pool else None
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 7: GENERIC HELPERS
-# ═══════════════════════════════════════════════════════════════════════════
 async def safe_react(bot, chat_id: int, msg_id: int, emoji: str = None):
     if not emoji:
         emoji = random.choice(["🐱","🐾","❤️","🔥","👍","😻","😼","😂","✨","👀"])
@@ -428,6 +383,66 @@ def clean_html(t: str) -> str:
     t = re.sub(r"<[^>]+>", " ", t)
     t = re.sub(r"&[a-zA-Z#0-9]+;", " ", t)
     return re.sub(r"\s+", " ", t).strip()
+
+_resolved_image_cache: dict = {}
+
+def resolve_postimg_direct_url(page_url: str) -> Optional[str]:
+    """
+    postimg.cc share links (e.g. postimg.cc/HrV5wnj0) are HTML viewer pages,
+    not direct image files — Telegram's send_photo needs a direct file URL.
+    This scrapes the page's og:image meta tag to get the real direct link.
+    Cached in-process so we only ever hit postimg.cc once per URL, and any
+    failure just returns None so callers can fall back to text-only sends
+    instead of crashing.
+    """
+    if page_url in _resolved_image_cache:
+        return _resolved_image_cache[page_url]
+    try:
+        r = requests.get(page_url, headers=G_HDR, timeout=8)
+        if r.status_code == 200:
+            soup = BeautifulSoup(r.text, "html.parser")
+            og_img = soup.find("meta", property="og:image")
+            if og_img and og_img.get("content"):
+                direct_url = og_img["content"]
+                _resolved_image_cache[page_url] = direct_url
+                return direct_url
+    except Exception as e:
+        logger.warning(f"[resolve_postimg_direct_url] Could not resolve {page_url}: {e}")
+    _resolved_image_cache[page_url] = None
+    return None
+
+async def send_photo_safe(bot, chat_id, photo_url_or_page: str, caption: str = None,
+                           parse_mode=None, reply_markup=None) -> bool:
+    """
+    Crash-proof photo sender. Resolves postimg.cc viewer pages to a direct
+    URL automatically, tries the send, and on ANY failure (bad link, network
+    hiccup, Telegram rejecting the URL) falls back to sending the caption as
+    plain text instead — the bot NEVER breaks just because an image failed
+    to load. Returns True if a photo was actually sent, False if it fell
+    back to text (or sent nothing because there was no caption either).
+    """
+    direct_url = photo_url_or_page
+    if "postimg.cc/" in photo_url_or_page and "/i.postimg.cc/" not in photo_url_or_page:
+        resolved = resolve_postimg_direct_url(photo_url_or_page)
+        if resolved:
+            direct_url = resolved
+        else:
+            direct_url = None
+
+    if direct_url:
+        try:
+            await bot.send_photo(chat_id=chat_id, photo=direct_url, caption=caption,
+                                  parse_mode=parse_mode, reply_markup=reply_markup)
+            return True
+        except Exception as e:
+            logger.warning(f"[send_photo_safe] Photo send failed ({e}), falling back to text.")
+
+    if caption:
+        try:
+            await bot.send_message(chat_id=chat_id, text=caption, parse_mode=parse_mode, reply_markup=reply_markup)
+        except Exception as e:
+            logger.error(f"[send_photo_safe] Text fallback also failed: {e}")
+    return False
 
 def q_hash(q: str) -> str:
     return hashlib.md5(q.lower().strip().encode()).hexdigest()[:12]
@@ -469,31 +484,11 @@ def bump_score(cid: str, uid: str, name: str, delta: int) -> int:
     db_needs_sync = True
     return e["score"]
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 8: AI ENGINE — GROQ + OPENROUTER (dual provider, auto-switch)
-# ═══════════════════════════════════════════════════════════════════════════
-# Models:
-#   Groq       → llama-3.3-70b-versatile   (fast, free tier)
-#   OpenRouter → openai/gpt-oss-120b:free  (Hinglish+English, 2-3 lines)
-#
-# /model command (owner-only): switch between gro / rou / auto
-# Auto mode: tries current provider; if rate-limited, silently falls back
-# to the other one for that request and remembers the rate-limit cooldown.
-#
-# ENV VARS:
-#   GROQ_API_KEY        → Groq key
-#   OPENROUTER_API_KEY  → OpenRouter key
-
 GROQ_MODEL = "llama-3.3-70b-versatile"
 OR_MODEL = "openai/gpt-oss-120b:free"
 OR_BASE = "https://openrouter.ai/api/v1"
 
-# ai_model_state:
-#   "gro"  = always use Groq
-#   "rou"  = always use OpenRouter
-#   "auto" = try chosen, fall back to other on rate limit
 ai_model_state = {"mode": "auto", "groq_rl_until": 0.0, "or_rl_until": 0.0}
-
 
 def _groq_rate_limited() -> bool:
     return time.time() < ai_model_state["groq_rl_until"]
@@ -508,7 +503,6 @@ def _set_groq_rl():
 def _set_or_rl():
     ai_model_state["or_rl_until"] = time.time() + 60
     logger.warning("[AI] OpenRouter rate-limited — backing off 60s")
-
 
 async def _call_groq(system: str, user: str, max_tok: int) -> Optional[str]:
     if not GROQ_KEY:
@@ -537,7 +531,6 @@ async def _call_groq(system: str, user: str, max_tok: int) -> Optional[str]:
     except Exception:
         bot_status["failed_apis"] += 1
     return None
-
 
 async def _call_openrouter(system: str, user: str, max_tok: int) -> Optional[str]:
     if not OPENROUTER_KEY:
@@ -572,7 +565,6 @@ async def _call_openrouter(system: str, user: str, max_tok: int) -> Optional[str
         bot_status["failed_apis"] += 1
     return None
 
-
 async def ai(system: str, user: str, fallback: str = "Meow! 🐾", max_tok: int = 200) -> str:
     """
     Smart dual-provider AI call.
@@ -583,16 +575,11 @@ async def ai(system: str, user: str, fallback: str = "Meow! 🐾", max_tok: int 
     """
     mode = ai_model_state["mode"]
 
-    # If user chose 'rou' but it's rate-limited, auto-fallback to groq
-    # If user chose 'gro' but it's rate-limited, auto-fallback to OR
-    # This way user's manual choice is respected but rate limits never hard-fail
-
-    # Determine call order
     if mode == "gro":
         order = ["groq", "or"]
     elif mode == "rou":
         order = ["or", "groq"]
-    else:  # auto
+    else:
         order = ["groq", "or"]
 
     for provider in order:
@@ -604,10 +591,6 @@ async def ai(system: str, user: str, fallback: str = "Meow! 🐾", max_tok: int 
             else:
                 if _or_rate_limited():
                     continue
-                # When the caller passed our standard CHAT_PROMPT, swap in the
-                # OpenRouter-tuned variant (2-3 lines, Hinglish+English) instead.
-                # For any other custom system prompt (e.g. DM_SECRETARY_PROMPT),
-                # use it as-is so callers stay in full control of tone/length.
                 or_system = CHAT_PROMPT_OR if system.startswith(CHAT_PROMPT) else system
                 res = await asyncio.wait_for(_call_openrouter(or_system, user, max_tok), timeout=16)
             if res:
@@ -618,7 +601,6 @@ async def ai(system: str, user: str, fallback: str = "Meow! 🐾", max_tok: int 
             logger.warning(f"[AI] {provider} error: {e}")
 
     return fallback
-
 
 async def ai_emoji(text: str) -> str:
     """Quick emoji pick — always uses Groq (lightweight, no Hinglish needed)."""
@@ -634,7 +616,6 @@ async def ai_emoji(text: str) -> str:
     except Exception:
         pass
     return "😼"
-
 
 async def model_command_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """Owner-only: /model — pick Groq, OpenRouter, or Auto via inline keyboard."""
@@ -665,7 +646,6 @@ async def model_command_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     )
     await u.message.reply_text(status, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
 
-
 async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q:
@@ -689,15 +669,6 @@ async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"[model_callback] {e}")
 
-
-# NOTE: the old in-RAM save_chat_memory()/fun_db["chat_memory"] was removed —
-# it never persisted across restarts. Persistent per-user chat history now
-# lives in append_chat_history() / build_chat_history_context() (SECTION 28),
-# stored inside each user's memory/<user_id>.json file on GitHub.
-
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 9: CRYPTO — PRICE / MOVERS / CHART
-# ═══════════════════════════════════════════════════════════════════════════
 async def crypto_price_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message or not exchange:
         return
@@ -809,9 +780,6 @@ async def crypto_chart_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"[crypto_chart] {e}")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 10: NEWS FEED (crypto / ai / tech)
-# ═══════════════════════════════════════════════════════════════════════════
 def fetch_google_news(feed_type: str) -> list:
     feeds = {
         "crypto": "https://news.google.com/rss/search?q=cryptocurrency+bitcoin",
@@ -904,9 +872,6 @@ async def execute_news_flow(u: Update, c: ContextTypes.DEFAULT_TYPE, feed_type: 
     except Exception as e:
         logger.error(f"[execute_news_flow] {e}")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 11: QR TOOLS
-# ═══════════════════════════════════════════════════════════════════════════
 async def qr_generate_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message:
         return
@@ -958,9 +923,6 @@ async def qr_scan_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"[qr_scan] {e}")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 12: IMAGE TOOLS (resize / compress / info)
-# ═══════════════════════════════════════════════════════════════════════════
 async def img_handler(u: Update, c: ContextTypes.DEFAULT_TYPE, action: str):
     if not u.message or not u.message.reply_to_message or not u.message.reply_to_message.photo:
         await u.message.reply_text("🐱 Reply to a photo.")
@@ -999,9 +961,6 @@ async def img_handler(u: Update, c: ContextTypes.DEFAULT_TYPE, action: str):
     except Exception as e:
         logger.error(f"[img_handler] {e}")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 13: WATERMARK ENGINE (auto-wrap, no overflow, multi-style)
-# ═══════════════════════════════════════════════════════════════════════════
 def _wrap_text(draw, text: str, font, max_width: int) -> list:
     words = text.split()
     lines, current = [], ""
@@ -1172,9 +1131,6 @@ async def watermark_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception as e:
         logger.error(f"[wm_callback] {e}")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 14: QUIZ GAME
-# ═══════════════════════════════════════════════════════════════════════════
 def quiz_on_cooldown(cid: str, question: str) -> bool:
     return time.time() < quiz_cooldown.get(cid, {}).get(q_hash(question), 0)
 
@@ -1258,9 +1214,6 @@ async def poll_answer_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 15: LEADERBOARD (/lb) & WEEK RESET (/nw)
-# ═══════════════════════════════════════════════════════════════════════════
 async def lb_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message:
         return
@@ -1358,9 +1311,6 @@ async def pump_dump_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"[pump_dump] {e}")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 16: FUN COMMANDS (/gay /couple)
-# ═══════════════════════════════════════════════════════════════════════════
 async def fun_dispatcher(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message:
         return
@@ -1392,9 +1342,6 @@ async def fun_dispatcher(u: Update, c: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"[fun_dispatcher] {e}")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 17: GOOD MORNING ATTENDANCE (/gm)
-# ═══════════════════════════════════════════════════════════════════════════
 def _build_gm_caption(users: list, date_str: str) -> str:
     display_users = users[-15:] if len(users) > 15 else users
     lines = ["📸 *DAILY ATTENDANCE*\n", "🥱 Mark attendance!\n", f"📅 {date_str}  |  👥 {len(users)}\n", "━━━━━━━━━━━━━━━━━━━━\n"]
@@ -1461,14 +1408,11 @@ async def gm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     await context.bot.edit_message_text(chat_id=q.message.chat_id, message_id=msg_id, text=new_cap, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
                 await q.answer(f"✅ +50 pts, {u_name}!")
-            except Exception:
+                            except Exception:
                 await q.answer("✅ Marked!")
     except Exception as e:
         logger.error(f"[gm_callback] {e}")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 18: TIC TAC TOE
-# ═══════════════════════════════════════════════════════════════════════════
 TTT_EMPTY, TTT_X, TTT_O = "⬜", "❌", "⭕"
 WINS = [(0,1,2),(3,4,5),(6,7,8),(0,3,6),(1,4,7),(2,5,8),(0,4,8),(2,4,6)]
 
@@ -1678,9 +1622,6 @@ async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"[ttt_cb] {e}")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 19: MINESWEEPER
-# ═══════════════════════════════════════════════════════════════════════════
 def _mine_setup_keyboard(gkey):
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("3 Mines", callback_data=f"mine:set:{gkey}:3"),
@@ -1817,35 +1758,48 @@ async def mine_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"[mine_callback] {e}")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 20: SEARCH (/search) & BANANALOGIC (/bananalogic)
-# ═══════════════════════════════════════════════════════════════════════════
 def wiki_summary(query):
-    out = {"found": False, "title": "", "url": "", "intro": "", "sections": []}
+    """
+    Uses Wikipedia's OFFICIAL REST v1 API (https://www.mediawiki.org/wiki/API:REST_API)
+    instead of scraping the legacy action=query endpoint. Two calls:
+      1. /search/page  -> find the best-matching title for the query
+      2. /page/{title}/summary -> official clean summary + thumbnail image
+    Return shape kept identical to before so every caller (search_handler,
+    bananalogic_handler, wiki_page_image) keeps working unchanged.
+    """
+    out = {"found": False, "title": "", "url": "", "intro": "", "sections": [], "image": None}
     try:
-        sr = requests.get("https://en.wikipedia.org/w/api.php", params={"action":"query","list":"search","srsearch":query,"srlimit":5,"format":"json"}, headers=WIKI_UA, timeout=10)
-        hits = sr.json().get("query", {}).get("search", [])
+        sr = requests.get(
+            "https://en.wikipedia.org/w/rest.php/v1/search/page",
+            params={"q": query, "limit": 1},
+            headers=WIKI_UA, timeout=10,
+        )
+        if sr.status_code != 200:
+            return out
+        hits = sr.json().get("pages", [])
         if not hits:
             return out
-        best = hits[0]["title"]
-        er = requests.get("https://en.wikipedia.org/w/api.php", params={"action":"query","titles":best,"prop":"extracts|info","inprop":"url","explaintext":"true","exsectionformat":"wiki","format":"json"}, headers=WIKI_UA, timeout=15)
-        for pid, page in er.json().get("query", {}).get("pages", {}).items():
-            if pid == "-1":
-                continue
-            raw = page.get("extract", "").strip()
-            url = page.get("fullurl", f"https://en.wikipedia.org/wiki/{urllib.parse.quote(best.replace(' ', '_'))}")
-            if not raw:
-                continue
-            parts = re.split(r"\n(==+)\s*(.+?)\s*\1\n", raw)
-            intro = parts[0].strip()
-            sections = []
-            for i in range(1, len(parts) - 2, 3):
-                st = parts[i + 1].strip() if i + 1 < len(parts) else ""
-                sb = parts[i + 2].strip() if i + 2 < len(parts) else ""
-                if sb and st not in ("See also", "References", "Further reading", "External links"):
-                    sections.append({"h": st, "b": sb[:800]})
-            out.update({"found": True, "title": best, "url": url, "intro": intro[:1200], "sections": sections[:8]})
-            break
+        best_title = hits[0]["title"]
+        best_key = hits[0].get("key", best_title.replace(" ", "_"))
+
+        summary_r = requests.get(
+            f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(best_key)}",
+            headers=WIKI_UA, timeout=10,
+        )
+        if summary_r.status_code != 200:
+            return out
+        data = summary_r.json()
+        intro = data.get("extract", "").strip()
+        if not intro:
+            return out
+        page_url = data.get("content_urls", {}).get("desktop", {}).get("page") \
+            or f"https://en.wikipedia.org/wiki/{urllib.parse.quote(best_key)}"
+        thumb = data.get("thumbnail", {}).get("source") or data.get("originalimage", {}).get("source")
+
+        out.update({
+            "found": True, "title": best_title, "url": page_url,
+            "intro": intro[:1500], "sections": [], "image": thumb,
+        })
     except Exception:
         pass
     return out
@@ -1882,14 +1836,6 @@ async def web_summarise(query, wiki, goog, system_prompt, max_tok=500):
         return ""
     return await ai(system_prompt, f"User question: {query}\n\nSearch facts:\n{chr(10).join(ctx)[:3000]}\n\nAnswer concisely.", "", max_tok=max_tok)
 
-# Wikipedia-API client (synchronous, wrapped in run_in_executor below so it
-# never blocks the event loop). Used for clean, correctly-parsed summaries.
-_wiki_client = wikipediaapi.Wikipedia(
-    user_agent="BelugaBot/1.0 (https://t.me/BELUGAPY)",
-    language="en",
-    extract_format=wikipediaapi.ExtractFormat.WIKI,
-)
-
 def wiki_page_image(title: str) -> Optional[str]:
     """
     Fetch the main thumbnail image URL for a Wikipedia page via the raw
@@ -1914,22 +1860,53 @@ def wiki_page_image(title: str) -> Optional[str]:
         pass
     return None
 
+def _is_url(text: str) -> bool:
+    return bool(re.match(r"^https?://\S+$", text.strip(), re.IGNORECASE))
+
+
+async def _screenshot_website(u: Update, c: ContextTypes.DEFAULT_TYPE, url: str):
+    """
+    /search <website link> — sends a screenshot of the site instead of
+    running a text search. Uses WordPress's free mShots screenshot service
+    (no API key needed). Crash-proof: falls back to a plain message with
+    the link if the screenshot can't be generated or sent.
+    """
+    cid = u.effective_chat.id
+    sm = await u.message.reply_text("📸 *Taking a screenshot...*", parse_mode=ParseMode.MARKDOWN)
+    shot_url = f"https://s.wordpress.com/mshots/v1/{urllib.parse.quote(url, safe='')}?w=1280&h=720"
+    caption = f"📸 *Screenshot of:*\n{url}"
+    try:
+        await sm.delete()
+    except Exception:
+        pass
+    sent = await send_photo_safe(c.bot, cid, shot_url, caption=caption, parse_mode=ParseMode.MARKDOWN)
+    if not sent:
+        try:
+            await u.message.reply_text(f"😿 Couldn't screenshot that site.\n{url}", reply_to_message_id=u.message.message_id)
+        except Exception as e:
+            logger.error(f"[_screenshot_website] {e}")
+
 
 async def search_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """
-    /search <query> — finds the best-matching Wikipedia page (via the existing
-    MediaWiki search step), pulls a clean summary through Wikipedia-API,
-    grabs the page's main image, and asks the AI to condense everything into
-    a 60-100 word summary. Sends as a photo with caption when an image is
-    found, falls back to plain text otherwise.
+    /search <query> — Wikipedia (official REST API) + web search, condensed
+    into a 60-100 word AI summary with the page's official image attached.
+    /search <website link> — sends a screenshot of that site instead of
+    running a text search at all.
     """
     if not u.message:
         return
     parts = u.message.text.split(maxsplit=1)
     if len(parts) < 2:
-        await u.message.reply_text("🐱 Usage: `/search query`"); return
+        await u.message.reply_text("🐱 Usage: `/search query` or `/search https://example.com`", parse_mode=ParseMode.MARKDOWN)
+        return
     query = parts[1].strip()
     cid = u.effective_chat.id
+
+    if _is_url(query):
+        await _screenshot_website(u, c, query)
+        return
+
     await safe_react(c.bot, cid, u.message.message_id, "🔍")
     sm = await u.message.reply_text("🔎 *Searching...*", parse_mode=ParseMode.MARKDOWN)
 
@@ -1939,20 +1916,12 @@ async def search_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         loop.run_in_executor(None, google_search, query),
     )
 
-    image_url = None
-    clean_summary_text = ""
-    if wiki.get("found") and wiki.get("title"):
+    image_url = wiki.get("image")
+    if not image_url and wiki.get("found") and wiki.get("title"):
         try:
-            def _fetch_clean_summary():
-                page = _wiki_client.page(wiki["title"])
-                return page.summary if page.exists() else ""
-            clean_summary_text = await loop.run_in_executor(None, _fetch_clean_summary)
+            image_url = await loop.run_in_executor(None, wiki_page_image, wiki["title"])
         except Exception:
-            clean_summary_text = wiki.get("intro", "")
-        image_url = await loop.run_in_executor(None, wiki_page_image, wiki["title"])
-
-    if clean_summary_text:
-        wiki["intro"] = clean_summary_text[:1500]
+            image_url = None
 
     summary = await web_summarise(
         query, wiki, goog,
@@ -1963,23 +1932,28 @@ async def search_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     )
 
     if not summary:
-        await sm.edit_text("😿 No results found.")
+        try:
+            await sm.edit_text("😿 No results found.")
+        except Exception:
+            pass
         return
 
-    await sm.delete()
+    try:
+        await sm.delete()
+    except Exception:
+        pass
+
     caption = f"🔍 *{query}*\n\n{summary}"
 
     if image_url:
-        try:
-            await u.message.reply_photo(
-                photo=image_url, caption=caption, parse_mode=ParseMode.MARKDOWN,
-                reply_to_message_id=u.message.message_id,
-            )
+        sent = await send_photo_safe(c.bot, cid, image_url, caption=caption, parse_mode=ParseMode.MARKDOWN)
+        if sent:
             return
-        except Exception:
-            pass  # fall through to text-only reply below
 
-    await u.message.reply_text(caption, parse_mode=ParseMode.MARKDOWN, reply_to_message_id=u.message.message_id)
+    try:
+        await u.message.reply_text(caption, parse_mode=ParseMode.MARKDOWN, reply_to_message_id=u.message.message_id)
+    except Exception as e:
+        logger.error(f"[search_handler] Final text send failed: {e}")
 
 async def bananalogic_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message:
@@ -1994,22 +1968,186 @@ async def bananalogic_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     loop = asyncio.get_running_loop()
     wiki, goog = await asyncio.gather(loop.run_in_executor(None, wiki_summary, query), loop.run_in_executor(None, google_search, query))
     answer = await web_summarise(query, wiki, goog, BANANA_PROMPT, max_tok=600)
-    if answer:
-        await sm.delete()
-        text = f"❝ *{query}* ❞\n\n{answer}\n\n🐾 _via BananaLogic_"
-        await u.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_to_message_id=u.message.message_id)
-    else:
-        await sm.edit_text("🍌 No response. Try again!")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 21: /block — STICKER PACK BAN (auto-delete banned-pack stickers)
-# ═══════════════════════════════════════════════════════════════════════════
-# Usage: /block https://t.me/addstickers/Sadalien_pack   (or just the pack name)
-#
-# Behaviour: from this point on, ANY sticker sent by ANY user in ANY group,
-# that belongs to a banned pack, is automatically deleted by Beluga. This is
-# detected live in monitor_group() (SECTION 24) by reading the incoming
-# sticker's `.set_name` field and checking it against sticker_data["banned_packs"].
+    if not answer:
+        try:
+            await sm.edit_text("🍌 No response. Try again!")
+        except Exception:
+            pass
+        return
+
+    text = f"❝ *{query}* ❞\n\n{answer}\n\n🐾 _via BananaLogic_"
+    image_url = None
+    if wiki.get("found") and wiki.get("title"):
+        try:
+            image_url = await loop.run_in_executor(None, wiki_page_image, wiki["title"])
+        except Exception:
+            image_url = None
+
+    try:
+        await sm.delete()
+    except Exception:
+        pass
+
+    if image_url:
+        sent = await send_photo_safe(c.bot, cid, image_url, caption=text, parse_mode=ParseMode.MARKDOWN)
+        if not sent:
+            pass  # send_photo_safe already sent the text fallback
+    else:
+        try:
+            await u.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_to_message_id=u.message.message_id)
+        except Exception as e:
+            logger.error(f"[bananalogic_handler] Final send failed: {e}")
+
+
+def _extract_youtube_video_id(query: str) -> Optional[str]:
+    """Pull a YouTube video ID out of any common URL format, or return None if it's not a URL."""
+    patterns = [
+        r"(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/|youtube\.com/embed/)([A-Za-z0-9_-]{11})",
+    ]
+    for pat in patterns:
+        m = re.search(pat, query)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _format_yt_duration(iso_duration: str) -> str:
+    """Convert ISO 8601 duration (e.g. PT1H2M3S) to a readable H:MM:SS / M:SS string."""
+    m = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", iso_duration or "")
+    if not m:
+        return "?"
+    h, mi, s = (int(x) if x else 0 for x in m.groups())
+    if h:
+        return f"{h}:{mi:02d}:{s:02d}"
+    return f"{mi}:{s:02d}"
+
+
+def _format_yt_count(n: str) -> str:
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return "?"
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n/1_000:.1f}K"
+    return str(n)
+
+
+async def yt_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """
+    /yt <query or link> — looks up a YouTube video's metadata using the
+    OFFICIAL YouTube Data API v3 (search + videos endpoints). Sends back
+    the thumbnail, title, channel, duration, views, and a direct YouTube
+    link. This does NOT download or redistribute any video/audio content —
+    only public metadata that the API is designed to return.
+    """
+    if not u.message:
+        return
+    parts = u.message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await u.message.reply_text("🎬 Usage: `/yt query or link`", parse_mode=ParseMode.MARKDOWN)
+        return
+    query = parts[1].strip()
+
+    if not YOUTUBE_API_KEY:
+        await u.message.reply_text("🎬 YouTube lookup isn't configured right now (missing API key).")
+        return
+
+    cid = u.effective_chat.id
+    await safe_react(c.bot, cid, u.message.message_id, "🎬")
+    sm = await u.message.reply_text("🎬 *Looking that up...*", parse_mode=ParseMode.MARKDOWN)
+
+    loop = asyncio.get_running_loop()
+    video_id = _extract_youtube_video_id(query)
+
+    def _fetch_video_id_via_search():
+        r = requests.get(
+            "https://www.googleapis.com/youtube/v3/search",
+            params={"part": "snippet", "q": query, "type": "video", "maxResults": 1, "key": YOUTUBE_API_KEY},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return None
+        items = r.json().get("items", [])
+        if not items:
+            return None
+        return items[0]["id"]["videoId"]
+
+    def _fetch_video_details(vid: str):
+        r = requests.get(
+            "https://www.googleapis.com/youtube/v3/videos",
+            params={"part": "snippet,contentDetails,statistics", "id": vid, "key": YOUTUBE_API_KEY},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return None
+        items = r.json().get("items", [])
+        if not items:
+            return None
+        return items[0]
+
+    try:
+        if not video_id:
+            video_id = await loop.run_in_executor(None, _fetch_video_id_via_search)
+        if not video_id:
+            try:
+                await sm.edit_text("😿 Couldn't find that video.")
+            except Exception:
+                pass
+            return
+
+        details = await loop.run_in_executor(None, _fetch_video_details, video_id)
+        if not details:
+            try:
+                await sm.edit_text("😿 Couldn't fetch video details right now.")
+            except Exception:
+                pass
+            return
+
+        snippet = details.get("snippet", {})
+        stats = details.get("statistics", {})
+        content = details.get("contentDetails", {})
+
+        title = snippet.get("title", "Unknown title")
+        channel = snippet.get("channelTitle", "Unknown channel")
+        duration = _format_yt_duration(content.get("duration", ""))
+        views = _format_yt_count(stats.get("viewCount", "0"))
+        likes = _format_yt_count(stats.get("likeCount", "0"))
+        video_url = f"https://youtu.be/{video_id}"
+        thumb = (
+            snippet.get("thumbnails", {}).get("high", {}).get("url")
+            or snippet.get("thumbnails", {}).get("default", {}).get("url")
+        )
+
+        caption = (
+            f"🎬 *{title}*\n\n"
+            f"📺 {channel}\n"
+            f"⏱ {duration}  •  👁 {views} views  •  👍 {likes}\n\n"
+            f"🔗 [Watch on YouTube]({video_url})"
+        )
+
+        try:
+            await sm.delete()
+        except Exception:
+            pass
+
+        if thumb:
+            sent = await send_photo_safe(c.bot, cid, thumb, caption=caption, parse_mode=ParseMode.MARKDOWN)
+            if not sent:
+                pass
+        else:
+            await u.message.reply_text(caption, parse_mode=ParseMode.MARKDOWN, reply_to_message_id=u.message.message_id)
+
+    except Exception as e:
+        logger.error(f"[yt_handler] {e}")
+        try:
+            await sm.edit_text(f"😿 Error: `{str(e)[:60]}`", parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            pass
+
+
 async def block_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """Owner-only. /block <pack_name OR t.me/addstickers/ URL> bans a sticker pack."""
     if not u.message:
@@ -2034,240 +2172,11 @@ async def block_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         logger.error(f"[block] {e}")
         await u.message.reply_text(f"❌ Error: `{str(e)[:60]}`")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 22: TELEGRAM BUSINESS — REAL SECRETARY MODE
-# ═══════════════════════════════════════════════════════════════════════════
-# This is Telegram's actual "Secretary Mode" / Business Connection feature —
-# NOT a regular DM handler. It requires:
-#
-#   1. Secretary Mode enabled for this bot in @BotFather.
-#   2. The bot owner connects their Telegram Business account to this bot
-#      (Settings -> Telegram Business -> Chatbots -> pick this bot -> choose
-#      which chats it can access).
-#   3. Telegram then sends a `BusinessConnection` update whenever a user
-#      connects, edits, or ends that connection (handle_business_connection).
-#   4. Every message sent to/in a chat the bot was granted access to arrives
-#      as a `business_message` update (NOT a normal `message` update) —
-#      handled by handle_business_message below.
-#   5. To reply "as" the business account, every send_* call MUST include
-#      business_connection_id — otherwise it either fails or sends as the
-#      bot itself, which defeats the purpose.
-#   6. can_reply on the BusinessConnection object tells us whether we're
-#      actually allowed to send messages in that connection right now
-#      (connections can be view-only, or only active for 24h after the
-#      last customer message, depending on what the owner granted).
-#
-# business_connections: business_connection_id -> {
-#     "user_chat_id": int,   # private chat id of the business owner
-#     "can_reply": bool,
-#     "is_enabled": bool,
-#     "owner_user_id": int,  # Telegram user id of the business account owner
-# }
-# Persisted to GitHub (small file) so reconnecting after a restart doesn't
-# require the owner to reconnect Business mode from scratch.
-FILE_BUSINESS_CONNECTIONS = "beluga_business_connections.json"
-business_connections: dict = {}
-_business_connections_needs_sync = False
-
-
-async def load_business_connections():
-    """Load any previously-known business connections from GitHub at startup."""
-    global business_connections
-    loop = asyncio.get_running_loop()
-    data = await loop.run_in_executor(None, gh_read, FILE_BUSINESS_CONNECTIONS)
-    business_connections = data if isinstance(data, dict) else {}
-    logger.info(f"[business] Loaded {len(business_connections)} known business connection(s).")
-
-
-async def save_business_connections():
-    """Persist the current business_connections dict to GitHub (only if changed)."""
-    global _business_connections_needs_sync
-    if not _business_connections_needs_sync:
-        return
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, gh_write, FILE_BUSINESS_CONNECTIONS, business_connections)
-    _business_connections_needs_sync = False
-
-
-async def handle_business_connection(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """
-    Fires when a user connects, edits, or disconnects their Telegram Business
-    account from this bot. Telegram sends this same update type for all
-    three cases — we just overwrite our stored state with whatever the
-    latest connection object says (is_enabled=False means disconnected).
-    """
-    global _business_connections_needs_sync
-    conn = u.business_connection
-    if not conn:
-        return
-    try:
-        business_connections[conn.id] = {
-            "user_chat_id": conn.user_chat_id,
-            "can_reply": bool(getattr(conn, "can_reply", False)),
-            "is_enabled": bool(conn.is_enabled),
-            "owner_user_id": conn.user.id if conn.user else None,
-        }
-        _business_connections_needs_sync = True
-        await save_business_connections()
-
-        status = "connected" if conn.is_enabled else "disconnected"
-        logger.info(f"[business] Connection {conn.id} {status} "
-                    f"(can_reply={getattr(conn, 'can_reply', False)}, owner_chat={conn.user_chat_id})")
-
-        # Notify the owner in their private chat with the bot, if we can.
-        if conn.is_enabled:
-            try:
-                await c.bot.send_message(
-                    chat_id=conn.user_chat_id,
-                    text="✅ Beluga is now connected as your Secretary! I'll handle messages in the chats you've allowed.",
-                )
-            except Exception:
-                pass
-    except Exception as e:
-        logger.error(f"[handle_business_connection] {e}"
-
-def _get_owner_pronouns(gender: str):
-    g = (gender or "unknown").lower()
-    if g == "male":
-        return "he", "him"
-    elif g == "female":
-        return "she", "her"
-    return "they", "them"
-
-
-def _wants_long_reply(text: str) -> bool:
-    triggers = ["explain", "detail", "elaborate", "more info", "tell me more",
-                "describe", "in full", "long answer", "why", "how does", "how do",
-                "bata", "samjha", "samjhao", "kyun", "kaise"]
-    t = text.lower()
-    return any(trig in t for trig in triggers) or len(text) > 200
-
-
-def _is_asking_where(text: str) -> bool:
-    t = text.lower()
-    return bool(re.search(r"\bwhere\b", t)) and any(w in t for w in ["is", "are", "he", "she", "they", "owner"])
-
-
-def _is_asking_who_are_you(text: str) -> bool:
-    t = text.lower()
-    return any(p in t for p in ["who are you", "who is this", "are you a bot", "kaun ho", "kaun hai", "kya hai ye", "who r u"])
-
-
-async def setgender_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Owner-only: /setgender male|female — sets pronoun for 'where is X' replies."""
-    if not u.message:
-        return
-    if not is_owner(u.effective_user.id if u.effective_user else 0):
-        await u.message.reply_text("🚫 Owner only.")
-        return
-    parts = u.message.text.split()
-    if len(parts) < 2 or parts[1].lower() not in ("male", "female"):
-        await u.message.reply_text("Usage: `/setgender male` or `/setgender female`", parse_mode=ParseMode.MARKDOWN)
-        return
-    os.environ["OWNER_GENDER"] = parts[1].lower()
-    await u.message.reply_text(f"✅ Gender set to *{parts[1].lower()}*.", parse_mode=ParseMode.MARKDOWN)
-
-
-async def setname_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Owner-only: /setname YourName — sets the name used in 'X is not at home' replies."""
-    if not u.message:
-        return
-    if not is_owner(u.effective_user.id if u.effective_user else 0):
-        await u.message.reply_text("🚫 Owner only.")
-        return
-    parts = u.message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await u.message.reply_text("Usage: `/setname YourName`", parse_mode=ParseMode.MARKDOWN)
-        return
-    os.environ["OWNER_NAME"] = parts[1].strip()
-    await u.message.reply_text(f"✅ Owner name set to *{parts[1].strip()}*.", parse_mode=ParseMode.MARKDOWN)
-
-
-async def handle_business_message(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """
-    Fires on an incoming business_message update — a message sent INSIDE a
-    chat the bot has been granted access to via Business Connection. This
-    includes messages from BOTH the customer and the business owner
-    themselves (if they reply manually from their own phone) — we must
-    skip messages sent by the owner so we don't reply to ourselves/them.
-    """
-    msg = u.business_message
-    if not msg:
-        return
-    try:
-        biz_conn_id = msg.business_connection_id
-        conn_info = business_connections.get(biz_conn_id)
-
-        # Skip if we don't recognize this connection, or it's disabled,
-        # or we don't currently have permission to reply in it.
-        if not conn_info or not conn_info.get("is_enabled") or not conn_info.get("can_reply"):
-            return
-
-        # Never reply to the business owner's own messages sent from their phone.
-        if msg.from_user and msg.from_user.id == conn_info.get("owner_user_id"):
-            return
-
-        text = (msg.text or msg.caption or "").strip()
-        if not text or text.startswith("/"):
-            return
-
-        owner_name = os.environ.get("OWNER_NAME", "the owner")
-        pronoun_s, _ = _get_owner_pronouns(os.environ.get("OWNER_GENDER", "unknown"))
-
-        if _is_asking_who_are_you(text):
-            reply = "I am BELUGA, handling this chat. 🐾"
-        elif _is_asking_where(text):
-            reply = f"{owner_name} is not at home right now, {pronoun_s} will be back soon."
-        else:
-            wants_long = _wants_long_reply(text)
-            max_tok = 220 if wants_long else 40
-            prompt = DM_SECRETARY_PROMPT
-            if wants_long:
-                prompt += "\nThe user asked for detail — reply up to 100 words this time."
-            reply = await ai(prompt, text, "Okay! 🐾", max_tok=max_tok)
-
-        # CRITICAL: business_connection_id must be passed so this message is
-        # sent AS the business account, not as the bot itself.
-        await c.bot.send_message(
-            chat_id=msg.chat.id,
-            text=reply,
-            business_connection_id=biz_conn_id,
-            reply_to_message_id=msg.message_id,
-        )
-
-        stick = await get_random_sticker_from(STICKER_PACK_MAIN)
-        if stick:
-            try:
-                await c.bot.send_sticker(chat_id=msg.chat.id, sticker=stick, business_connection_id=biz_conn_id)
-            except Exception:
-                pass
-    except Exception as e:
-        logger.error(f"[handle_business_message] {e}")
-
-
-async def handle_edited_business_message(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Fires when a message inside a managed business chat is edited. Logged only for now."""
-    msg = u.edited_business_message
-    if not msg:
-        return
-    logger.info(f"[business] Message edited in business chat {msg.chat.id} (conn={msg.business_connection_id})")
-
-
-async def handle_deleted_business_messages(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Fires when messages inside a managed business chat are deleted. Logged only for now."""
-    deleted = u.deleted_business_messages
-    if not deleted:
-        return
-    logger.info(f"[business] {len(deleted.message_ids)} message(s) deleted in business chat "
-                f"{deleted.chat.id} (conn={deleted.business_connection_id})")
-
-
 async def monitor_private_chat(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """
-    Plain AI chat for people DMing the BOT ITSELF directly (i.e. Beluga's own
-    account, not a Business Connection). Completely separate from Secretary
-    Mode above — this fires on normal `message` updates in private chats.
-    Uses the same persistent memory + chat history as group/ghost-mode chat.
+    Plain AI chat for DMs. No secretary/business logic anymore — every
+    private text message just gets an AI reply, with a sticker from the
+    MAIN pack attached to every single response (private-chat rule).
     """
     if not u.message or u.effective_chat.type != "private":
         return
@@ -2284,7 +2193,11 @@ async def monitor_private_chat(u: Update, c: ContextTypes.DEFAULT_TYPE):
         system = f"{CHAT_PROMPT}\nThe user's name is {user_name}.{mem_ctx}{hist_ctx}"
         reply = await ai(system, text, f"Hey {user_name}! 🐾", max_tok=140)
 
-        await u.message.reply_text(reply, reply_to_message_id=u.message.message_id)
+        try:
+            await u.message.reply_text(reply, reply_to_message_id=u.message.message_id)
+        except Exception:
+            pass
+
         await append_chat_history(uid, text, reply)
 
         stick = await get_random_sticker_from(STICKER_PACK_MAIN)
@@ -2296,11 +2209,6 @@ async def monitor_private_chat(u: Update, c: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"[monitor_private_chat] {e}")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 23: GHOST MODE (@botusername mention in groups)
-# ═══════════════════════════════════════════════════════════════════════════
-# When anyone tags the bot in a group (even groups it hasn't been added to),
-# Beluga replies. Checks both the actual bot username AND @smartbeluga_bot.
 async def monitor_ghost_mode(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message or u.effective_chat.type == "private":
         return
@@ -2319,7 +2227,6 @@ async def monitor_ghost_mode(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not mentioned:
         return
 
-    # Strip all @mentions so we get the pure message content
     msg_content = re.sub(r"@\w+", "", text, flags=re.IGNORECASE).strip()
     if not msg_content:
         return
@@ -2337,31 +2244,16 @@ async def monitor_ghost_mode(u: Update, c: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"[monitor_ghost_mode] {e}")
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 24: GENERAL GROUP CHAT MONITOR (groups ONLY)
-# ═══════════════════════════════════════════════════════════════════════════
-# Group-only behaviour, per spec:
-#   - Every 14th message in a group -> send 1 sticker from STICKER_PACK_SAFE,
-#                                       no AI reply needed/required.
-#   - No more periodic "every Nth message" sticker from the MAIN pack — that
-#     was removed. The MAIN pack sticker now only ever accompanies an AI
-#     reply, and even then only on every 4th AI reply (see ai_reply_counter),
-#     not on every single one.
-#   - STICKER_PACK_SAFE is NEVER attached to an AI response — only the
-#     periodic 14th-message counter triggers it.
-#   - Any incoming STICKER from a banned pack (see /block) is deleted instantly.
-ai_reply_counter = {}  # per-chat counter of AI replies given, for the "every 4th" sticker rule
+ai_reply_counter = {}
 
 async def monitor_group(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message or not u.effective_user or u.effective_user.is_bot:
         return
     if u.effective_chat.type == "private":
-        return  # this handler is GROUPS ONLY
+        return
     try:
         uid, cid, now = u.effective_user.id, str(u.effective_chat.id), datetime.now()
 
-        # --- /block enforcement: delete any sticker from a banned pack ---
         if u.message.sticker:
             pack_of_sticker = getattr(u.message.sticker, "set_name", None)
             if is_pack_banned(pack_of_sticker):
@@ -2369,9 +2261,8 @@ async def monitor_group(u: Update, c: ContextTypes.DEFAULT_TYPE):
                     await u.message.delete()
                 except Exception:
                     pass
-                return  # don't count/process a deleted message further
+                return
 
-        # --- anti-spam (text messages) ---
         spam_tracker.setdefault(uid, [])
         spam_tracker[uid] = [t for t in spam_tracker[uid] if now - t < timedelta(seconds=2)]
         spam_tracker[uid].append(now)
@@ -2380,14 +2271,12 @@ async def monitor_group(u: Update, c: ContextTypes.DEFAULT_TYPE):
             except Exception: pass
             return
 
-        # --- track seen users (for /gay /couple etc.) ---
         db.setdefault("seen", {}).setdefault(cid, {})[str(uid)] = {
             "id": uid, "un": u.effective_user.username, "n": u.effective_user.first_name or "User"
         }
         counts = db.setdefault("counts", {})
         counts[cid] = counts.get(cid, 0) + 1
 
-        # --- every 14th message: sticker from STAY-SAFE pack (no AI needed) ---
         if counts[cid] % 14 == 0:
             stick_safe = await get_random_sticker_from(STICKER_PACK_SAFE)
             if stick_safe:
@@ -2430,10 +2319,8 @@ async def monitor_group(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
             await append_chat_history(uid, text, reply)
 
-            # AI response sticker -> only every 4th AI reply in this chat,
-            # and always from MAIN pack (never stay-safe pack).
             ai_reply_counter[cid] = ai_reply_counter.get(cid, 0) + 1
-            if ai_reply_counter[cid] % 4 == 0:
+            if ai_reply_counter[cid] % 2 == 0:
                 stick = await get_random_sticker_from(STICKER_PACK_MAIN)
                 if stick:
                     try:
@@ -2445,10 +2332,6 @@ async def monitor_group(u: Update, c: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"[monitor_group] {e}")
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 25: HTTP HEALTH SERVER (keeps Render web-service alive)
-# ═══════════════════════════════════════════════════════════════════════════
 async def _health(req):
     up = int((datetime.now() - bot_status["start_time"]).total_seconds())
     return web.json_response({"status": "healthy", "uptime_seconds": up, "running": bot_status["running"], "messages": bot_status["message_count"], "version": "11.4.0"})
@@ -2483,74 +2366,135 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 26: /start COMMAND (with intro video)
-# ═══════════════════════════════════════════════════════════════════════════
+START_TEXT = (
+    "Hi, human friend! 😼 I\u2019m Beluga!\n\n"
+    "Ready to chat?!! 😺\n\n"
+    "Just ask me anything — Science, Maths, Random Questions, or Something You\u2019re curious about...\n\n"
+    "You Can Start With :\n"
+    "\u201cHi Beluga, what is the Big Bang Theory?\u201d 💥\n\n"
+    "Your Turn, Poookie 🎀"
+)
+
+WHAT_I_CAN_DO_TEXT = (
+    "*✨ 𝓑𝓮𝓵𝓾𝓰𝓪'𝓼 𝓒𝓸𝓶𝓶𝓪𝓷𝓭 𝓑𝓸𝓸𝓴 ✨*\n\n"
+    "*🎮 Games & Fun*\n"
+    "`/quiz` — brain trivia\n"
+    "`/tictac` — tic tac toe\n"
+    "`/mine` — minesweeper\n"
+    "`/gay` `/couple` — daily fun picks\n\n"
+    "*💰 Crypto Live*\n"
+    "`/price` — live coin price\n"
+    "`/topgainers` `/toplosers` — market movers\n"
+    "`/chart` — candlestick chart\n\n"
+    "*📰 News*\n"
+    "`/news` — crypto headlines\n"
+    "`/ainews` — AI updates\n"
+    "`/technews` — tech world\n\n"
+    "*🔍 Search & AI*\n"
+    "`/search` — web + Wikipedia search\n"
+    "`/bananalogic` — AI answer with image\n"
+    "`/yt` — YouTube video info\n"
+    "_@ mention me anytime to chat!_\n\n"
+    "*🖼️ Image Tools*\n"
+    "`/qr` — QR code generator\n"
+    "`/scanqr` — scan a QR code\n"
+    "`/resize` `/compress` — image tools\n"
+    "`/watermark` — add a watermark\n"
+    "`/imginfo` — image details\n\n"
+    "*🏆 Leaderboard*\n"
+    "`/lb` — view rankings\n"
+    "`/gm` `/nw` `/pump` `/dump` — admin tools\n\n"
+    "*🎀 Extras*\n"
+    "`/model` — pick AI engine (admin)\n"
+    "`/block` — ban a sticker pack (admin)\n"
+    "`/clearmemory` — wipe memory (admin)\n"
+    "`/workflow` — how I think"
+)
+
+
+def _start_main_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🫦 KIDNAP ME 🫦", url=KIDNAP_ME_URL)],
+        [InlineKeyboardButton("💖 UPDATES CHANNEL 💖", url=UPDATES_CHANNEL)],
+        [InlineKeyboardButton("😼 WHAT I CAN DO ?", callback_data="menu:whatido")],
+        [InlineKeyboardButton("👀 WORKFLOW", callback_data="menu:workflow")],
+    ])
+
+
+def _back_only_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("BACK 🫤", callback_data="menu:back")]])
+
+
 async def start_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message:
         return
+    kb = _start_main_menu_kb()
+    sent = await send_photo_safe(
+        c.bot, u.effective_chat.id, START_MENU_IMAGE_PAGE,
+        caption=START_TEXT, parse_mode=ParseMode.MARKDOWN, reply_markup=kb
+    )
+    if not sent:
+        # send_photo_safe already sent the text fallback if photo failed;
+        # this only fires if BOTH photo and text somehow failed, so retry once more.
+        try:
+            await u.message.reply_text(START_TEXT, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+        except Exception as e:
+            logger.error(f"[start_handler] Total failure: {e}")
 
-    # Telegram sends "/start bizChat<user_chat_id>" when the business owner
-    # taps "Manage Bot" from the quick action bar inside a managed chat.
-    args = c.args if hasattr(c, "args") else []
-    if args and args[0].startswith("bizChat"):
-        target_chat_id = args[0][len("bizChat"):]
-        owner_conn = next(
-            (info for info in business_connections.values()
-             if info.get("owner_user_id") == u.effective_user.id and info.get("is_enabled")),
-            None
-        )
-        if owner_conn:
-            await u.message.reply_text(
-                f"🎀 *Beluga is actively managing chat* `{target_chat_id}` *for you!*\n\n"
-                f"Reply permission: {'✅ Enabled' if owner_conn.get('can_reply') else '⛔ View-only'}",
-                parse_mode=ParseMode.MARKDOWN
-            )
-        else:
-            await u.message.reply_text(
-                "🎀 I don't see an active connection yet — try reconnecting via "
-                "Telegram Business settings if this doesn't update shortly."
-            )
+
+async def workflow_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not u.message:
         return
+    await send_photo_safe(
+        c.bot, u.effective_chat.id, WORKFLOW_IMAGE_PAGE,
+        caption=WORKFLOW_TEXT, parse_mode=ParseMode.MARKDOWN
+    )
 
-    text = "Hi I am Beluga 🎀 chat with me anytime freely I am ready to hear you pookie ♥."
 
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎀 Kidnap me 🎀", url=KIDNAP_ME_URL)],
-        [InlineKeyboardButton("📢 UPDATES CHANNEL", url=UPDATES_CHANNEL)],
-    ])
-
+async def start_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handles all 3 submenu buttons + the BACK button on /start's inline menu.
+    Edits the existing message in place (text or caption, whichever the
+    message actually has) instead of sending new messages every tap.
+    """
+    q = update.callback_query
+    if not q:
+        return
     try:
-        await u.message.reply_video(video=START_VIDEO, caption=text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
-    except Exception:
-        await u.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+        await q.answer()
+        action = q.data.split(":", 1)[1]
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 28: GITHUB-BACKED LONG-TERM USER MEMORY (+ /clearmemory)
-# ═══════════════════════════════════════════════════════════════════════════
-# Gives Beluga a per-user "long term memory" that persists indefinitely:
-#   - One JSON file per Telegram user: memory/<user_id>.json in the SAME
-#     GitHub repo already configured via GITHUB_TOKEN / GITHUB_REPO /
-#     GITHUB_BRANCH (Section 1) — no separate credentials needed.
-#   - Read before every AI reply and folded into the system prompt, so
-#     Beluga can recall what it knows about that user.
-#   - Never auto-expires. Only cleared by:
-#       * delete_user_memory(user_id)  -> wipes ONE user's file
-#       * clear_all_memory()           -> wipes EVERY user's file, via the
-#         owner-only /clearmemory command (gated by OWNER_ID / is_owner(),
-#         same as /nw, /gm, /pump, /dump, /block).
-MEMORY_FOLDER = "memory"  # folder in the repo that holds all per-user memory files
+        if action == "whatido":
+            target_text, target_kb = WHAT_I_CAN_DO_TEXT, _back_only_kb()
+        elif action == "workflow":
+            target_text, target_kb = WORKFLOW_TEXT, _back_only_kb()
+        elif action == "back":
+            target_text, target_kb = START_TEXT, _start_main_menu_kb()
+        else:
+            return
 
-# Reuse Section 4's _memory-style folder-confirmation pattern, but scoped
-# to this feature so it only logs once per process.
+        try:
+            if q.message.photo:
+                await q.edit_message_caption(caption=target_text, parse_mode=ParseMode.MARKDOWN, reply_markup=target_kb)
+            else:
+                await q.edit_message_text(text=target_text, parse_mode=ParseMode.MARKDOWN, reply_markup=target_kb)
+        except Exception as e:
+            logger.warning(f"[start_menu_callback] Edit failed ({e}), sending fresh message instead.")
+            await context.bot.send_message(chat_id=q.message.chat_id, text=target_text,
+                                            parse_mode=ParseMode.MARKDOWN, reply_markup=target_kb)
+    except Exception as e:
+        logger.error(f"[start_menu_callback] {e}")
+
+
+
+MEMORY_FOLDER = "memory"
+
 _memory_folder_confirmed = False
 _memory_folder_lock = asyncio.Lock()
 _memory_rate_limit_reset_at: Optional[float] = None
 
-
 def _memory_file_path(user_id) -> str:
     return f"{MEMORY_FOLDER}/{user_id}.json"
-
 
 async def _memory_respect_rate_limit():
     global _memory_rate_limit_reset_at
@@ -2562,7 +2506,6 @@ async def _memory_respect_rate_limit():
             await asyncio.sleep(min(wait, 30))
         _memory_rate_limit_reset_at = None
 
-
 def _memory_note_rate_limit(headers) -> None:
     global _memory_rate_limit_reset_at
     try:
@@ -2572,7 +2515,6 @@ def _memory_note_rate_limit(headers) -> None:
             _memory_rate_limit_reset_at = float(reset_ts)
     except Exception:
         pass
-
 
 async def _memory_gh_get_file(session: aiohttp.ClientSession, path: str):
     """Fetch a file's content + sha. Returns (parsed_dict_or_None, sha_or_None). 404 is expected/normal."""
@@ -2607,7 +2549,6 @@ async def _memory_gh_get_file(session: aiohttp.ClientSession, path: str):
     except Exception as e:
         logger.error(f"[memory] Error reading {path}: {e}")
         return None, None
-
 
 async def _memory_gh_put_file(session: aiohttp.ClientSession, path: str, content_dict: dict,
                                commit_message: str, sha: Optional[str] = None) -> bool:
@@ -2645,7 +2586,6 @@ async def _memory_gh_put_file(session: aiohttp.ClientSession, path: str, content
         logger.error(f"[memory] Error writing {path}: {e}")
         return False
 
-
 async def _memory_gh_delete_file(session: aiohttp.ClientSession, path: str, sha: str, commit_message: str) -> bool:
     await _memory_respect_rate_limit()
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
@@ -2666,7 +2606,6 @@ async def _memory_gh_delete_file(session: aiohttp.ClientSession, path: str, sha:
         logger.error(f"[memory] Error deleting {path}: {e}")
         return False
 
-
 async def _memory_list_files(session: aiohttp.ClientSession) -> list:
     """Directory-listing form of the Contents API: GET on a folder path returns an array of entries."""
     await _memory_respect_rate_limit()
@@ -2679,7 +2618,7 @@ async def _memory_list_files(session: aiohttp.ClientSession) -> list:
                 entries = await resp.json()
                 return [e for e in entries if e.get("type") == "file" and e.get("name", "").endswith(".json")]
             elif resp.status == 404:
-                return []  # folder doesn't exist yet — nothing to list
+                return []
             else:
                 body = await resp.text()
                 logger.error(f"[memory] Listing {MEMORY_FOLDER}/ failed: {resp.status} {body[:200]}")
@@ -2687,7 +2626,6 @@ async def _memory_list_files(session: aiohttp.ClientSession) -> list:
     except Exception as e:
         logger.error(f"[memory] Error listing {MEMORY_FOLDER}/: {e}")
         return []
-
 
 async def _memory_ensure_repo_reachable(session: aiohttp.ClientSession) -> None:
     """Confirm GitHub repo access once per process (clear log message if misconfigured)."""
@@ -2716,15 +2654,12 @@ async def _memory_ensure_repo_reachable(session: aiohttp.ClientSession) -> None:
         except Exception as e:
             logger.error(f"[memory] Could not reach GitHub to confirm repo: {e}")
 
-
 def _memory_is_configured() -> bool:
     ok = bool(GITHUB_TOKEN and GITHUB_REPO)
     if not ok:
         logger.error("[memory] GITHUB_TOKEN / GITHUB_REPO not fully configured — memory disabled.")
     return ok
 
-
-# ───────────────────────────── PUBLIC MEMORY API ─────────────────────────────
 async def get_user_memory(user_id) -> dict:
     """
     Fetch a user's long-term memory dict (empty {} if none exists yet).
@@ -2738,7 +2673,6 @@ async def get_user_memory(user_id) -> dict:
         await _memory_ensure_repo_reachable(session)
         data, _sha = await _memory_gh_get_file(session, path)
         return data if data is not None else {}
-
 
 async def save_user_memory(user_id, memory_data: dict) -> bool:
     """Overwrite a user's ENTIRE memory file with memory_data (fetches sha first if it exists)."""
@@ -2756,7 +2690,6 @@ async def save_user_memory(user_id, memory_data: dict) -> bool:
         if success:
             logger.info(f"[memory] Saved memory for user {user_id} ({len(payload)} keys).")
         return success
-
 
 async def update_user_memory(user_id, key: str, value) -> bool:
     """Update (or add) a SINGLE key in a user's memory, preserving everything else already stored."""
@@ -2777,14 +2710,7 @@ async def update_user_memory(user_id, key: str, value) -> bool:
             logger.info(f"[memory] Updated key '{key}' for user {user_id}.")
         return success
 
-
-# ───────────────────────────── PERSISTENT CHAT HISTORY (per user) ─────────────────────────────
-# Stores a rolling window of a user's recent AI-chat exchanges INSIDE their
-# existing memory/<user_id>.json file, under the "chat_history" key. This is
-# what makes Beluga "remember the previous chat" across restarts — unlike
-# the old fun_db["chat_memory"] dict, which lived only in RAM and was wiped
-# every time the process restarted. Persisted to GitHub, survives restarts.
-CHAT_HISTORY_MAX_TURNS = 10  # keep the last N (user, beluga) exchanges per user
+CHAT_HISTORY_MAX_TURNS = 10
 
 async def append_chat_history(user_id, user_text: str, bot_reply: str) -> bool:
     """
@@ -2814,7 +2740,6 @@ async def append_chat_history(user_id, user_text: str, bot_reply: str) -> bool:
         success = await _memory_gh_put_file(session, path, data, commit_msg, sha=sha)
         return success
 
-
 def build_chat_history_context(memory: dict) -> str:
     """
     Turn a user's stored chat_history into a short block the AI can read
@@ -2835,7 +2760,6 @@ def build_chat_history_context(memory: dict) -> str:
         return ""
     return "\n\nPrevious conversation with this user (for context, don't repeat verbatim):\n" + "\n".join(lines)
 
-
 async def delete_user_memory(user_id) -> bool:
     """Permanently delete a single user's memory file. Returns True even if there was nothing to delete."""
     if not _memory_is_configured():
@@ -2845,12 +2769,11 @@ async def delete_user_memory(user_id) -> bool:
         await _memory_ensure_repo_reachable(session)
         _, sha = await _memory_gh_get_file(session, path)
         if not sha:
-            return True  # nothing existed — desired end-state already achieved
+            return True
         success = await _memory_gh_delete_file(session, path, sha, f"Delete memory for user {user_id} [skip ci]")
         if success:
             logger.info(f"[memory] Deleted memory for user {user_id}.")
         return success
-
 
 async def clear_all_memory() -> tuple:
     """
@@ -2877,7 +2800,6 @@ async def clear_all_memory() -> tuple:
         logger.info(f"[memory] clear_all_memory: deleted {deleted} file(s), {failed} failure(s).")
         return (deleted, failed)
 
-
 def build_memory_context(memory: dict) -> str:
     """
     Turn a memory dict into a short text block to append to an AI system
@@ -2889,8 +2811,6 @@ def build_memory_context(memory: dict) -> str:
         return ""
     return "\n\nWhat you remember about this user:\n" + "\n".join(lines)
 
-
-# ───────────────────────────── /clearmemory COMMAND (owner-only) ─────────────────────────────
 async def clearmemory_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """
     Owner-only. Wipes EVERY user's memory file from GitHub.
@@ -2916,9 +2836,6 @@ async def clearmemory_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await u.message.reply_text(result_text)
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SECTION 27: MAIN ENTRYPOINT
-# ═══════════════════════════════════════════════════════════════════════════
 async def main():
     logger.info("STARTING BELUGA BOT v11.4.0")
     http_runner = await start_http(HTTP_PORT)
@@ -2926,18 +2843,10 @@ async def main():
 
     app = TGApp.builder().token(BOT_TOKEN).build()
 
-    # ---- Load persistent data: checks GitHub file existence first ----
     await load_persistent_data()
-    await load_business_connections()
 
-    # ---- Load both sticker packs (main + staysafe) ----
-    await load_sticker_pack(app.bot, STICKER_PACK_MAIN)
-    await load_sticker_pack(app.bot, STICKER_PACK_SAFE)
-    # Flush sticker file immediately so it's created/updated on this very startup
-    await save_all_data()
-
-    # ---- Command handlers ----
     app.add_handler(CommandHandler("start", start_handler))
+    app.add_handler(CommandHandler("workflow", workflow_handler))
     app.add_handler(CommandHandler("price", crypto_price_handler))
     app.add_handler(CommandHandler(["topgainers", "toplosers"], crypto_movers_handler))
     app.add_handler(CommandHandler(["chart", "chart5m", "chart15m", "chart1h", "chart4h", "chart1d"], crypto_chart_handler))
@@ -2946,6 +2855,7 @@ async def main():
     app.add_handler(CommandHandler("technews", lambda u, c: execute_news_flow(u, c, "tech", "Tech News")))
     app.add_handler(CommandHandler("search", search_handler))
     app.add_handler(CommandHandler("bananalogic", bananalogic_handler))
+    app.add_handler(CommandHandler("yt", yt_handler))
     app.add_handler(CommandHandler("qr", qr_generate_handler))
     app.add_handler(CommandHandler("scanqr", qr_scan_handler))
     app.add_handler(CommandHandler("resize", lambda u, c: img_handler(u, c, "resize")))
@@ -2963,39 +2873,15 @@ async def main():
     app.add_handler(CommandHandler("block", block_handler))
     app.add_handler(CommandHandler("clearmemory", clearmemory_handler))
     app.add_handler(CommandHandler("model", model_command_handler))
-    app.add_handler(CommandHandler("setname", setname_handler))
-    app.add_handler(CommandHandler("setgender", setgender_handler))
 
-    # ---- Callback query handlers ----
     app.add_handler(CallbackQueryHandler(ttt_callback, pattern=r"^ttt:"))
     app.add_handler(CallbackQueryHandler(gm_callback, pattern=r"^gm:"))
     app.add_handler(CallbackQueryHandler(mine_callback, pattern=r"^mine:"))
     app.add_handler(CallbackQueryHandler(watermark_callback, pattern=r"^wm:"))
     app.add_handler(CallbackQueryHandler(model_callback, pattern=r"^model:"))
+    app.add_handler(CallbackQueryHandler(start_menu_callback, pattern=r"^menu:"))
     app.add_handler(PollAnswerHandler(poll_answer_handler))
 
-    # ---- Telegram Business (real Secretary Mode) handlers ----
-    # BusinessConnectionHandler fires when an owner connects/edits/disconnects
-    # their Telegram Business account from this bot (see SECTION 22).
-    # business_message / edited_business_message / deleted_business_messages
-    # are SEPARATE update types from normal `message` updates — they do NOT
-    # arrive as regular private-chat messages, so they need their own handlers.
-    app.add_handler(BusinessConnectionHandler(handle_business_connection))
-    app.add_handler(MessageHandler(filters.UpdateType.BUSINESS_MESSAGE, handle_business_message))
-    app.add_handler(MessageHandler(filters.UpdateType.EDITED_BUSINESS_MESSAGE, handle_edited_business_message))
-    app.add_handler(BusinessMessagesDeletedHandler(handle_deleted_business_messages))
-
-    # ---- Message handlers ----
-    # IMPORTANT: each handler is registered in its OWN handler group.
-    # PTB only runs the FIRST matching handler within a single group by
-    # default, so separate groups are required for multiple handlers to
-    # all see the same update (e.g. ghost-mode check AND general AI chat
-    # both need to run on the same group text message).
-    #
-    #   group 0: incoming STICKERS in groups -> banned-pack auto-delete check
-    #   group 1: private-chat text  -> plain AI chat (regular DMs, unrelated to Business Connection)
-    #   group 2: group-chat text    -> ghost mode (@botusername mention)
-    #   group 3: group-chat text/stickers -> general group monitor (AI + sticker cadence)
     app.add_handler(MessageHandler(filters.Sticker.ALL & filters.ChatType.GROUPS, monitor_group), group=0)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, monitor_private_chat), group=1)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, monitor_ghost_mode), group=2)
@@ -3005,6 +2891,10 @@ async def main():
 
     await app.initialize()
     await app.start()
+
+    await load_sticker_pack(app.bot, STICKER_PACK_MAIN)
+    await load_sticker_pack(app.bot, STICKER_PACK_SAFE)
+    await save_all_data()
 
     try:
         me = await app.bot.get_me()
@@ -3028,9 +2918,6 @@ async def main():
 
     cleanup_task = asyncio.create_task(cleanup_expired_games())
     sync_task = asyncio.create_task(periodic_sync())
-    # Exchange connection (ccxt.load_markets) is a slow blocking network call.
-    # Running it here, AFTER the HTTP port is bound and Telegram polling has
-    # started, guarantees Render's port-scan / health check succeeds first.
     exchange_task = asyncio.create_task(init_exchange_async())
 
     await stop_evt.wait()
@@ -3053,3 +2940,4 @@ if __name__ == "__main__":
     except Exception as e:
         logger.critical(f"Fatal: {e}")
         sys.exit(1)
+
