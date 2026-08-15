@@ -983,7 +983,8 @@ def _wrap_text(draw, text: str, font, max_width: int) -> list:
     if current:
         lines.append(current)
     return lines if lines else [text]
-    def _apply_watermark(buf: io.BytesIO, wm_text: str, font_size: int, color_key: str, style_name: str) -> io.BytesIO:
+
+def _apply_watermark(buf: io.BytesIO, wm_text: str, font_size: int, color_key: str, style_name: str) -> io.BytesIO:
     im = Image.open(buf).convert("RGBA")
     img_w, img_h = im.size
     rgba = VIBGYOR_COLORS.get(color_key, (255, 255, 255, 220))
@@ -1953,7 +1954,7 @@ async def search_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text(caption, parse_mode=ParseMode.MARKDOWN, reply_to_message_id=u.message.message_id)
     except Exception as e:
         logger.error(f"[search_handler] Final text send failed: {e}")
-        
+
 async def bananalogic_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message:
         return
@@ -2939,6 +2940,3 @@ if __name__ == "__main__":
     except Exception as e:
         logger.critical(f"Fatal: {e}")
         sys.exit(1)
-
-
-
