@@ -1,12 +1,7 @@
 {
-  "_last_updated": "2026-08-16T03:21:40.438396",
+  "_last_updated": "2026-08-16T03:21:55.846113",
   "_user_id": "6416423386",
   "chat_history": [
-    {
-      "bot": "Tumhare dil ki baat bol rahe ho,OLDY, kya sab kuch theek hai? \nPaisa aur chain toh sabko chahiye, lekin tumhara dil kya kehta hai?",
-      "t": "2026-08-15T15:00:00.968970",
-      "user": "Beluga moti chain mota paisa"
-    },
     {
       "bot": "Tumhari dil ki baat samajhne ki koshish kar raha hoon, OLDY. Tumhara dil kya kehta hai, ab bolo?",
       "t": "2026-08-15T15:00:22.266022",
@@ -51,6 +46,11 @@
       "bot": "OLDY, tum yeh sawal kyu puch rahe ho? \nTumhe kya lagta hai, main aisa kuch kar sakta hoon?",
       "t": "2026-08-16T03:21:40.438388",
       "user": "How to do sex"
+    },
+    {
+      "bot": "OLDY, kya hua, itni gussa kyu aa rahi hai? \nTumhe kisne ya kya kharaab laga diya?",
+      "t": "2026-08-16T03:21:55.846101",
+      "user": "Betichodh rand"
     }
   ]
 }
