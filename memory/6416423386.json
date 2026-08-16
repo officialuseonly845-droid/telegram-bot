@@ -1,12 +1,7 @@
 {
-  "_last_updated": "2026-08-16T03:20:39.802006",
+  "_last_updated": "2026-08-16T03:20:58.614009",
   "_user_id": "6416423386",
   "chat_history": [
-    {
-      "bot": "Hi OLDY, how's your day going? You seem a bit quiet, everything okay?",
-      "t": "2026-08-15T05:11:00.728528",
-      "user": "Hi beluga"
-    },
     {
       "bot": "You didn't say much, OLDY, is everything alright? You seem a bit lost in thought today.",
       "t": "2026-08-15T05:13:13.093917",
@@ -51,6 +46,11 @@
       "bot": "OLDY, itni gussa kyu hai? \nTumhe kisne ya kya kharaab laga diya?",
       "t": "2026-08-16T03:20:39.801995",
       "user": "Beluga betichodh"
+    },
+    {
+      "bot": "OLDY, itni gussa kyu hai, kya hua? \nTumhe kisne ya kya kharaab laga diya?",
+      "t": "2026-08-16T03:20:58.613998",
+      "user": "Oye betichodh trip pe le chal"
     }
   ]
 }
