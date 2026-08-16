@@ -1,12 +1,7 @@
 {
-  "_last_updated": "2026-08-16T03:21:55.846113",
+  "_last_updated": "2026-08-16T05:38:53.773197",
   "_user_id": "6416423386",
   "chat_history": [
-    {
-      "bot": "Tumhari dil ki baat samajhne ki koshish kar raha hoon, OLDY. Tumhara dil kya kehta hai, ab bolo?",
-      "t": "2026-08-15T15:00:22.266022",
-      "user": "Beluga ko hi bolo"
-    },
     {
       "bot": "OLDY, tum yeh sawal kyu puch rahe ho? \nTumhe kya lagta hai, main aisa kuch kar sakta hoon?",
       "t": "2026-08-15T15:17:47.517538",
@@ -51,6 +46,11 @@
       "bot": "OLDY, kya hua, itni gussa kyu aa rahi hai? \nTumhe kisne ya kya kharaab laga diya?",
       "t": "2026-08-16T03:21:55.846101",
       "user": "Betichodh rand"
+    },
+    {
+      "bot": "OLDY, kya hua, itni udaasi kyu hai? \nTumhe kisne ya kya kharaab laga diya?",
+      "t": "2026-08-16T05:38:53.773186",
+      "user": "Shiva chud gyi"
     }
   ]
 }
