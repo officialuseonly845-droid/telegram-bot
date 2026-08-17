@@ -1,12 +1,7 @@
 {
-  "_last_updated": "2026-08-17T18:27:13.317014",
+  "_last_updated": "2026-08-17T18:27:23.220157",
   "_user_id": "6416423386",
   "chat_history": [
-    {
-      "bot": "OLDY, kya hua, itni gussa kyu hai? \nTumhe kisne ya kya kharaab laga diya?",
-      "t": "2026-08-15T15:45:29.407596",
-      "user": "Belugahhh ko gali sikha deta hu sabko pel dega"
-    },
     {
       "bot": "OLDY, itni gussa kyu hai? \nTumhe kisne ya kya kharaab laga diya?",
       "t": "2026-08-16T03:20:39.801995",
@@ -51,6 +46,11 @@
       "bot": "Hey OLDY! 🐾",
       "t": "2026-08-17T18:27:13.317004",
       "user": "Aba kya bake ja rha bc"
+    },
+    {
+      "bot": "Hey OLDY! 🐾",
+      "t": "2026-08-17T18:27:23.220146",
+      "user": "Lund le"
     }
   ]
 }
