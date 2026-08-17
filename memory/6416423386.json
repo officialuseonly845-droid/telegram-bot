@@ -1,12 +1,7 @@
 {
-  "_last_updated": "2026-08-17T18:26:54.356665",
+  "_last_updated": "2026-08-17T18:27:13.317014",
   "_user_id": "6416423386",
   "chat_history": [
-    {
-      "bot": "Tumhara babu hai kitna shareef, yeh to tum hi bata sakte ho, OLDY. \nTum uske bare mein kya sochti ho?",
-      "t": "2026-08-15T15:44:47.650152",
-      "user": "Kitna shareef ha mera babu"
-    },
     {
       "bot": "OLDY, kya hua, itni gussa kyu hai? \nTumhe kisne ya kya kharaab laga diya?",
       "t": "2026-08-15T15:45:29.407596",
@@ -51,6 +46,11 @@
       "bot": "Hey OLDY! 🐾",
       "t": "2026-08-17T18:26:54.356652",
       "user": "Hola"
+    },
+    {
+      "bot": "Hey OLDY! 🐾",
+      "t": "2026-08-17T18:27:13.317004",
+      "user": "Aba kya bake ja rha bc"
     }
   ]
 }
