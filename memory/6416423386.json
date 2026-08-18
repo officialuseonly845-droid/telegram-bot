@@ -1,12 +1,7 @@
 {
-  "_last_updated": "2026-08-18T13:54:13.570075",
+  "_last_updated": "2026-08-18T13:54:54.614367",
   "_user_id": "6416423386",
   "chat_history": [
-    {
-      "bot": "Hey OLDY! 🐾",
-      "t": "2026-08-17T18:26:45.281452",
-      "user": "Kya"
-    },
     {
       "bot": "Hey OLDY! 🐾",
       "t": "2026-08-17T18:26:54.356652",
@@ -51,6 +46,11 @@
       "bot": "Hey OLDY! 🐾",
       "t": "2026-08-18T13:54:13.570066",
       "user": "Oh yeah oh yeah cz bounce bounce oh yeah"
+    },
+    {
+      "bot": "Hey OLDY! 🐾",
+      "t": "2026-08-18T13:54:54.614358",
+      "user": "Hola"
     }
   ]
 }
