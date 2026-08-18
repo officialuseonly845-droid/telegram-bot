@@ -22,4 +22,5 @@ langdetect==1.0.9
 textblob==0.18.0.post0
 rapidfuzz==3.9.6
 python-dotenv==1.0.1
-Wikipedia-API==0.7.1
+motor==3.6.0
+pymongo==4.9.2
