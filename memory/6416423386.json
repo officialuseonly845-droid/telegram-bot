@@ -1,12 +1,7 @@
 {
-  "_last_updated": "2026-08-18T13:54:54.614367",
+  "_last_updated": "2026-08-18T14:30:13.852233",
   "_user_id": "6416423386",
   "chat_history": [
-    {
-      "bot": "Hey OLDY! 🐾",
-      "t": "2026-08-17T18:26:54.356652",
-      "user": "Hola"
-    },
     {
       "bot": "Hey OLDY! 🐾",
       "t": "2026-08-17T18:27:13.317004",
@@ -51,6 +46,11 @@
       "bot": "Hey OLDY! 🐾",
       "t": "2026-08-18T13:54:54.614358",
       "user": "Hola"
+    },
+    {
+      "bot": "Hey OLDY! 🐾",
+      "t": "2026-08-18T14:30:13.852220",
+      "user": "Ja rha hu beluga ma jaan daalnw"
     }
   ]
 }
