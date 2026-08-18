@@ -1,12 +1,7 @@
 {
-  "_last_updated": "2026-08-18T04:48:38.627351",
+  "_last_updated": "2026-08-18T04:48:52.766743",
   "_user_id": "6416423386",
   "chat_history": [
-    {
-      "bot": "OLDY, Big Bang Theory ek scientific theory hai jo kehta hai ki universe lagbhag 13.8 billion saal pehle ek bahut bade explosion se banaya gaya tha. \nIsse pehle universe ek infinitely hot aur dense point mein tha, jiseh Big Bang kehte hain.",
-      "t": "2026-08-16T03:21:21.104355",
-      "user": "Beluga search what is the big bang theory"
-    },
     {
       "bot": "OLDY, tum yeh sawal kyu puch rahe ho? \nTumhe kya lagta hai, main aisa kuch kar sakta hoon?",
       "t": "2026-08-16T03:21:40.438388",
@@ -51,6 +46,11 @@
       "bot": "Hey OLDY! 🐾",
       "t": "2026-08-18T04:48:38.627342",
       "user": "Hi beluga"
+    },
+    {
+      "bot": "Hey OLDY! 🐾",
+      "t": "2026-08-18T04:48:52.766728",
+      "user": "Kya"
     }
   ]
 }
