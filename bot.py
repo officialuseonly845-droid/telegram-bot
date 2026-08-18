@@ -27,7 +27,7 @@ GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-HTTP_PORT = int(os.environ.get("PORT", "10000"))
+HTTP_PORT = int(os.environ.get("PORT", "10000")) 
 OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 
 KIDNAP_ME_URL = os.environ.get("KIDNAP_ME_URL", "https://t.me/BELUGAPY")
