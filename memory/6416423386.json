@@ -1,12 +1,7 @@
 {
-  "_last_updated": "2026-08-18T06:54:45.744848",
+  "_last_updated": "2026-08-18T13:54:13.570075",
   "_user_id": "6416423386",
   "chat_history": [
-    {
-      "bot": "OLDY, kya hua, itni udaasi kyu hai? \nTumhe kisne ya kya kharaab laga diya?",
-      "t": "2026-08-16T05:38:53.773186",
-      "user": "Shiva chud gyi"
-    },
     {
       "bot": "Hey OLDY! 🐾",
       "t": "2026-08-17T18:26:45.281452",
@@ -51,6 +46,11 @@
       "bot": "Hey OLDY! 🐾",
       "t": "2026-08-18T06:54:45.744838",
       "user": "Ye bhi sabko warning deta rehta ha"
+    },
+    {
+      "bot": "Hey OLDY! 🐾",
+      "t": "2026-08-18T13:54:13.570066",
+      "user": "Oh yeah oh yeah cz bounce bounce oh yeah"
     }
   ]
 }
