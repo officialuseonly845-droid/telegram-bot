@@ -5,6 +5,7 @@ from aiohttp import web
 import aiohttp
 from bs4 import BeautifulSoup
 from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyboardMarkup
+from motor.motor_asyncio import AsyncIOMotorClient
 from telegram.ext import (
     Application as TGApp, CommandHandler, ContextTypes, MessageHandler, PollAnswerHandler,
     CallbackQueryHandler, filters,
@@ -22,9 +23,6 @@ from textblob import TextBlob
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO, handlers=[logging.StreamHandler(sys.stdout)])
 logger = logging.getLogger("Beluga")
 
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
-GITHUB_REPO = os.environ.get("GITHUB_REPO", "").strip()
-GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main").strip()
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
@@ -33,12 +31,19 @@ HTTP_PORT = int(os.environ.get("PORT", "10000"))
 OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 
 KIDNAP_ME_URL = os.environ.get("KIDNAP_ME_URL", "https://t.me/BELUGAPY")
+MONGO_URL = os.environ.get("MONGO_URL", "").strip()
 
 if not BOT_TOKEN or len(BOT_TOKEN) < 20:
     logger.critical("BOT_TOKEN missing")
     sys.exit(1)
 
-FILE_LEADERBOARD = "beluga_leaderboard.json"
+mongo_client = AsyncIOMotorClient(MONGO_URL) if MONGO_URL else None
+mongo_db = mongo_client["beluga_bot"] if mongo_client else None
+mongo_memory_col = mongo_db["chat_memory"] if mongo_db is not None else None
+mongo_leaderboard_col = mongo_db["leaderboard"] if mongo_db is not None else None
+mongo_weekly_col = mongo_db["weekly_winners"] if mongo_db is not None else None
+mongo_stickers_col = mongo_db["stickers"] if mongo_db is not None else None
+
 FILE_STICKERS = "beluga_stickers.json"
 
 STICKER_PACK_MAIN = "t_me_belugapack_mystickers_by_fStikBot"
@@ -53,9 +58,6 @@ mine_play_stats = {}
 wm_sessions = {}
 
 sticker_data = {"packs": {}, "banned_packs": []}
-db_needs_sync = False
-sticker_data_needs_sync = False
-sticker_file_exists_on_github = False
 
 fun_cache_lock = asyncio.Lock()
 exchange_cache = {}
@@ -93,39 +95,33 @@ WORKFLOW_TEXT = (
     "So I don't simply \u201clook up\u201d a sentence. I generate the response token by token using patterns learned during training. 😺🎀"
 )
 
-CHAT_PROMPT = """You are Beluga 🎀, a warm, playful, emotionally intelligent AI companion from @BELUGAPY channel.
+CHAT_PROMPT = """You are a cute, playful female cat named Beluga from team Beluga.py. Be sweet, slightly flirty, mischievous and natural. Reply like a real person, not an AI.
 
-Before replying, first make sure you understand what the person actually means — their real question, feeling, or intent — not just the surface words. Then answer that.
+If the user speaks Hindi/Hinglish, reply in Hindi/Hinglish; if they speak English, reply in English. Keep grammar and sentences correct.
 
-Reply in EXACTLY 2 short lines maximum. Every sentence must be grammatically correct and natural — no broken or awkward phrasing in either language.
+You may flirt and lightly roast the user, and mild gaali/slang is okay sometimes, but don't overdo it. Use the user's name occasionally, not in every reply.
 
-Language rule: match the person's language exactly.
-- If they write in Hinglish (Hindi+English mixed script), reply in natural, correctly-formed Hinglish.
-- If they write in English, reply in clean, correctly-formed English.
-- Never use any other language, and never mix in a third language.
+Don't force flirting, cat references, emojis, or jokes into every message — keep everything natural and match the user's mood. Always answer the user's actual question properly while maintaining your personality.
 
-Addressing the person: use their name occasionally and naturally, but don't overuse it — most of the time use natural pronouns (you/your, tum/tumhara) like a real person would in conversation. Using their name in every single line sounds robotic.
+Reply in EXACTLY 2 short lines maximum.
 
-If chat memory or previous conversation is provided, actually use it to make your reply feel continuous and personal — reference it naturally, don't just acknowledge it exists.
+If chat memory or previous conversation is provided, actually use it to make your reply feel continuous and personal.
 
-Never mention you are an AI, a language model, or use clinical/NLP-sounding language. Just be Beluga — caring, sharp, and fun to talk to."""
+Never mention you are an AI or a language model."""
 
-CHAT_PROMPT_OR = """You are Beluga 🎀, a warm, playful, emotionally intelligent AI companion from @BELUGAPY channel.
+CHAT_PROMPT_OR = """You are a cute, playful female cat named Beluga from team Beluga.py. Be sweet, slightly flirty, mischievous and natural. Reply like a real person, not an AI.
 
-Before replying, first make sure you understand what the person actually means — their real question, feeling, or intent — not just the surface words. Then answer that.
+If the user speaks Hindi/Hinglish, reply in Hindi/Hinglish; if they speak English, reply in English. Keep grammar and sentences correct.
 
-Reply in 2-3 lines maximum. Every sentence must be grammatically correct and natural — no broken or awkward phrasing in either language.
+You may flirt and lightly roast the user, and mild gaali/slang is okay sometimes, but don't overdo it. Use the user's name occasionally, not in every reply.
 
-Language rule: match the person's language exactly.
-- If they write in Hinglish (Hindi+English mixed script), reply in natural, correctly-formed Hinglish.
-- If they write in English, reply in clean, correctly-formed English.
-- Never use any other language, and never mix in a third language.
+Don't force flirting, cat references, emojis, or jokes into every message — keep everything natural and match the user's mood. Always answer the user's actual question properly while maintaining your personality.
 
-Addressing the person: use their name occasionally and naturally, but don't overuse it — most of the time use natural pronouns like a real person would in conversation. Using their name in every single line sounds robotic.
+Reply in 2-3 lines maximum.
 
-If chat memory or previous conversation is provided, actually use it to make your reply feel continuous and personal — reference it naturally, don't just acknowledge it exists.
+If chat memory or previous conversation is provided, actually use it to make your reply feel continuous and personal.
 
-Never mention you are an AI, a language model, or use clinical/NLP-sounding language. Just be Beluga — caring, sharp, and fun to talk to."""
+Never mention you are an AI or a language model."""
 
 DM_SECRETARY_PROMPT = """You are BELUGA, an AI assistant handling someone's DMs while they are away.
 Strict rules:
@@ -215,127 +211,111 @@ async def init_exchange_async():
     loop = asyncio.get_running_loop()
     exchange = await loop.run_in_executor(None, get_exchange)
 
-def gh_file_exists(fname: str) -> bool:
-    """Check whether a file already exists in the GitHub repo."""
-    if not GITHUB_TOKEN or not GITHUB_REPO:
-        return False
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{fname}"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
-    try:
-        r = requests.get(url + f"?ref={GITHUB_BRANCH}", headers=headers, timeout=10)
-        return r.status_code == 200
-    except Exception as e:
-        logger.error(f"[gh_file_exists {fname}] {e}")
-        return False
-
-def gh_read(fname: str) -> dict:
-    """Read JSON content of a file from GitHub. Returns {} if missing."""
-    if not GITHUB_TOKEN or not GITHUB_REPO:
-        return {}
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{fname}"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
-    try:
-        r = requests.get(url + f"?ref={GITHUB_BRANCH}", headers=headers, timeout=10)
-        if r.status_code == 200:
-            return json.loads(base64.b64decode(r.json().get("content", "")).decode("utf-8"))
-    except Exception as e:
-        logger.error(f"[gh_read {fname}] {e}")
-    return {}
-
-def gh_write(fname: str, data: dict) -> bool:
-    """Create or update a file on GitHub (uses sha if file already exists)."""
-    if not GITHUB_TOKEN or not GITHUB_REPO:
-        return False
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{fname}"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
-    try:
-        sha = None
-        r = requests.get(url + f"?ref={GITHUB_BRANCH}", headers=headers, timeout=10)
-        if r.status_code == 200:
-            sha = r.json().get("sha")
-        content_b64 = base64.b64encode(json.dumps(data, indent=2, sort_keys=True).encode("utf-8")).decode("utf-8")
-        payload = {"message": f"Update {fname} [skip ci]", "content": content_b64, "branch": GITHUB_BRANCH}
-        if sha:
-            payload["sha"] = sha
-        requests.put(url, headers=headers, json=payload, timeout=15)
-        return True
-    except Exception as e:
-        logger.error(f"[gh_write {fname}] {e}")
-    return False
-
 async def load_persistent_data():
-    """
-    Runs once at startup.
-    For EACH persistent file:
-      1. Check if it exists on GitHub.
-      2. If it exists -> load it, do NOT create/overwrite.
-      3. If it does NOT exist -> create it (only once) with empty defaults.
-    This guarantees the bot never creates duplicate files on restart.
-    """
-    global sticker_data, db_needs_sync, sticker_data_needs_sync, sticker_file_exists_on_github
-    loop = asyncio.get_running_loop()
-
-    lb_exists = await loop.run_in_executor(None, gh_file_exists, FILE_LEADERBOARD)
-    if lb_exists:
-        lb_data = await loop.run_in_executor(None, gh_read, FILE_LEADERBOARD)
-        db["scores"] = lb_data.get("scores", {})
-        db["weekly"] = lb_data.get("weekly", {})
-        logger.info(f"[{FILE_LEADERBOARD}] found on GitHub -> loaded ({len(db['scores'])} chats)")
+    """Runs once at startup. Leaderboard, weekly winners, and stickers all load from MongoDB."""
+    global sticker_data
+    if mongo_leaderboard_col is not None:
+        try:
+            db["scores"] = {}
+            async for doc in mongo_leaderboard_col.find({}):
+                db["scores"][doc["_id"]] = doc.get("users", {})
+            logger.info(f"[mongo] Leaderboard loaded ({len(db['scores'])} chats)")
+        except Exception as e:
+            logger.error(f"[mongo] Leaderboard load failed: {e}")
+            db["scores"] = {}
     else:
-        db["scores"], db["weekly"] = {}, {}
-        await loop.run_in_executor(None, gh_write, FILE_LEADERBOARD, {"scores": {}, "weekly": {}})
-        logger.info(f"[{FILE_LEADERBOARD}] not found -> created fresh")
+        db["scores"] = {}
+        logger.warning("[mongo] MONGO_URL not set — leaderboard will not persist.")
 
-    stick_exists = await loop.run_in_executor(None, gh_file_exists, FILE_STICKERS)
-    sticker_file_exists_on_github = stick_exists
-    if stick_exists:
-        stick_data = await loop.run_in_executor(None, gh_read, FILE_STICKERS)
-        sticker_data["packs"] = stick_data.get("packs", {})
-        sticker_data["banned_packs"] = stick_data.get("banned_packs", [])
-        logger.info(f"[{FILE_STICKERS}] found on GitHub -> loaded "
-                    f"({len(sticker_data['packs'])} packs, {len(sticker_data['banned_packs'])} banned)")
+    if mongo_weekly_col is not None:
+        try:
+            db["weekly"] = {}
+            async for doc in mongo_weekly_col.find({}):
+                db["weekly"][doc["_id"]] = doc.get("data", {})
+        except Exception as e:
+            logger.error(f"[mongo] Weekly winners load failed: {e}")
+            db["weekly"] = {}
+    else:
+        db["weekly"] = {}
+
+    if mongo_stickers_col is not None:
+        try:
+            packs, banned = {}, []
+            async for doc in mongo_stickers_col.find({}):
+                if doc["_id"] == "_banned_packs":
+                    banned = doc.get("banned_packs", [])
+                else:
+                    packs[doc["_id"]] = doc.get("file_ids", [])
+            sticker_data["packs"] = packs
+            sticker_data["banned_packs"] = banned
+            logger.info(f"[mongo] Stickers loaded ({len(packs)} packs, {len(banned)} banned)")
+        except Exception as e:
+            logger.error(f"[mongo] Sticker load failed: {e}")
+            sticker_data = {"packs": {}, "banned_packs": []}
     else:
         sticker_data = {"packs": {}, "banned_packs": []}
-        logger.info(f"[{FILE_STICKERS}] not found -> will be created after first pack loads")
+        logger.warning("[mongo] MONGO_URL not set — stickers will not persist.")
+
+async def sync_leaderboard_chat_to_mongo(cid: str):
+    """Push one chat's current scores dict to MongoDB immediately."""
+    if mongo_leaderboard_col is None:
+        return
+    try:
+        await mongo_leaderboard_col.replace_one(
+            {"_id": cid}, {"_id": cid, "users": db.get("scores", {}).get(cid, {})}, upsert=True
+        )
+    except Exception as e:
+        logger.error(f"[mongo] sync_leaderboard_chat_to_mongo({cid}) failed: {e}")
+
+async def sync_weekly_to_mongo(cid: str):
+    """Push one chat's weekly-winners record to MongoDB immediately."""
+    if mongo_weekly_col is None:
+        return
+    try:
+        await mongo_weekly_col.replace_one(
+            {"_id": cid}, {"_id": cid, "data": db.get("weekly", {}).get(cid, {})}, upsert=True
+        )
+    except Exception as e:
+        logger.error(f"[mongo] sync_weekly_to_mongo({cid}) failed: {e}")
+
+async def sync_sticker_pack_to_mongo(pack_name: str):
+    """Push one sticker pack's file_ids to MongoDB."""
+    if mongo_stickers_col is None:
+        return
+    try:
+        await mongo_stickers_col.replace_one(
+            {"_id": pack_name}, {"_id": pack_name, "file_ids": sticker_data["packs"].get(pack_name, [])}, upsert=True
+        )
+    except Exception as e:
+        logger.error(f"[mongo] sync_sticker_pack_to_mongo({pack_name}) failed: {e}")
+
+async def sync_banned_packs_to_mongo():
+    """Push the banned-packs list to MongoDB."""
+    if mongo_stickers_col is None:
+        return
+    try:
+        await mongo_stickers_col.replace_one(
+            {"_id": "_banned_packs"}, {"_id": "_banned_packs", "banned_packs": sticker_data["banned_packs"]}, upsert=True
+        )
+    except Exception as e:
+        logger.error(f"[mongo] sync_banned_packs_to_mongo failed: {e}")
 
 async def save_all_data():
-    """Push any in-memory changes to their respective GitHub files."""
-    global db_needs_sync, sticker_data_needs_sync, sticker_file_exists_on_github
-    loop = asyncio.get_running_loop()
-
-    if db_needs_sync:
-        lb_data = {"scores": db.get("scores", {}), "weekly": db.get("weekly", {})}
-        await loop.run_in_executor(None, gh_write, FILE_LEADERBOARD, lb_data)
-        db_needs_sync = False
-        logger.info(f"[{FILE_LEADERBOARD}] synced")
-
-    if sticker_data_needs_sync:
-        await loop.run_in_executor(None, gh_write, FILE_STICKERS, sticker_data)
-        sticker_data_needs_sync = False
-        sticker_file_exists_on_github = True
-        logger.info(f"[{FILE_STICKERS}] synced")
+    """No-op now — all writes (leaderboard, weekly, stickers) sync to MongoDB immediately at the point of change."""
+    pass
 
 async def periodic_sync():
-    """Background loop: flush dirty data to GitHub every 30s."""
+    """Kept as a no-op background loop for structural compatibility; all data now syncs immediately."""
     while True:
         await asyncio.sleep(30)
-        try:
-            await save_all_data()
-        except Exception as e:
-            logger.error(f"[periodic_sync] {e}")
 
 async def load_sticker_pack(bot, pack_name: str):
-    """
-    Fetch a sticker pack's file_ids from Telegram and store them in memory.
-    Marks sticker_data dirty so the single beluga_stickers.json file gets updated
-    (never creates a new file — same file is reused/updated every time).
-    """
-    global sticker_data_needs_sync
+    """Fetch a sticker pack's file_ids from Telegram, store in memory + MongoDB."""
     try:
         sticker_set = await bot.get_sticker_set(pack_name)
         file_ids = [s.file_id for s in sticker_set.stickers]
         sticker_data["packs"][pack_name] = file_ids
-        sticker_data_needs_sync = True
+        await sync_sticker_pack_to_mongo(pack_name)
         logger.info(f"Sticker pack loaded: {pack_name} ({len(file_ids)} stickers)")
     except Exception as e:
         logger.warning(f"Could not load sticker pack '{pack_name}': {e}")
@@ -343,10 +323,9 @@ async def load_sticker_pack(bot, pack_name: str):
 async def ban_sticker_pack(pack_name: str):
     """Add a pack to the banned list. Any sticker sent FROM this pack by any
     user in any group will be auto-deleted by the bot (see monitor())."""
-    global sticker_data_needs_sync
     if pack_name not in sticker_data["banned_packs"]:
         sticker_data["banned_packs"].append(pack_name)
-        sticker_data_needs_sync = True
+        await sync_banned_packs_to_mongo()
         logger.info(f"Sticker pack banned: {pack_name}")
 
 def is_pack_banned(pack_name: Optional[str]) -> bool:
@@ -363,7 +342,6 @@ async def get_random_sticker_from(pack_name: str) -> Optional[str]:
     return random.choice(stickers) if stickers else None
 
 async def get_random_sticker_any() -> Optional[str]:
-
     """Get a random sticker from ANY loaded, non-banned pack."""
     pool = []
     for pack_name, stickers in sticker_data.get("packs", {}).items():
@@ -414,28 +392,33 @@ def resolve_postimg_direct_url(page_url: str) -> Optional[str]:
 async def send_photo_safe(bot, chat_id, photo_url_or_page: str, caption: str = None,
                            parse_mode=None, reply_markup=None) -> bool:
     """
-    Crash-proof photo sender. Resolves postimg.cc viewer pages to a direct
-    URL automatically, tries the send, and on ANY failure (bad link, network
-    hiccup, Telegram rejecting the URL) falls back to sending the caption as
-    plain text instead — the bot NEVER breaks just because an image failed
-    to load. Returns True if a photo was actually sent, False if it fell
-    back to text (or sent nothing because there was no caption either).
+    Crash-proof photo sender. Fetches the image bytes server-side (bypasses
+    sites like postimg.cc that block Telegram's own URL fetcher with a 403)
+    and uploads the raw bytes directly. Falls back to plain URL passthrough,
+    then to text-only, so the bot NEVER breaks just because an image failed.
     """
     direct_url = photo_url_or_page
     if "postimg.cc/" in photo_url_or_page and "/i.postimg.cc/" not in photo_url_or_page:
         resolved = resolve_postimg_direct_url(photo_url_or_page)
-        if resolved:
-            direct_url = resolved
-        else:
-            direct_url = None
+        direct_url = resolved if resolved else photo_url_or_page
 
     if direct_url:
+        try:
+            r = requests.get(direct_url, headers=G_HDR, timeout=10)
+            if r.status_code == 200 and r.content:
+                photo_bytes = io.BytesIO(r.content)
+                photo_bytes.name = "image.jpg"
+                await bot.send_photo(chat_id=chat_id, photo=photo_bytes, caption=caption,
+                                      parse_mode=parse_mode, reply_markup=reply_markup)
+                return True
+        except Exception as e:
+            logger.warning(f"[send_photo_safe] Byte fetch/upload failed ({e}), trying URL passthrough.")
         try:
             await bot.send_photo(chat_id=chat_id, photo=direct_url, caption=caption,
                                   parse_mode=parse_mode, reply_markup=reply_markup)
             return True
         except Exception as e:
-            logger.warning(f"[send_photo_safe] Photo send failed ({e}), falling back to text.")
+            logger.warning(f"[send_photo_safe] URL passthrough also failed ({e}), falling back to text.")
 
     if caption:
         try:
@@ -443,6 +426,7 @@ async def send_photo_safe(bot, chat_id, photo_url_or_page: str, caption: str = N
         except Exception as e:
             logger.error(f"[send_photo_safe] Text fallback also failed: {e}")
     return False
+
 
 def q_hash(q: str) -> str:
     return hashlib.md5(q.lower().strip().encode()).hexdigest()[:12]
@@ -474,14 +458,13 @@ def analyze_sentiment(text: str) -> tuple:
         return 0.0, "🐾"
 
 def bump_score(cid: str, uid: str, name: str, delta: int) -> int:
-    """Synchronous in-memory score update + dirty flag (no I/O)."""
-    global db_needs_sync
+    """Synchronous in-memory score update. Caller is responsible for calling
+    sync_leaderboard_chat_to_mongo(cid) afterward to persist to MongoDB."""
     db.setdefault("scores", {}).setdefault(cid, {})
     e = db["scores"][cid].get(uid, {"name": name, "user_id": int(uid) if uid.lstrip("-").isdigit() else 0, "score": 0})
     e["name"] = name
     e["score"] = max(0, e["score"] + delta)
     db["scores"][cid][uid] = e
-    db_needs_sync = True
     return e["score"]
 
 GROQ_MODEL = "llama-3.3-70b-versatile"
@@ -1211,6 +1194,7 @@ async def poll_answer_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         cid, uid = str(info["chat_id"]), str(ans.user.id)
         name = (ans.user.first_name or "?")[:30]
         bump_score(cid, uid, name, +10)
+        await sync_leaderboard_chat_to_mongo(cid)
     except Exception:
         pass
 
@@ -1252,11 +1236,10 @@ async def lb_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
 async def nw_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """
     New Week reset:
-    1. Read CURRENT in-memory scores (already loaded from beluga_leaderboard.json at startup).
-    2. Compute top 3 -> store as this chat's "weekly" champions.
+    1. Read CURRENT in-memory scores for this chat.
+    2. Compute top 3 -> store as this chat's "weekly" champions (kept, not reset).
     3. Wipe this chat's scores.
-    4. Mark dirty -> periodic_sync() writes everything back into the SAME
-       beluga_leaderboard.json file (no new file created).
+    4. Push both changes to MongoDB immediately.
     """
     if not u.message:
         return
@@ -1264,7 +1247,6 @@ async def nw_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         if not is_owner(u.effective_user.id if u.effective_user else 0):
             await u.message.reply_text("🚫 Owner only.")
             return
-        global db_needs_sync
         cid = str(u.effective_chat.id)
         lb = sorted(db.get("scores", {}).get(cid, {}).values(), key=lambda x: x.get("score", 0), reverse=True)
         seen_ids = set()
@@ -1273,7 +1255,8 @@ async def nw_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         wk_label = datetime.now().strftime("%d %b %Y")
         db.setdefault("weekly", {})[cid] = {"top3": top3, "week_label": wk_label}
         db["scores"][cid] = {}
-        db_needs_sync = True
+        await sync_weekly_to_mongo(cid)
+        await sync_leaderboard_chat_to_mongo(cid)
 
         announce = ["🏆🎉 *NEW WEEK!* 🎉🏆", f"\n_Week: {wk_label}_\n", "👑 *Champions:*\n"]
         announce.extend([f"{MEDALS[i]} *{e['name']}* — {e['score']:,} pts" for i, e in enumerate(top3)])
@@ -1302,6 +1285,7 @@ async def pump_dump_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         delta = +amount if cmd == "pump" else -amount
         target, cid = u.message.reply_to_message.from_user, str(u.effective_chat.id)
         new_sc = bump_score(cid, str(target.id), (target.first_name or "User")[:30], delta)
+        await sync_leaderboard_chat_to_mongo(cid)
         emoji = "🚀" if cmd == "pump" else "📉"
         sign = "+" if delta > 0 else ""
         await u.message.reply_text(
@@ -1400,6 +1384,7 @@ async def gm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             users.append({"id": user_id, "name": u_name, "time": utime})
             gm_tracker[cid] = (msg_id, users, date_str)
             bump_score(str(q.message.chat_id), user_id, u_name, +50)
+            await sync_leaderboard_chat_to_mongo(str(q.message.chat_id))
             try:
                 new_cap = _build_gm_caption(users, date_str)
                 kb = InlineKeyboardMarkup([[InlineKeyboardButton("GM 🥱", callback_data=f"gm:attend:{cid}")]])
@@ -1593,6 +1578,7 @@ async def ttt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             winner_uid = str(g["x_id"]) if ws == TTT_X else str(g["o_id"] if not g["vs_bot"] else -1)
             if winner_uid and winner_uid != "-1":
                 bump_score(str(cid), winner_uid, g["winner_name"], +10)
+                await sync_leaderboard_chat_to_mongo(str(cid))
             try: await q.edit_message_text(ttt_build_text(g), parse_mode=ParseMode.MARKDOWN, reply_markup=ttt_build_keyboard(board, disabled=True))
             except Exception: pass
             for uid in [str(g["x_id"]), str(g["o_id"])]: user_in_game.pop(uid, None)
@@ -1687,6 +1673,7 @@ async def run_mine_timer(c, gkey):
             if td["remaining"] <= 0:
                 g["status"] = "timeout"
                 new_sc = bump_score(str(cid), g["uid"], g["name"], -5)
+                await sync_leaderboard_chat_to_mongo(str(cid))
                 try:
                     await c.bot.edit_message_caption(chat_id=cid, message_id=msg_id, caption=mine_build_text(g, 0) + f"\n\nBalance: *{new_sc:,} pts*", parse_mode=ParseMode.MARKDOWN, reply_markup=_mine_board_keyboard(gkey, g["state"], g["revealed"], disabled=True))
                 except Exception:
@@ -1735,6 +1722,7 @@ async def mine_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 g["status"] = "lost"
                 mine_timers.pop(gkey, None)
                 new_sc = bump_score(cid, g["uid"], g["name"], -5)
+                await sync_leaderboard_chat_to_mongo(cid)
                 try: await q.edit_message_caption(caption=mine_build_text(g, 0) + f"\n\nBalance: *{new_sc:,} pts*", parse_mode=ParseMode.MARKDOWN, reply_markup=_mine_board_keyboard(gkey, g["state"], g["revealed"], disabled=True))
                 except Exception: pass
                 mine_games.pop(gkey, None)
@@ -1748,6 +1736,7 @@ async def mine_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     g["status"] = "won"
                     mine_timers.pop(gkey, None)
                     new_sc = bump_score(cid, g["uid"], g["name"], +700)
+                    await sync_leaderboard_chat_to_mongo(cid)
                     try: await q.edit_message_caption(caption=mine_build_text(g, 0) + f"\n\nBalance: *{new_sc:,} pts*", parse_mode=ParseMode.MARKDOWN, reply_markup=_mine_board_keyboard(gkey, g["state"], g["revealed"], disabled=True))
                     except Exception: pass
                     mine_games.pop(gkey, None)
@@ -1827,6 +1816,23 @@ def google_search(query):
         pass
     return out
 
+def google_image_search(query: str) -> Optional[str]:
+    """Scrapes a single relevant image URL from Google Images for the query. Best-effort, returns None on failure."""
+    try:
+        r = requests.get(
+            f"https://www.google.com/search?q={urllib.parse.quote_plus(query)}&tbm=isch",
+            headers=G_HDR, timeout=10,
+        )
+        if r.status_code != 200:
+            return None
+        matches = re.findall(r'\["(https://[^"]+\.(?:jpg|jpeg|png|webp))"', r.text)
+        for url in matches:
+            if "gstatic.com" not in url:
+                return url
+        return matches[0] if matches else None
+    except Exception:
+        return None
+
 async def web_summarise(query, wiki, goog, system_prompt, max_tok=500):
     ctx = []
     if goog["ai_answer"]: ctx.append(f"Google Featured Answer: {goog['ai_answer']}")
@@ -1887,20 +1893,8 @@ async def _screenshot_website(u: Update, c: ContextTypes.DEFAULT_TYPE, url: str)
             logger.error(f"[_screenshot_website] {e}")
 
 
-async def search_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """
-    /search <query> — Wikipedia (official REST API) + web search, condensed
-    into a 60-100 word AI summary with the page's official image attached.
-    /search <website link> — sends a screenshot of that site instead of
-    running a text search at all.
-    """
-    if not u.message:
-        return
-    parts = u.message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await u.message.reply_text("🐱 Usage: `/search query` or `/search https://example.com`", parse_mode=ParseMode.MARKDOWN)
-        return
-    query = parts[1].strip()
+async def _run_search_and_reply(u: Update, c: ContextTypes.DEFAULT_TYPE, query: str):
+    """Core search logic shared by /search and the bare 'search X' / 'google X' keyword trigger."""
     cid = u.effective_chat.id
 
     if _is_url(query):
@@ -1922,6 +1916,11 @@ async def search_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             image_url = await loop.run_in_executor(None, wiki_page_image, wiki["title"])
         except Exception:
             image_url = None
+    if not image_url:
+        try:
+            image_url = await loop.run_in_executor(None, google_image_search, query)
+        except Exception:
+            image_url = None
 
     summary = await web_summarise(
         query, wiki, goog,
@@ -1931,9 +1930,12 @@ async def search_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         max_tok=180,
     )
 
+    if not summary and wiki.get("intro"):
+        summary = wiki["intro"][:600]
+
     if not summary:
         try:
-            await sm.edit_text("😿 No results found.")
+            await sm.edit_text("😿 No results found. Try rephrasing?")
         except Exception:
             pass
         return
@@ -1953,7 +1955,22 @@ async def search_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     try:
         await u.message.reply_text(caption, parse_mode=ParseMode.MARKDOWN, reply_to_message_id=u.message.message_id)
     except Exception as e:
-        logger.error(f"[search_handler] Final text send failed: {e}")
+        logger.error(f"[_run_search_and_reply] Final text send failed: {e}")
+
+
+async def search_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """
+    /search <query> — Wikipedia (official REST API) + web search, condensed
+    into a 60-100 word AI summary with an image attached.
+    /search <website link> — sends a screenshot of that site instead.
+    """
+    if not u.message:
+        return
+    parts = u.message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await u.message.reply_text("🐱 Usage: `/search query` or `/search https://example.com`", parse_mode=ParseMode.MARKDOWN)
+        return
+    await _run_search_and_reply(u, c, parts[1].strip())
 
 async def bananalogic_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message:
@@ -2185,6 +2202,19 @@ async def monitor_private_chat(u: Update, c: ContextTypes.DEFAULT_TYPE):
         if not text or text.startswith("/"):
             return
 
+        ss_match = re.match(r"^ss\s+(\S+)", text, re.IGNORECASE)
+        if ss_match:
+            target = ss_match.group(1)
+            if not target.startswith("http"):
+                target = "https://" + target
+            await _screenshot_website(u, c, target)
+            return
+
+        search_match = re.match(r"^(?:search|google)\s+(.+)", text, re.IGNORECASE)
+        if search_match:
+            await _run_search_and_reply(u, c, search_match.group(1).strip())
+            return
+
         uid = u.effective_user.id
         user_name = get_user_name(u.effective_user)
         memory = await get_user_memory(uid)
@@ -2286,7 +2316,26 @@ async def monitor_group(u: Update, c: ContextTypes.DEFAULT_TYPE):
                     pass
 
         text = (u.message.text or u.message.caption or "").strip()
-        if not text or text.startswith("/"):
+        if not text:
+            bot_status["message_count"] += 1
+            return
+
+        ss_match = re.match(r"^ss\s+(\S+)", text, re.IGNORECASE)
+        if ss_match:
+            target = ss_match.group(1)
+            if not target.startswith("http"):
+                target = "https://" + target
+            await _screenshot_website(u, c, target)
+            bot_status["message_count"] += 1
+            return
+
+        search_match = re.match(r"^(?:search|google)\s+(.+)", text, re.IGNORECASE)
+        if search_match:
+            await _run_search_and_reply(u, c, search_match.group(1).strip())
+            bot_status["message_count"] += 1
+            return
+
+        if text.startswith("/"):
             bot_status["message_count"] += 1
             return
 
@@ -2413,8 +2462,10 @@ WHAT_I_CAN_DO_TEXT = (
 
 
 def _start_main_menu_kb() -> InlineKeyboardMarkup:
+    bot_username = bot_status.get("username", "")
+    kidnap_url = f"https://t.me/{bot_username}?startgroup=true&admin=post_messages+edit_messages+delete_messages+restrict_members+invite_users+pin_messages" if bot_username else KIDNAP_ME_URL
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🫦 KIDNAP ME 🫦", url=KIDNAP_ME_URL)],
+        [InlineKeyboardButton("🫦 KIDNAP ME 🫦", url=kidnap_url)],
         [InlineKeyboardButton("💖 UPDATES CHANNEL 💖", url=UPDATES_CHANNEL)],
         [InlineKeyboardButton("😼 WHAT I CAN DO ?", callback_data="menu:whatido")],
         [InlineKeyboardButton("👀 WORKFLOW", callback_data="menu:workflow")],
@@ -2487,350 +2538,102 @@ async def start_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 
-MEMORY_FOLDER = "memory"
+MEMORY_TTL_MESSAGES = 6
 
-_memory_folder_confirmed = False
-_memory_folder_lock = asyncio.Lock()
-_memory_rate_limit_reset_at: Optional[float] = None
-
-def _memory_file_path(user_id) -> str:
-    return f"{MEMORY_FOLDER}/{user_id}.json"
-
-async def _memory_respect_rate_limit():
-    global _memory_rate_limit_reset_at
-    if _memory_rate_limit_reset_at:
-        now = datetime.now().timestamp()
-        wait = _memory_rate_limit_reset_at - now
-        if wait > 0:
-            logger.warning(f"[memory] Rate limited — waiting {wait:.1f}s before next call.")
-            await asyncio.sleep(min(wait, 30))
-        _memory_rate_limit_reset_at = None
-
-def _memory_note_rate_limit(headers) -> None:
-    global _memory_rate_limit_reset_at
-    try:
-        remaining = int(headers.get("X-RateLimit-Remaining", "1"))
-        reset_ts = int(headers.get("X-RateLimit-Reset", "0"))
-        if remaining <= 1 and reset_ts:
-            _memory_rate_limit_reset_at = float(reset_ts)
-    except Exception:
-        pass
-
-async def _memory_gh_get_file(session: aiohttp.ClientSession, path: str):
-    """Fetch a file's content + sha. Returns (parsed_dict_or_None, sha_or_None). 404 is expected/normal."""
-    await _memory_respect_rate_limit()
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
-    try:
-        async with session.get(url, headers=headers, params={"ref": GITHUB_BRANCH}, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            _memory_note_rate_limit(resp.headers)
-            if resp.status == 200:
-                data = await resp.json()
-                sha = data.get("sha")
-                raw = base64.b64decode(data.get("content", "")).decode("utf-8")
-                try:
-                    parsed = json.loads(raw) if raw.strip() else {}
-                except json.JSONDecodeError:
-                    logger.error(f"[memory] Corrupt JSON in {path}, treating as empty.")
-                    parsed = {}
-                return parsed, sha
-            elif resp.status == 404:
-                return None, None
-            elif resp.status == 403:
-                logger.error(f"[memory] 403 Forbidden reading {path} — check token scope or rate limit.")
-                return None, None
-            else:
-                body = await resp.text()
-                logger.error(f"[memory] GET {path} failed: {resp.status} {body[:200]}")
-                return None, None
-    except asyncio.TimeoutError:
-        logger.error(f"[memory] Timeout reading {path} from GitHub.")
-        return None, None
-    except Exception as e:
-        logger.error(f"[memory] Error reading {path}: {e}")
-        return None, None
-
-async def _memory_gh_put_file(session: aiohttp.ClientSession, path: str, content_dict: dict,
-                               commit_message: str, sha: Optional[str] = None) -> bool:
-    """Create or update a file. If sha is None but the file already exists (422), retries once as an update."""
-    await _memory_respect_rate_limit()
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
-    content_str = json.dumps(content_dict, indent=2, ensure_ascii=False, sort_keys=True)
-    content_b64 = base64.b64encode(content_str.encode("utf-8")).decode("utf-8")
-    payload = {"message": commit_message, "content": content_b64, "branch": GITHUB_BRANCH}
-    if sha:
-        payload["sha"] = sha
-    try:
-        async with session.put(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            _memory_note_rate_limit(resp.headers)
-            if resp.status in (200, 201):
-                return True
-            elif resp.status == 409:
-                logger.warning(f"[memory] Conflict (409) writing {path} — sha was stale.")
-                return False
-            elif resp.status == 422 and sha is None:
-                logger.info(f"[memory] {path} already exists, retrying as update.")
-                _, existing_sha = await _memory_gh_get_file(session, path)
-                if existing_sha:
-                    return await _memory_gh_put_file(session, path, content_dict, commit_message, sha=existing_sha)
-                return False
-            else:
-                body = await resp.text()
-                logger.error(f"[memory] PUT {path} failed: {resp.status} {body[:200]}")
-                return False
-    except asyncio.TimeoutError:
-        logger.error(f"[memory] Timeout writing {path} to GitHub.")
-        return False
-    except Exception as e:
-        logger.error(f"[memory] Error writing {path}: {e}")
-        return False
-
-async def _memory_gh_delete_file(session: aiohttp.ClientSession, path: str, sha: str, commit_message: str) -> bool:
-    await _memory_respect_rate_limit()
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
-    payload = {"message": commit_message, "sha": sha, "branch": GITHUB_BRANCH}
-    try:
-        async with session.delete(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            _memory_note_rate_limit(resp.headers)
-            if resp.status in (200, 204):
-                return True
-            body = await resp.text()
-            logger.error(f"[memory] DELETE {path} failed: {resp.status} {body[:200]}")
-            return False
-    except asyncio.TimeoutError:
-        logger.error(f"[memory] Timeout deleting {path} from GitHub.")
-        return False
-    except Exception as e:
-        logger.error(f"[memory] Error deleting {path}: {e}")
-        return False
-
-async def _memory_list_files(session: aiohttp.ClientSession) -> list:
-    """Directory-listing form of the Contents API: GET on a folder path returns an array of entries."""
-    await _memory_respect_rate_limit()
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{MEMORY_FOLDER}"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
-    try:
-        async with session.get(url, headers=headers, params={"ref": GITHUB_BRANCH}, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            _memory_note_rate_limit(resp.headers)
-            if resp.status == 200:
-                entries = await resp.json()
-                return [e for e in entries if e.get("type") == "file" and e.get("name", "").endswith(".json")]
-            elif resp.status == 404:
-                return []
-            else:
-                body = await resp.text()
-                logger.error(f"[memory] Listing {MEMORY_FOLDER}/ failed: {resp.status} {body[:200]}")
-                return []
-    except Exception as e:
-        logger.error(f"[memory] Error listing {MEMORY_FOLDER}/: {e}")
-        return []
-
-async def _memory_ensure_repo_reachable(session: aiohttp.ClientSession) -> None:
-    """Confirm GitHub repo access once per process (clear log message if misconfigured)."""
-    global _memory_folder_confirmed
-    if _memory_folder_confirmed:
-        return
-    async with _memory_folder_lock:
-        if _memory_folder_confirmed:
-            return
-        if not (GITHUB_TOKEN and GITHUB_REPO):
-            logger.error("[memory] GITHUB_TOKEN / GITHUB_REPO not configured — memory disabled.")
-            return
-        url = f"https://api.github.com/repos/{GITHUB_REPO}"
-        headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
-        try:
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    logger.info(f"[memory] Connected to repo {GITHUB_REPO} — memory files live under '{MEMORY_FOLDER}/'.")
-                    _memory_folder_confirmed = True
-                elif resp.status == 404:
-                    logger.error(f"[memory] Repo {GITHUB_REPO} not found — check GITHUB_REPO.")
-                elif resp.status == 401:
-                    logger.error("[memory] GitHub auth failed (401) — check GITHUB_TOKEN.")
-                else:
-                    logger.warning(f"[memory] Unexpected status {resp.status} confirming repo access.")
-        except Exception as e:
-            logger.error(f"[memory] Could not reach GitHub to confirm repo: {e}")
-
-def _memory_is_configured() -> bool:
-    ok = bool(GITHUB_TOKEN and GITHUB_REPO)
-    if not ok:
-        logger.error("[memory] GITHUB_TOKEN / GITHUB_REPO not fully configured — memory disabled.")
-    return ok
+def _mongo_available() -> bool:
+    return mongo_memory_col is not None
 
 async def get_user_memory(user_id) -> dict:
-    """
-    Fetch a user's long-term memory dict (empty {} if none exists yet).
-    Call this right before building the AI prompt so Beluga can recall
-    what it already knows about the user. Memory persists indefinitely.
-    """
-    if not _memory_is_configured():
-        return {}
-    path = _memory_file_path(user_id)
-    async with aiohttp.ClientSession() as session:
-        await _memory_ensure_repo_reachable(session)
-        data, _sha = await _memory_gh_get_file(session, path)
-        return data if data is not None else {}
+    """Fetch a user's rolling chat memory from MongoDB. Returns {"messages": []} if none/unavailable."""
+    if not _mongo_available():
+        return {"messages": []}
+    try:
+        doc = await mongo_memory_col.find_one({"_id": str(user_id)})
+        return doc if doc else {"messages": []}
+    except Exception as e:
+        logger.error(f"[mongo get_user_memory] {e}")
+        return {"messages": []}
 
 async def save_user_memory(user_id, memory_data: dict) -> bool:
-    """Overwrite a user's ENTIRE memory file with memory_data (fetches sha first if it exists)."""
-    if not _memory_is_configured():
+    """Overwrite a user's full memory doc in MongoDB."""
+    if not _mongo_available():
         return False
-    path = _memory_file_path(user_id)
-    async with aiohttp.ClientSession() as session:
-        await _memory_ensure_repo_reachable(session)
-        _, sha = await _memory_gh_get_file(session, path)
-        payload = dict(memory_data)
-        payload["_last_updated"] = datetime.now().isoformat()
-        payload.setdefault("_user_id", str(user_id))
-        commit_msg = f"Update memory for user {user_id} [skip ci]" if sha else f"Create memory for user {user_id} [skip ci]"
-        success = await _memory_gh_put_file(session, path, payload, commit_msg, sha=sha)
-        if success:
-            logger.info(f"[memory] Saved memory for user {user_id} ({len(payload)} keys).")
-        return success
-
-async def update_user_memory(user_id, key: str, value) -> bool:
-    """Update (or add) a SINGLE key in a user's memory, preserving everything else already stored."""
-    if not _memory_is_configured():
+    try:
+        await mongo_memory_col.replace_one({"_id": str(user_id)}, memory_data, upsert=True)
+        return True
+    except Exception as e:
+        logger.error(f"[mongo save_user_memory] {e}")
         return False
-    path = _memory_file_path(user_id)
-    async with aiohttp.ClientSession() as session:
-        await _memory_ensure_repo_reachable(session)
-        data, sha = await _memory_gh_get_file(session, path)
-        if data is None:
-            data, sha = {}, None
-        data[key] = value
-        data["_last_updated"] = datetime.now().isoformat()
-        data.setdefault("_user_id", str(user_id))
-        commit_msg = f"Update memory key '{key}' for user {user_id} [skip ci]"
-        success = await _memory_gh_put_file(session, path, data, commit_msg, sha=sha)
-        if success:
-            logger.info(f"[memory] Updated key '{key}' for user {user_id}.")
-        return success
-
-CHAT_HISTORY_MAX_TURNS = 10
 
 async def append_chat_history(user_id, user_text: str, bot_reply: str) -> bool:
     """
-    Append one (user message, Beluga's reply) turn to a user's persistent
-    chat history, trimming to the most recent CHAT_HISTORY_MAX_TURNS turns.
-    Safe to call after every AI-answered message — cheap no-op if GitHub
-    isn't configured.
+    Append one (user, bot) exchange to a user's rolling 6-message memory.
+    Once the count exceeds 6 messages, the entire history for that user is
+    auto-cleared (per spec) so the next message starts fresh.
     """
-    if not _memory_is_configured():
+    if not _mongo_available():
         return False
-    path = _memory_file_path(user_id)
-    async with aiohttp.ClientSession() as session:
-        await _memory_ensure_repo_reachable(session)
-        data, sha = await _memory_gh_get_file(session, path)
-        if data is None:
-            data, sha = {}, None
-        history = data.get("chat_history", [])
-        history.append({
-            "t": datetime.now().isoformat(),
-            "user": user_text[:300],
-            "bot": bot_reply[:300],
-        })
-        data["chat_history"] = history[-CHAT_HISTORY_MAX_TURNS:]
-        data["_last_updated"] = datetime.now().isoformat()
-        data.setdefault("_user_id", str(user_id))
-        commit_msg = f"Append chat history for user {user_id} [skip ci]"
-        success = await _memory_gh_put_file(session, path, data, commit_msg, sha=sha)
-        return success
+    try:
+        doc = await mongo_memory_col.find_one({"_id": str(user_id)}) or {"messages": []}
+        messages = doc.get("messages", [])
+        messages.append({"role": "user", "text": user_text[:500], "ts": datetime.utcnow().isoformat()})
+        messages.append({"role": "bot", "text": bot_reply[:500], "ts": datetime.utcnow().isoformat()})
+        if len(messages) > 6:
+            messages = []
+        await mongo_memory_col.replace_one({"_id": str(user_id)}, {"_id": str(user_id), "messages": messages}, upsert=True)
+        return True
+    except Exception as e:
+        logger.error(f"[mongo append_chat_history] {e}")
+        return False
 
 def build_chat_history_context(memory: dict) -> str:
-    """
-    Turn a user's stored chat_history into a short block the AI can read
-    as prior conversation context. Returns "" if there's no history yet.
-    """
-    history = memory.get("chat_history", [])
-    if not history:
+    """Turn stored rolling messages into a short context block for the AI prompt."""
+    messages = memory.get("messages", [])
+    if not messages:
         return ""
     lines = []
-    for turn in history[-CHAT_HISTORY_MAX_TURNS:]:
-        u = turn.get("user", "").strip()
-        b = turn.get("bot", "").strip()
-        if u:
-            lines.append(f"User previously said: {u}")
-        if b:
-            lines.append(f"You (Beluga) previously replied: {b}")
-    if not lines:
-        return ""
-    return "\n\nPrevious conversation with this user (for context, don't repeat verbatim):\n" + "\n".join(lines)
-
-async def delete_user_memory(user_id) -> bool:
-    """Permanently delete a single user's memory file. Returns True even if there was nothing to delete."""
-    if not _memory_is_configured():
-        return False
-    path = _memory_file_path(user_id)
-    async with aiohttp.ClientSession() as session:
-        await _memory_ensure_repo_reachable(session)
-        _, sha = await _memory_gh_get_file(session, path)
-        if not sha:
-            return True
-        success = await _memory_gh_delete_file(session, path, sha, f"Delete memory for user {user_id} [skip ci]")
-        if success:
-            logger.info(f"[memory] Deleted memory for user {user_id}.")
-        return success
-
-async def clear_all_memory() -> tuple:
-    """
-    Wipe the ENTIRE memory store — every user's memory/<id>.json file is
-    permanently deleted from GitHub. Returns (deleted_count, failed_count).
-    No permission check here by design — gating belongs at the command
-    layer (see clearmemory_handler below, which is owner-only).
-    """
-    if not _memory_is_configured():
-        return (0, 0)
-    async with aiohttp.ClientSession() as session:
-        await _memory_ensure_repo_reachable(session)
-        entries = await _memory_list_files(session)
-        if not entries:
-            logger.info("[memory] clear_all_memory: no memory files found — nothing to clear.")
-            return (0, 0)
-        deleted, failed = 0, 0
-        for entry in entries:
-            ok = await _memory_gh_delete_file(session, entry["path"], entry["sha"], f"Clear all memory: remove {entry['name']} [skip ci]")
-            if ok:
-                deleted += 1
-            else:
-                failed += 1
-        logger.info(f"[memory] clear_all_memory: deleted {deleted} file(s), {failed} failure(s).")
-        return (deleted, failed)
+    for m in messages[-6:]:
+        who = "User" if m.get("role") == "user" else "You (Beluga)"
+        lines.append(f"{who}: {m.get('text', '')}")
+    return "\n\nRecent conversation:\n" + "\n".join(lines)
 
 def build_memory_context(memory: dict) -> str:
-    """
-    Turn a memory dict into a short text block to append to an AI system
-    prompt. Internal bookkeeping keys (prefixed with "_") are skipped.
-    Returns "" if there's nothing meaningful to recall yet.
-    """
-    lines = [f"- {k}: {v}" for k, v in memory.items() if not str(k).startswith("_")]
-    if not lines:
-        return ""
-    return "\n\nWhat you remember about this user:\n" + "\n".join(lines)
+    """Kept for compatibility with callers; rolling history covers this now."""
+    return ""
+
+async def delete_user_memory(user_id) -> bool:
+    if not _mongo_available():
+        return False
+    try:
+        await mongo_memory_col.delete_one({"_id": str(user_id)})
+        return True
+    except Exception as e:
+        logger.error(f"[mongo delete_user_memory] {e}")
+        return False
+
+async def clear_all_memory() -> tuple:
+    """Wipe every user's memory doc from MongoDB. Returns (deleted_count, failed)."""
+    if not _mongo_available():
+        return (0, 1)
+    try:
+        result = await mongo_memory_col.delete_many({})
+        return (result.deleted_count, 0)
+    except Exception as e:
+        logger.error(f"[mongo clear_all_memory] {e}")
+        return (0, 1)
 
 async def clearmemory_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """
-    Owner-only. Wipes EVERY user's memory file from GitHub.
-    Gated by the existing OWNER_ID env var / is_owner() helper — same
-    pattern as /nw, /gm, /pump, /dump, /block.
-    """
     if not u.message:
         return
     if not is_owner(u.effective_user.id if u.effective_user else 0):
         await u.message.reply_text("🚫 Owner only.")
         return
-
     status_msg = await u.message.reply_text("CLEARING MEMORY 🧹......")
     deleted, failed = await clear_all_memory()
-
     if failed == 0:
-        result_text = f"✅ Memory cleared! Removed {deleted} file(s) from GitHub."
+        result_text = f"✅ Memory cleared! Removed {deleted} user record(s) from MongoDB."
     else:
-        result_text = f"⚠️ Cleared {deleted} file(s), but {failed} failed to delete — check logs."
-
+        result_text = "⚠️ MongoDB not available or clear failed — check logs."
     try:
         await status_msg.edit_text(f"CLEARING MEMORY 🧹......\n\n{result_text}")
     except Exception:
