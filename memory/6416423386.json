@@ -1,12 +1,7 @@
 {
-  "_last_updated": "2026-08-17T18:27:23.220157",
+  "_last_updated": "2026-08-18T04:48:22.611618",
   "_user_id": "6416423386",
   "chat_history": [
-    {
-      "bot": "OLDY, itni gussa kyu hai? \nTumhe kisne ya kya kharaab laga diya?",
-      "t": "2026-08-16T03:20:39.801995",
-      "user": "Beluga betichodh"
-    },
     {
       "bot": "OLDY, itni gussa kyu hai, kya hua? \nTumhe kisne ya kya kharaab laga diya?",
       "t": "2026-08-16T03:20:58.613998",
@@ -51,6 +46,11 @@
       "bot": "Hey OLDY! 🐾",
       "t": "2026-08-17T18:27:23.220146",
       "user": "Lund le"
+    },
+    {
+      "bot": "Hey OLDY! 🐾",
+      "t": "2026-08-18T04:48:22.611608",
+      "user": "Hi beluga"
     }
   ]
 }
