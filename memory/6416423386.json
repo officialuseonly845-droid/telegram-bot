@@ -1,12 +1,7 @@
 {
-  "_last_updated": "2026-08-18T04:48:52.766743",
+  "_last_updated": "2026-08-18T04:49:01.147817",
   "_user_id": "6416423386",
   "chat_history": [
-    {
-      "bot": "OLDY, tum yeh sawal kyu puch rahe ho? \nTumhe kya lagta hai, main aisa kuch kar sakta hoon?",
-      "t": "2026-08-16T03:21:40.438388",
-      "user": "How to do sex"
-    },
     {
       "bot": "OLDY, kya hua, itni gussa kyu aa rahi hai? \nTumhe kisne ya kya kharaab laga diya?",
       "t": "2026-08-16T03:21:55.846101",
@@ -51,6 +46,11 @@
       "bot": "Hey OLDY! 🐾",
       "t": "2026-08-18T04:48:52.766728",
       "user": "Kya"
+    },
+    {
+      "bot": "Hey OLDY! 🐾",
+      "t": "2026-08-18T04:49:01.147806",
+      "user": "Beluga helo"
     }
   ]
 }
