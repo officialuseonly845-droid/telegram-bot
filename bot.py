@@ -777,22 +777,26 @@ async def stats_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if top_users:
         medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
         top_lines = "\n".join(
-            f"{medals[i]} __{tagged_name(cid, uid, e['name'])}__ — *{e['count']:,}* msgs"
+            f"{medals[i]}  __{e['name']}__\n     ✎ *{e['count']:,}* messages"
             for i, (uid, e) in enumerate(top_users)
         )
     else:
         top_lines = "_No activity yet today._"
 
     members_line = f"`{member_count:,}`" if isinstance(member_count, int) else f"`{member_count}`"
+    today_label = datetime.now().strftime("%d %b %Y")
     text = (
-        f"📊 *GROUP STATISTICS* 📊\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"👥 *Total Members:* {members_line}\n"
-        f"💬 *Messages Today:* `{d['messages']:,}`\n"
-        f"🔇 *Mutes Today:* `{d['mutes']:,}`   🔨 *Bans Today:* `{d['bans']:,}`\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🏆 *Most Active Today*\n{top_lines}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"┏━━━━━━━━━━━━━━━━━━┓\n"
+        f"┃   📊 *GROUP STATISTICS*   ┃\n"
+        f"┗━━━━━━━━━━━━━━━━━━┛\n"
+        f"_{today_label}_\n\n"
+        f"👥 *Total Members*\n     {members_line}\n\n"
+        f"💬 *Messages Today*\n     `{d['messages']:,}`\n\n"
+        f"🔇 *Mutes Today*  ·  🔨 *Bans Today*\n     `{d['mutes']:,}`  ·  `{d['bans']:,}`\n\n"
+        f"─────────────────────\n"
+        f"🏆 *MOST ACTIVE TODAY*\n\n"
+        f"{top_lines}\n\n"
+        f"─────────────────────\n"
         f"_POWERED BY BELUGA.PY_ 🎀"
     )
     await u.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
@@ -864,12 +868,16 @@ async def shop_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
 
 async def mytag_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """/mytag — shows the cosmetic tag you currently have equipped, if any."""
+    """/mytag — shows your OFFICIAL Telegram member tag (live from Telegram, not a local copy)."""
     if not u.message or u.effective_chat.type == "private":
         await u.message.reply_text("🐱 `/mytag` only works inside a group.", parse_mode=ParseMode.MARKDOWN)
         return
-    cid, uid = str(u.effective_chat.id), str(u.effective_user.id)
-    tag = member_tags.get(cid, {}).get(uid)
+    try:
+        member = await c.bot.get_chat_member(u.effective_chat.id, u.effective_user.id)
+        tag = getattr(member, "tag", None)
+    except Exception as e:
+        logger.error(f"[mytag] {e}")
+        tag = None
     if tag:
         await u.message.reply_text(f"🎀 Your current tag: *{tag}*", parse_mode=ParseMode.MARKDOWN)
     else:
@@ -892,6 +900,24 @@ async def shop_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer(f"😿 Not enough points! You have {current_pts:,}, need {tag['cost']:,}.", show_alert=True)
             return
 
+        # Set the REAL official Telegram member tag (shows next to their name
+        # in the actual group UI) — requires the bot to be an admin with the
+        # "Edit Member Tags" (can_manage_tags) right turned on.
+        try:
+            await context.bot.set_chat_member_tag(
+                chat_id=q.message.chat_id, user_id=q.from_user.id, tag=tag["label"],
+            )
+        except Exception as e:
+            logger.error(f"[shop_buy] set_chat_member_tag failed: {e}")
+            await q.answer(
+                "😿 I need the 'Edit Member Tags' admin permission to do this — "
+                "ask an admin to enable it for me!",
+                show_alert=True,
+            )
+            return
+
+        # Cache locally too, purely so our own /lb and /stats displays don't
+        # need an extra API call per row — the line above is the source of truth.
         member_tags.setdefault(cid, {})[uid] = tag["label"]
         await sync_tags_to_mongo(cid)
 
