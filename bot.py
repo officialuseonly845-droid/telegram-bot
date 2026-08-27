@@ -4,11 +4,12 @@ from typing import Optional
 from aiohttp import web
 import aiohttp
 from bs4 import BeautifulSoup
-from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyboardMarkup
+import uuid
+from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResultArticle, InputTextMessageContent, ChatPermissions
 from motor.motor_asyncio import AsyncIOMotorClient
 from telegram.ext import (
     Application as TGApp, CommandHandler, ContextTypes, MessageHandler, PollAnswerHandler,
-    CallbackQueryHandler, filters,
+    CallbackQueryHandler, TypeHandler, filters,
 )
 from telegram.constants import ParseMode
 from telegram.error import NetworkError, TimedOut, Forbidden, BadRequest, RetryAfter, Conflict
@@ -43,6 +44,7 @@ mongo_memory_col = mongo_db["chat_memory"] if mongo_db is not None else None
 mongo_leaderboard_col = mongo_db["leaderboard"] if mongo_db is not None else None
 mongo_weekly_col = mongo_db["weekly_winners"] if mongo_db is not None else None
 mongo_stickers_col = mongo_db["stickers"] if mongo_db is not None else None
+mongo_tags_col = mongo_db["member_tags"] if mongo_db is not None else None
 
 FILE_STICKERS = "beluga_stickers.json"
 
@@ -51,8 +53,55 @@ STICKER_PACK_SAFE = "t_me_staysafebelu_by_fStikBot"
 STICKER_PACK_ALT = "pybelu_by_fStikBot"
 
 bot_status = {"running": False, "start_time": datetime.now(), "message_count": 0, "error_count": 0, "api_calls": 0, "failed_apis": 0, "username": ""}
+away_mode_state = {"on": False}
 quiz_cooldown, active_polls, spam_tracker = {}, {}, {}
 db = {"scores": {}, "weekly": {}, "seen": {}, "counts": {}}
+
+# --- Anti-spam / anti-raid state ---
+raid_flags = {}        # cid(str) -> {uid(str): last_flood_timestamp}
+lockdown_state = {}     # cid(str) -> {"locking": bool, "active": bool, "prevent": bool}
+FLOOD_WINDOW_SEC = 3
+FLOOD_COUNT = 4
+RAID_WINDOW_SEC = 5
+RAID_USER_THRESHOLD = 3
+LOCK_COUNTDOWN_SEC = 10
+LOCK_DURATION_SEC = 120
+
+# --- Daily stats (messages/day, mutes/bans, most active users, milestones) ---
+daily_stats = {}  # cid(str) -> {"date": "YYYY-MM-DD", "messages": 0, "mutes": 0, "bans": 0, "user_counts": {uid: {"name":.., "count":0}}, "milestones_hit": set()}
+
+def get_daily_stats(cid: str) -> dict:
+    today = datetime.now().strftime("%Y-%m-%d")
+    d = daily_stats.get(cid)
+    if not d or d["date"] != today:
+        d = {"date": today, "messages": 0, "mutes": 0, "bans": 0, "user_counts": {}, "milestones_hit": set()}
+        daily_stats[cid] = d
+    return d
+
+# --- Tag shop (points -> cosmetic name tag, shown in leaderboard/stats — NOT an admin title) ---
+member_tags = {}  # cid(str) -> {uid(str): tag_label}
+TAG_SHOP = [
+    {"key": "CEO", "label": "CEO", "emoji": "👤", "cost": 7500, "color": "danger"},
+    {"key": "MANAGER", "label": "MANAGER", "emoji": "👨\u200d💼", "cost": 7000, "color": "danger"},
+    {"key": "ACTIVE", "label": "ACTIVE", "emoji": "😼", "cost": 4900, "color": "success"},
+    {"key": "HELPER", "label": "HELPER", "emoji": "👷", "cost": 3700, "color": "success"},
+]
+SHOP_IMAGE_URL = "https://postimg.cc/kR3myZ0S"
+
+def tagged_name(cid: str, uid: str, name: str) -> str:
+    """Prefixes a user's display name with their purchased shop tag, if any."""
+    tag = member_tags.get(cid, {}).get(uid)
+    return f"「{tag}」 {name}" if tag else name
+
+async def sync_tags_to_mongo(cid: str):
+    if mongo_tags_col is None:
+        return
+    try:
+        await mongo_tags_col.replace_one(
+            {"_id": cid}, {"_id": cid, "tags": member_tags.get(cid, {})}, upsert=True
+        )
+    except Exception as e:
+        logger.error(f"[mongo] sync_tags_to_mongo({cid}) failed: {e}")
 fun_db = {"gay_couple_log": {}}
 ttt_games, mine_games, user_in_game, game_timers, mine_timers, gm_tracker, gm_msg_lock = {}, {}, {}, {}, {}, {}, {}
 mine_play_stats = {}
@@ -263,6 +312,19 @@ async def load_persistent_data():
         sticker_data = {"packs": {}, "banned_packs": []}
         logger.warning("[mongo] MONGO_URL not set — stickers will not persist.")
 
+    global member_tags
+    if mongo_tags_col is not None:
+        try:
+            member_tags = {}
+            async for doc in mongo_tags_col.find({}):
+                member_tags[doc["_id"]] = doc.get("tags", {})
+            logger.info(f"[mongo] Member tags loaded ({len(member_tags)} chats)")
+        except Exception as e:
+            logger.error(f"[mongo] Member tags load failed: {e}")
+            member_tags = {}
+    else:
+        member_tags = {}
+
 async def sync_leaderboard_chat_to_mongo(cid: str):
     """Push one chat's current scores dict to MongoDB immediately."""
     if mongo_leaderboard_col is None:
@@ -443,6 +505,13 @@ def game_key(msg_id: int, cid: int) -> str:
 
 def is_owner(uid: int) -> bool:
     return OWNER_ID != 0 and uid == OWNER_ID
+
+async def is_group_admin(bot, chat_id, user_id) -> bool:
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        return member.status in ("administrator", "creator")
+    except Exception:
+        return False
 
 def get_user_name(user) -> str:
     if user and user.first_name:
@@ -649,6 +718,220 @@ async def ai_emoji(text: str) -> str:
     except Exception:
         pass
     return "😼"
+
+async def mute_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: /mute (as a reply to the target's message) — restricts them from sending anything in this chat."""
+    if not u.message or u.effective_chat.type == "private":
+        return
+    if not await is_group_admin(c.bot, u.effective_chat.id, u.effective_user.id):
+        await u.message.reply_text("🚫 Admins only.")
+        return
+    if not u.message.reply_to_message:
+        await u.message.reply_text("🐱 Reply to the person's message with `/mute`.", parse_mode=ParseMode.MARKDOWN)
+        return
+    target = u.message.reply_to_message.from_user
+    try:
+        await c.bot.restrict_chat_member(
+            u.effective_chat.id, target.id,
+            permissions=ChatPermissions(can_send_messages=False, can_send_audios=False, can_send_documents=False,
+                                         can_send_photos=False, can_send_videos=False, can_send_video_notes=False,
+                                         can_send_voice_notes=False, can_send_polls=False, can_send_other_messages=False),
+        )
+        get_daily_stats(str(u.effective_chat.id))["mutes"] += 1
+        await u.message.reply_text(f"🔇 *{get_user_name(target)}* has been muted.", parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        await u.message.reply_text(f"😿 Couldn't mute: `{str(e)[:100]}`", parse_mode=ParseMode.MARKDOWN)
+
+async def ban_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: /ban (as a reply to the target's message) — bans them from this chat."""
+    if not u.message or u.effective_chat.type == "private":
+        return
+    if not await is_group_admin(c.bot, u.effective_chat.id, u.effective_user.id):
+        await u.message.reply_text("🚫 Admins only.")
+        return
+    if not u.message.reply_to_message:
+        await u.message.reply_text("🐱 Reply to the person's message with `/ban`.", parse_mode=ParseMode.MARKDOWN)
+        return
+    target = u.message.reply_to_message.from_user
+    try:
+        await c.bot.ban_chat_member(u.effective_chat.id, target.id)
+        get_daily_stats(str(u.effective_chat.id))["bans"] += 1
+        await u.message.reply_text(f"🔨 *{get_user_name(target)}* has been banned.", parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        await u.message.reply_text(f"😿 Couldn't ban: `{str(e)[:100]}`", parse_mode=ParseMode.MARKDOWN)
+
+async def stats_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """/stats — shows total members, messages/day, mutes/bans today, and most active users."""
+    if not u.message or u.effective_chat.type == "private":
+        await u.message.reply_text("🐱 `/stats` only works inside a group.", parse_mode=ParseMode.MARKDOWN)
+        return
+    cid = str(u.effective_chat.id)
+    try:
+        member_count = await c.bot.get_chat_member_count(u.effective_chat.id)
+    except Exception:
+        member_count = "N/A"
+
+    d = get_daily_stats(cid)
+    top_users = sorted(d["user_counts"].items(), key=lambda kv: kv[1]["count"], reverse=True)[:5]
+
+    if top_users:
+        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+        top_lines = "\n".join(
+            f"{medals[i]} __{tagged_name(cid, uid, e['name'])}__ — *{e['count']:,}* msgs"
+            for i, (uid, e) in enumerate(top_users)
+        )
+    else:
+        top_lines = "_No activity yet today._"
+
+    members_line = f"`{member_count:,}`" if isinstance(member_count, int) else f"`{member_count}`"
+    text = (
+        f"📊 *GROUP STATISTICS* 📊\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👥 *Total Members:* {members_line}\n"
+        f"💬 *Messages Today:* `{d['messages']:,}`\n"
+        f"🔇 *Mutes Today:* `{d['mutes']:,}`   🔨 *Bans Today:* `{d['bans']:,}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🏆 *Most Active Today*\n{top_lines}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"_POWERED BY BELUGA.PY_ 🎀"
+    )
+    await u.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+async def report_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """/report — used as a reply to the offending message. Posts a formatted
+    report in the group with the reporter, the reported person, and a copy
+    of their message, plus a 'MATTER CONCLUDED' button admins/owner can use."""
+    if not u.message or u.effective_chat.type == "private":
+        return
+    if not u.message.reply_to_message:
+        await u.message.reply_text("🐱 Reply to the message you're reporting with `/report`.", parse_mode=ParseMode.MARKDOWN)
+        return
+    reporter = get_user_name(u.effective_user)
+    target_msg = u.message.reply_to_message
+    reported = get_user_name(target_msg.from_user) if target_msg.from_user else "Unknown"
+    quoted = (target_msg.text or target_msg.caption or "[non-text message]").strip()[:600]
+
+    text = (
+        f"🚩 *NEW REPORT*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"PERSON WHO REPORTED 👀 : *{reporter}*\n\n"
+        f"PERSON WHO WAS REPORTED 👤 : *{reported}*\n\n"
+        f"MESSAGE 📝 : {quoted}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"*ADMINS WILL LOOK INTO THE MATTER ASAP.!!!*\n\n"
+        f"_POWERED BY BELUGA.PY_ 🎀"
+    )
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("MATTER CONCLUDED", callback_data=f"report:done:{u.effective_chat.id}", style="danger")]])
+    await u.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+
+async def report_concluded_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    try:
+        _, _, cid_s = q.data.split(":", 2)
+        is_admin = await is_group_admin(context.bot, int(cid_s), q.from_user.id)
+        if not (is_admin or is_owner(q.from_user.id)):
+            await q.answer("🚫 Admins or owner only.", show_alert=True)
+            return
+        await q.answer("✅ Marked as concluded.")
+        new_text = (q.message.text or "") + f"\n\n✅ *MATTER CONCLUDED* by {get_user_name(q.from_user)}"
+        await q.edit_message_text(new_text, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logger.error(f"[report_concluded_callback] {e}")
+
+async def shop_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """/shop — spend game points on a cosmetic name tag (CEO/MANAGER/ACTIVE/HELPER), shown in /lb and /stats."""
+    if not u.message or u.effective_chat.type == "private":
+        await u.message.reply_text("🐱 `/shop` only works inside a group.", parse_mode=ParseMode.MARKDOWN)
+        return
+    cid = str(u.effective_chat.id)
+    uid = str(u.effective_user.id)
+    current_pts = db.get("scores", {}).get(cid, {}).get(uid, {}).get("score", 0)
+
+    lines = [f"*{t['label']}* {t['emoji']}  —  *{t['cost']:,}* points" for t in TAG_SHOP]
+    text = (
+        "🎀 *FOLLOWING TAGS ARE AVAILABLE FOR PURCHASE* 🎀\n"
+        "━━━━━━━━━━━━━━━━━━━━\n" + "\n\n".join(lines) +
+        f"\n━━━━━━━━━━━━━━━━━━━━\nYour points: *{current_pts:,}*"
+    )
+    row1 = [InlineKeyboardButton(str(t["cost"]), callback_data=f"shop:buy:{t['key']}", style=t["color"]) for t in TAG_SHOP[:2]]
+    row2 = [InlineKeyboardButton(str(t["cost"]), callback_data=f"shop:buy:{t['key']}", style=t["color"]) for t in TAG_SHOP[2:]]
+    kb = InlineKeyboardMarkup([row1, row2])
+
+    sent = await send_photo_safe(c.bot, u.effective_chat.id, SHOP_IMAGE_URL, caption=text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+    if not sent:
+        await u.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+
+async def mytag_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """/mytag — shows the cosmetic tag you currently have equipped, if any."""
+    if not u.message or u.effective_chat.type == "private":
+        await u.message.reply_text("🐱 `/mytag` only works inside a group.", parse_mode=ParseMode.MARKDOWN)
+        return
+    cid, uid = str(u.effective_chat.id), str(u.effective_user.id)
+    tag = member_tags.get(cid, {}).get(uid)
+    if tag:
+        await u.message.reply_text(f"🎀 Your current tag: *{tag}*", parse_mode=ParseMode.MARKDOWN)
+    else:
+        await u.message.reply_text("😿 You don't have a tag yet — check `/shop` to buy one!", parse_mode=ParseMode.MARKDOWN)
+
+async def shop_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q or not q.message:
+        return
+    try:
+        _, _, tag_key = q.data.split(":", 2)
+        tag = next((t for t in TAG_SHOP if t["key"] == tag_key), None)
+        if not tag:
+            await q.answer("😿 Unknown tag.", show_alert=True)
+            return
+
+        cid, uid = str(q.message.chat_id), str(q.from_user.id)
+        current_pts = db.get("scores", {}).get(cid, {}).get(uid, {}).get("score", 0)
+        if current_pts < tag["cost"]:
+            await q.answer(f"😿 Not enough points! You have {current_pts:,}, need {tag['cost']:,}.", show_alert=True)
+            return
+
+        member_tags.setdefault(cid, {})[uid] = tag["label"]
+        await sync_tags_to_mongo(cid)
+
+        bump_score(cid, uid, get_user_name(q.from_user), -tag["cost"])
+        await sync_leaderboard_chat_to_mongo(cid)
+        await q.answer(f"🎉 You are now {tag['label']}!")
+        try:
+            await context.bot.send_message(
+                q.message.chat_id,
+                f"🎀 *{get_user_name(q.from_user)}* just bought the *{tag['label']}* {tag['emoji']} tag!",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"[shop_buy_callback] {e}")
+
+async def away_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """
+    Owner-only: /away — toggle DM automation on/off.
+    When ON, anyone who DMs the bot (except the owner) gets handled by the
+    DM_SECRETARY_PROMPT persona instead of the normal chat persona — short,
+    crunchy replies, deflects "where is [owner]" questions, never breaks
+    character as an AI. Meant for when the owner is away and wants their
+    DMs auto-managed without people realizing it's automated.
+    """
+    if not u.message:
+        return
+    if not is_owner(u.effective_user.id if u.effective_user else 0):
+        await u.message.reply_text("🚫 Owner only.")
+        return
+    away_mode_state["on"] = not away_mode_state["on"]
+    if away_mode_state["on"]:
+        await u.message.reply_text(
+            "🌙 *Away mode ON*\nI'll handle your DMs now — anyone who messages me "
+            "(except you) gets the secretary treatment. Send `/away` again to turn it off.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    else:
+        await u.message.reply_text("☀️ *Away mode OFF* — back to normal.", parse_mode=ParseMode.MARKDOWN)
 
 async def ping_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """
@@ -1344,7 +1627,8 @@ async def lb_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         else:
             for i, e in enumerate(clean_lb[:10]):
                 m = MEDALS[i] if i < len(MEDALS) else f"{i+1}."
-                lines.append(f"{m} `{e.get('name','Unknown')[:18]:<18}` `{e.get('score',0):>6,} pts`")
+                disp_name = tagged_name(cid, str(e.get("user_id", "")), e.get("name", "Unknown"))[:18]
+                lines.append(f"{m} `{disp_name:<18}` `{e.get('score',0):>6,} pts`")
         lines += ["\n━━━━━━━━━━━━━━━━━━━━", "➕ +10 quiz/ttt  ·  +700 mine  ·  +50 gm"]
         text = "\n".join(lines)
 
@@ -1607,16 +1891,22 @@ async def cleanup_expired_games():
 
 async def run_game_timer(c, gkey):
     try:
+        g, td = ttt_games.get(gkey), game_timers.get(gkey)
+        if not g or not td:
+            return
+        deadline = time.monotonic() + td.get("remaining", 60)
+        last_shown = None
         while True:
-            await asyncio.sleep(5)
             g, td = ttt_games.get(gkey), game_timers.get(gkey)
             if not g or not td or g.get("status") != "playing":
                 return
-            td["remaining"] = max(0, td["remaining"] - 5)
+            remaining = max(0, round(deadline - time.monotonic()))
+            td["remaining"] = remaining
             cid, msg_id = g.get("chat_id"), g.get("msg_id")
             if not msg_id:
                 return
-            if td["remaining"] <= 0:
+
+            if remaining <= 0:
                 g["status"] = "timeout"
                 g["winner_name"] = (g["o_name"] if g["turn"] == "X" else g["x_name"])
                 try:
@@ -1627,10 +1917,14 @@ async def run_game_timer(c, gkey):
                     user_in_game.pop(uid, None)
                 game_timers.pop(gkey, None); ttt_games.pop(gkey, None)
                 return
-            try:
-                await c.bot.edit_message_text(chat_id=cid, message_id=msg_id, text=ttt_build_text(g), parse_mode=ParseMode.MARKDOWN, reply_markup=ttt_build_keyboard(g["board"]))
-            except Exception:
-                pass
+
+            if remaining != last_shown and remaining % 5 == 0:
+                try:
+                    await c.bot.edit_message_text(chat_id=cid, message_id=msg_id, text=ttt_build_text(g), parse_mode=ParseMode.MARKDOWN, reply_markup=ttt_build_keyboard(g["board"]))
+                except Exception:
+                    pass
+                last_shown = remaining
+            await asyncio.sleep(0.5)
     except asyncio.CancelledError:
         pass
 
@@ -2346,15 +2640,29 @@ async def block_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 async def monitor_private_chat(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """
-    Plain AI chat for DMs. No secretary/business logic anymore — every
-    private text message just gets an AI reply, with a sticker from the
-    MAIN pack attached to every single response (private-chat rule).
+    Plain AI chat for DMs by default. If /away mode is ON and the sender
+    isn't the owner, replies come from DM_SECRETARY_PROMPT instead — short,
+    deflects "where's [owner]" questions, stays in character, no chat
+    history/memory used (stateless secretary behavior) and no sticker spam.
     """
     if not u.message or u.effective_chat.type != "private":
         return
     try:
         text = (u.message.text or u.message.caption or "").strip()
         if not text or text.startswith("/"):
+            return
+
+        uid = u.effective_user.id
+        is_away_dm = away_mode_state["on"] and not is_owner(uid)
+
+        if is_away_dm:
+            user_name = get_user_name(u.effective_user)
+            system = f"{DM_SECRETARY_PROMPT}\nThe person's name is {user_name}."
+            reply = await ai(system, text, "I am BELUGA, handling this chat.", max_tok=120)
+            try:
+                await u.message.reply_text(reply, reply_to_message_id=u.message.message_id)
+            except Exception:
+                pass
             return
 
         ss_match = re.match(r"^ss\s+(\S+)", text, re.IGNORECASE)
@@ -2370,7 +2678,6 @@ async def monitor_private_chat(u: Update, c: ContextTypes.DEFAULT_TYPE):
             await _run_search_and_reply(u, c, search_match.group(1).strip())
             return
 
-        uid = u.effective_user.id
         user_name = get_user_name(u.effective_user)
         memory = await get_user_memory(uid)
         mem_ctx = build_memory_context(memory)
@@ -2438,6 +2745,38 @@ def next_ai_sticker_pack() -> str:
     _ai_sticker_toggle["n"] += 1
     return STICKER_PACK_MAIN if _ai_sticker_toggle["n"] % 2 == 1 else STICKER_PACK_ALT
 
+async def guest_message_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """
+    Handles Telegram's Guest Bots feature (Bot API 10.0): someone @-mentions
+    the bot in a group chat it is NOT a member of. Telegram delivers this as
+    Update.guest_message instead of the usual Update.message, and requires a
+    reply via Bot.answer_guest_query() instead of send_message — the bot has
+    no membership in that chat, so it can't post there directly.
+    Limitations (per Telegram): no chat history access, exactly one reply
+    per guest_message, fully stateless — so no memory/history lookup here.
+    """
+    gm = getattr(u, "guest_message", None)
+    if not gm:
+        return
+    try:
+        guest_query_id = getattr(gm, "guest_query_id", None)
+        user_text = (gm.text or gm.caption or "").strip()
+        if not guest_query_id:
+            return
+        if not user_text:
+            reply_text = "Meow? Summon me with an actual question! 🐾"
+        else:
+            reply_text = await ai(CHAT_PROMPT, user_text, "Meow! Something glitched, try again? 🐾", max_tok=250)
+
+        result = InlineQueryResultArticle(
+            id=str(uuid.uuid4())[:32],
+            title="Beluga 🐾",
+            input_message_content=InputTextMessageContent(reply_text, parse_mode=ParseMode.MARKDOWN),
+        )
+        await c.bot.answer_guest_query(guest_query_id=guest_query_id, result=result)
+    except Exception as e:
+        logger.error(f"[guest_message] {e}")
+
 async def sticker_reply_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """When someone sends the bot a sticker directly (DM) or replies to the
     bot's message with a sticker (group), reply back with a sticker too."""
@@ -2461,6 +2800,138 @@ async def sticker_reply_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"[sticker_reply] {e}")
 
+async def trigger_lockdown(c: ContextTypes.DEFAULT_TYPE, cid: int):
+    """
+    Anti-raid group lockdown. Uses a monotonic-clock deadline (not a naive
+    sleep(1) loop) so the countdown never drifts even if a Telegram edit
+    call is slow or rate-limited — it always recomputes 'seconds remaining'
+    from the real clock, and only edits the message when the displayed
+    number actually changes (avoids spammy edits / 'message not modified').
+    """
+    cid_s = str(cid)
+    if lockdown_state.get(cid_s, {}).get("locking") or lockdown_state.get(cid_s, {}).get("active"):
+        return
+    lockdown_state[cid_s] = {"locking": True, "active": False, "prevent": False}
+
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("PREVENT LOCK 🔐", callback_data=f"antiraid:prevent:{cid_s}", style="danger")]])
+    try:
+        msg = await c.bot.send_message(
+            cid,
+            "🚨 *SPAMMING DETECTED 😡*\n*LOCKING GROUP IN 10 SECONDS.*\n\n_POWERED BY BELUGA.PY 🎀_",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=kb,
+        )
+    except Exception as e:
+        logger.error(f"[antiraid] couldn't send lock warning in {cid}: {e}")
+        lockdown_state.pop(cid_s, None)
+        return
+
+    deadline = time.monotonic() + LOCK_COUNTDOWN_SEC
+    last_shown = None
+    while True:
+        if lockdown_state.get(cid_s, {}).get("prevent"):
+            try:
+                await c.bot.edit_message_text(
+                    chat_id=cid, message_id=msg.message_id,
+                    text="✅ *Lock prevented by an admin.*\n\n_POWERED BY BELUGA.PY 🎀_",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                pass
+            lockdown_state.pop(cid_s, None)
+            return
+        remaining = max(0, round(deadline - time.monotonic()))
+        if remaining != last_shown:
+            try:
+                await c.bot.edit_message_text(
+                    chat_id=cid, message_id=msg.message_id,
+                    text=f"🚨 *SPAMMING DETECTED 😡*\n*LOCKING GROUP IN {remaining} SECONDS.*\n\n_POWERED BY BELUGA.PY 🎀_",
+                    parse_mode=ParseMode.MARKDOWN, reply_markup=kb,
+                )
+            except Exception:
+                pass
+            last_shown = remaining
+        if remaining <= 0:
+            break
+        await asyncio.sleep(0.4)
+
+    try:
+        await c.bot.set_chat_permissions(cid, ChatPermissions(
+            can_send_messages=False, can_send_audios=False, can_send_documents=False,
+            can_send_photos=False, can_send_videos=False, can_send_video_notes=False,
+            can_send_voice_notes=False, can_send_polls=False, can_send_other_messages=False,
+            can_add_web_page_previews=False,
+        ))
+    except Exception as e:
+        logger.error(f"[antiraid] failed to lock {cid}: {e}")
+
+    lockdown_state[cid_s] = {"locking": False, "active": True, "prevent": False}
+    try:
+        await c.bot.edit_message_text(
+            chat_id=cid, message_id=msg.message_id,
+            text="🔒 *GROUP LOCKED* — text & media are off for 2 minutes.\n\n_POWERED BY BELUGA.PY 🎀_",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception:
+        pass
+
+    await asyncio.sleep(max(0, LOCK_DURATION_SEC - LOCK_COUNTDOWN_SEC))
+
+    deadline2 = time.monotonic() + LOCK_COUNTDOWN_SEC
+    last_shown = None
+    while True:
+        remaining = max(0, round(deadline2 - time.monotonic()))
+        if remaining != last_shown:
+            try:
+                await c.bot.edit_message_text(
+                    chat_id=cid, message_id=msg.message_id,
+                    text=f"🔐 *UNLOCKING IN {remaining}S* 🔐",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                pass
+            last_shown = remaining
+        if remaining <= 0:
+            break
+        await asyncio.sleep(0.4)
+
+    try:
+        await c.bot.set_chat_permissions(cid, ChatPermissions(
+            can_send_messages=True, can_send_audios=True, can_send_documents=True,
+            can_send_photos=True, can_send_videos=True, can_send_video_notes=True,
+            can_send_voice_notes=True, can_send_polls=True, can_send_other_messages=True,
+            can_add_web_page_previews=True,
+        ))
+    except Exception as e:
+        logger.error(f"[antiraid] failed to unlock {cid}: {e}")
+
+    try:
+        await c.bot.edit_message_text(
+            chat_id=cid, message_id=msg.message_id,
+            text="✅ *GROUP UNLOCKED* — behave now! 🐾\n\n_POWERED BY BELUGA.PY 🎀_",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception:
+        pass
+    lockdown_state.pop(cid_s, None)
+
+async def antiraid_prevent_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    try:
+        _, _, cid_s = q.data.split(":", 2)
+        if not await is_group_admin(context.bot, int(cid_s), q.from_user.id):
+            await q.answer("🚫 Admins only!", show_alert=True)
+            return
+        st = lockdown_state.get(cid_s)
+        if not st or not st.get("locking"):
+            await q.answer("⏰ Too late — already locked or resolved.", show_alert=True)
+            return
+        st["prevent"] = True
+        await q.answer("✅ Lock prevented!")
+    except Exception as e:
+        logger.error(f"[antiraid_prevent_callback] {e}")
+
 async def monitor_group(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message or not u.effective_user or u.effective_user.is_bot:
         return
@@ -2479,12 +2950,35 @@ async def monitor_group(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 return
 
         spam_tracker.setdefault(uid, [])
-        spam_tracker[uid] = [t for t in spam_tracker[uid] if now - t < timedelta(seconds=2)]
+        spam_tracker[uid] = [t for t in spam_tracker[uid] if now - t < timedelta(seconds=FLOOD_WINDOW_SEC)]
         spam_tracker[uid].append(now)
-        if len(spam_tracker[uid]) >= 4:
+        if len(spam_tracker[uid]) >= FLOOD_COUNT:
             try: await u.message.delete()
             except Exception: pass
+
+            if not lockdown_state.get(cid, {}).get("locking") and not lockdown_state.get(cid, {}).get("active"):
+                flags = raid_flags.setdefault(cid, {})
+                flags[str(uid)] = time.time()
+                cutoff = time.time() - RAID_WINDOW_SEC
+                for k in list(flags.keys()):
+                    if flags[k] < cutoff:
+                        del flags[k]
+                if len(flags) >= RAID_USER_THRESHOLD:
+                    raid_flags[cid] = {}
+                    asyncio.create_task(trigger_lockdown(c, u.effective_chat.id))
             return
+
+        dstat = get_daily_stats(cid)
+        dstat["messages"] += 1
+        uentry = dstat["user_counts"].setdefault(str(uid), {"name": get_user_name(u.effective_user), "count": 0})
+        uentry["name"] = get_user_name(u.effective_user)
+        uentry["count"] += 1
+        if dstat["messages"] % 500 == 0 and dstat["messages"] not in dstat["milestones_hit"]:
+            dstat["milestones_hit"].add(dstat["messages"])
+            try:
+                await c.bot.send_message(int(cid), f"*{dstat['messages']} messages reached 💖*", parse_mode=ParseMode.MARKDOWN)
+            except Exception:
+                pass
 
         db.setdefault("seen", {}).setdefault(cid, {})[str(uid)] = {
             "id": uid, "un": u.effective_user.username, "n": u.effective_user.first_name or "User"
@@ -2874,6 +3368,12 @@ async def main():
     app.add_handler(CommandHandler("clearmemory", clearmemory_handler))
     app.add_handler(CommandHandler("ping", ping_handler))
     app.add_handler(CommandHandler("model", model_command_handler))
+    app.add_handler(CommandHandler("mute", mute_handler))
+    app.add_handler(CommandHandler("ban", ban_handler))
+    app.add_handler(CommandHandler("stats", stats_handler))
+    app.add_handler(CommandHandler("report", report_handler))
+    app.add_handler(CommandHandler("shop", shop_handler))
+    app.add_handler(CommandHandler("mytag", mytag_handler))
 
     app.add_handler(CallbackQueryHandler(ttt_callback, pattern=r"^ttt:"))
     app.add_handler(CallbackQueryHandler(gm_callback, pattern=r"^gm:"))
@@ -2881,8 +3381,12 @@ async def main():
     app.add_handler(CallbackQueryHandler(watermark_callback, pattern=r"^wm:"))
     app.add_handler(CallbackQueryHandler(model_callback, pattern=r"^model:"))
     app.add_handler(CallbackQueryHandler(start_menu_callback, pattern=r"^menu:"))
+    app.add_handler(CallbackQueryHandler(antiraid_prevent_callback, pattern=r"^antiraid:"))
+    app.add_handler(CallbackQueryHandler(report_concluded_callback, pattern=r"^report:"))
+    app.add_handler(CallbackQueryHandler(shop_buy_callback, pattern=r"^shop:"))
     app.add_handler(PollAnswerHandler(poll_answer_handler))
 
+    app.add_handler(TypeHandler(Update, guest_message_handler), group=-1)
     app.add_handler(MessageHandler(filters.Sticker.ALL & filters.ChatType.GROUPS, monitor_group), group=0)
     app.add_handler(MessageHandler(filters.Sticker.ALL, sticker_reply_handler), group=4)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, monitor_private_chat), group=1)
@@ -2914,7 +3418,10 @@ async def main():
     except Exception as e:
         logger.warning(f"[Startup delete_webhook] {e}")
 
-    await app.updater.start_polling(drop_pending_updates=True, allowed_updates=[])
+    await app.updater.start_polling(
+        drop_pending_updates=True,
+        allowed_updates=["message", "edited_message", "callback_query", "poll_answer", "my_chat_member", "guest_message"],
+    )
     bot_status["running"] = True
     logger.info("Beluga Bot is running")
 
