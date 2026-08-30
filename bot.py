@@ -5,11 +5,12 @@ from aiohttp import web
 import aiohttp
 from bs4 import BeautifulSoup
 import uuid
+from collections import deque
 from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResultArticle, InputTextMessageContent, ChatPermissions
 from motor.motor_asyncio import AsyncIOMotorClient
 from telegram.ext import (
     Application as TGApp, CommandHandler, ContextTypes, MessageHandler, PollAnswerHandler,
-    CallbackQueryHandler, TypeHandler, filters,
+    CallbackQueryHandler, TypeHandler, ChatMemberHandler, filters,
 )
 from telegram.constants import ParseMode
 from telegram.error import NetworkError, TimedOut, Forbidden, BadRequest, RetryAfter, Conflict
@@ -45,6 +46,27 @@ mongo_leaderboard_col = mongo_db["leaderboard"] if mongo_db is not None else Non
 mongo_weekly_col = mongo_db["weekly_winners"] if mongo_db is not None else None
 mongo_stickers_col = mongo_db["stickers"] if mongo_db is not None else None
 mongo_tags_col = mongo_db["member_tags"] if mongo_db is not None else None
+# Registry of every chat Beluga is in (for /broadcast). Lives in its OWN
+# collection, completely separate from mongo_memory_col — /clearmemory only
+# ever touches mongo_memory_col, so this registry is NEVER wiped by it.
+mongo_chats_col = mongo_db["known_chats"] if mongo_db is not None else None
+mongo_events_col = mongo_db["scheduled_events"] if mongo_db is not None else None
+
+known_chats = {}          # cid(str) -> {"id":int,"title":str,"username":str|None,"type":str}
+scheduled_events = {}     # cid(str) -> [ {id,name,time(iso str),emoji} ]
+event_reminder_started = set()   # event ids with an active reminder task (dedupe guard)
+last_welcome_msg = {}     # cid(str) -> message_id
+last_group_activity = {}  # cid(str) -> datetime
+last_revival_time = {}    # cid(str) -> datetime
+recent_group_msgs = {}    # cid(str) -> deque[str] (rolling chat context for revival)
+pending_broadcasts = {}   # broadcast_id(str) -> {"text":str, "target":str}
+INACTIVITY_THRESHOLD_SEC = 4 * 3600
+REVIVAL_COOLDOWN_SEC = 4 * 3600
+REMINDER_INTERVAL_SEC = 3600
+REMINDER_MAX_DURATION_SEC = 4 * 3600
+REMINDER_AUTOEXPIRE_SEC = 180
+WELCOME_AUTOEXPIRE_SEC = 180
+REVIVAL_AUTOEXPIRE_SEC = 180
 
 FILE_STICKERS = "beluga_stickers.json"
 
@@ -324,6 +346,129 @@ async def load_persistent_data():
             member_tags = {}
     else:
         member_tags = {}
+
+    global known_chats
+    known_chats = {}
+    if mongo_chats_col is not None:
+        try:
+            async for doc in mongo_chats_col.find({}):
+                known_chats[doc["_id"]] = {
+                    "id": doc["id"], "title": doc.get("title", ""),
+                    "username": doc.get("username"), "type": doc.get("type", ""),
+                }
+            logger.info(f"[mongo] Known chats loaded ({len(known_chats)} chats)")
+        except Exception as e:
+            logger.error(f"[mongo] Known chats load failed: {e}")
+
+    global scheduled_events
+    scheduled_events = {}
+    if mongo_events_col is not None:
+        try:
+            async for doc in mongo_events_col.find({}):
+                scheduled_events[doc["_id"]] = doc.get("events", [])
+            logger.info(f"[mongo] Scheduled events loaded ({len(scheduled_events)} chats)")
+        except Exception as e:
+            logger.error(f"[mongo] Scheduled events load failed: {e}")
+
+async def register_chat(chat) -> None:
+    """Adds/updates a chat in the persistent registry used by /broadcast."""
+    if chat is None or chat.type == "private":
+        return
+    cid = str(chat.id)
+    entry = {"id": chat.id, "title": chat.title or "", "username": chat.username, "type": chat.type}
+    if known_chats.get(cid) == entry:
+        return
+    known_chats[cid] = entry
+    if mongo_chats_col is not None:
+        try:
+            await mongo_chats_col.replace_one({"_id": cid}, {"_id": cid, **entry}, upsert=True)
+        except Exception as e:
+            logger.error(f"[mongo register_chat] {e}")
+
+async def unregister_chat(chat_id) -> None:
+    known_chats.pop(str(chat_id), None)
+    if mongo_chats_col is not None:
+        try:
+            await mongo_chats_col.delete_one({"_id": str(chat_id)})
+        except Exception as e:
+            logger.error(f"[mongo unregister_chat] {e}")
+
+async def sync_events_to_mongo(cid: str):
+    if mongo_events_col is None:
+        return
+    try:
+        await mongo_events_col.replace_one(
+            {"_id": cid}, {"_id": cid, "events": scheduled_events.get(cid, [])}, upsert=True
+        )
+    except Exception as e:
+        logger.error(f"[mongo sync_events_to_mongo] {e}")
+
+async def _delete_after(bot, chat_id, msg_id, delay: int):
+    """Shared helper: waits `delay` seconds then deletes a message, silently no-oping on failure."""
+    await asyncio.sleep(delay)
+    try:
+        await bot.delete_message(chat_id, msg_id)
+    except Exception:
+        pass
+
+async def my_chat_member_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Keeps the /broadcast chat registry in sync whenever Beluga is added to
+    or removed from a group/channel, and DMs the owner on every fresh add
+    (whether added as a plain member or straight to admin) with the group
+    name and an invite link where one can be obtained."""
+    cmu = u.my_chat_member
+    if not cmu:
+        return
+    try:
+        old_status = cmu.old_chat_member.status
+        new_status = cmu.new_chat_member.status
+        was_in_chat = old_status in ("member", "administrator", "creator")
+        is_in_chat = new_status in ("member", "administrator", "creator")
+
+        if is_in_chat:
+            await register_chat(cmu.chat)
+            if not was_in_chat:
+                asyncio.create_task(_notify_owner_added(c, cmu.chat, new_status, cmu.from_user, is_new_add=True))
+            elif old_status == "member" and new_status == "administrator":
+                asyncio.create_task(_notify_owner_added(c, cmu.chat, new_status, cmu.from_user, is_new_add=False))
+        elif not is_in_chat and was_in_chat:
+            await unregister_chat(cmu.chat.id)
+    except Exception as e:
+        logger.error(f"[my_chat_member_handler] {e}")
+
+async def _notify_owner_added(c: ContextTypes.DEFAULT_TYPE, chat, status: str, added_by, is_new_add: bool = True):
+    """DMs the owner: which group Beluga just got added to (or promoted in),
+    by whom, whether she's admin, and an invite link if one can be gotten."""
+    if not OWNER_ID:
+        return
+    link = None
+    try:
+        if chat.username:
+            link = f"https://t.me/{chat.username}"
+        elif status == "administrator":
+            link = await c.bot.export_chat_invite_link(chat.id)
+    except Exception as e:
+        logger.warning(f"[_notify_owner_added] couldn't get invite link: {e}")
+
+    adder = get_user_name(added_by) if added_by else "Unknown"
+    if is_new_add:
+        header = "🐋 *BELUGA WAS ADDED TO A NEW CHAT*"
+        role_line = "👑 Made *admin* immediately" if status == "administrator" else "👤 Added as a regular member"
+        who_line = f"👋 *Added by:* {adder}\n"
+    else:
+        header = "🐋 *BELUGA WAS PROMOTED TO ADMIN*"
+        role_line = "👑 Now has *admin* rights"
+        who_line = f"👋 *Promoted by:* {adder}\n"
+
+    text = f"{header}\n\n📌 *Group:* {chat.title or 'Untitled'}\n{role_line}\n{who_line}"
+    if link:
+        text += f"🔗 *Link:* {link}\n"
+    else:
+        text += "🔗 *Link:* _private group, no link available_\n"
+    try:
+        await c.bot.send_message(OWNER_ID, text, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logger.error(f"[_notify_owner_added] failed to DM owner: {e}")
 
 async def sync_leaderboard_chat_to_mongo(cid: str):
     """Push one chat's current scores dict to MongoDB immediately."""
@@ -934,6 +1079,364 @@ async def shop_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
     except Exception as e:
         logger.error(f"[shop_buy_callback] {e}")
+
+async def broadcast_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """
+    Owner-only: /broadcast <message> — sends to every chat Beluga is in.
+    /broadcast @username <message> or /broadcast <chat_id> <message> — sends
+    only to that specific chat. Always shows a confirm/cancel UI first.
+    """
+    if not u.message:
+        return
+    if not is_owner(u.effective_user.id if u.effective_user else 0):
+        await u.message.reply_text("🚫 Owner only.")
+        return
+    parts = u.message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await u.message.reply_text(
+            "🐋 Usage:\n`/broadcast <message>` — send to all chats\n"
+            "`/broadcast @username <message>` — send to one chat",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    payload = parts[1].strip()
+    target = "all"
+    m = re.match(r"^(@\w+|-?\d{5,})\s+(.+)$", payload, re.DOTALL)
+    if m:
+        target, msg_text = m.group(1), m.group(2).strip()
+    else:
+        msg_text = payload
+
+    bid = str(uuid.uuid4())[:8]
+    pending_broadcasts[bid] = {"text": msg_text, "target": target}
+    target_label = "All eligible chats" if target == "all" else target
+    conf_text = (
+        f"🐋 *BELUGA BROADCAST*\n\n"
+        f"📢 *Message*\n{msg_text}\n\n"
+        f"🌐 *Target:* {target_label}\n\n"
+        f"⚠️ Confirm broadcast?"
+    )
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ SEND", callback_data=f"bcast:send:{bid}", style="success"),
+        InlineKeyboardButton("❌ CANCEL", callback_data=f"bcast:cancel:{bid}", style="danger"),
+    ]])
+    await u.message.reply_text(conf_text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+
+async def broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    try:
+        _, action, bid = q.data.split(":", 2)
+        if not is_owner(q.from_user.id):
+            await q.answer("🚫 Owner only.", show_alert=True)
+            return
+        data = pending_broadcasts.pop(bid, None)
+        if not data:
+            await q.answer("⏰ This confirmation already expired.", show_alert=True)
+            return
+        if action == "cancel":
+            await q.answer("Cancelled.")
+            await q.edit_message_text("❌ *Broadcast cancelled.*", parse_mode=ParseMode.MARKDOWN)
+            return
+
+        await q.answer("Sending...")
+        await q.edit_message_text("📢 *Sending broadcast...*", parse_mode=ParseMode.MARKDOWN)
+
+        targets = list(known_chats.values())
+        if data["target"] != "all":
+            tref = data["target"]
+            tref_clean = tref.lstrip("@")
+            targets = [
+                ch for ch in targets
+                if (ch.get("username") and ch["username"].lower() == tref_clean.lower())
+                or str(ch["id"]) == tref_clean
+            ]
+
+        sent, failed = 0, 0
+        for ch in targets:
+            try:
+                await context.bot.send_message(ch["id"], data["text"])
+                sent += 1
+            except Exception:
+                failed += 1
+            await asyncio.sleep(0.05)  # gentle pacing, stays well under Telegram's flood limits
+
+        await q.edit_message_text(
+            f"📢 *BROADCAST COMPLETE*\n\n✅ Sent: {sent}\n⚠️ Failed: {failed}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception as e:
+        logger.error(f"[broadcast_callback] {e}")
+
+_SCHEDULE_TIME_RE = re.compile(r'(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b\.?\s*(ist)?', re.IGNORECASE)
+_SCHEDULE_FILLER_RE = re.compile(r'\b(coming|is|will\s+be|starts?|starting|at)\b\s*$', re.IGNORECASE)
+
+def parse_schedule_text(text: str) -> list:
+    """Pure regex/logic parser (no AI call) that splits a natural-language
+    schedule string on commas and pulls a time + event name out of each
+    segment. Handles things like 'smc part 4 coming at 8 pm ist'."""
+    segments = [s.strip() for s in re.split(r',', text) if s.strip()]
+    events = []
+    now = datetime.now()
+    for seg in segments:
+        matches = list(_SCHEDULE_TIME_RE.finditer(seg))
+        if not matches:
+            continue
+        m = matches[-1]
+        hour, minute, ampm = int(m.group(1)), int(m.group(2) or 0), m.group(3).lower()
+        if ampm == "pm" and hour != 12:
+            hour += 12
+        if ampm == "am" and hour == 12:
+            hour = 0
+        name = seg[:m.start()].strip(" -–—")
+        name = _SCHEDULE_FILLER_RE.sub("", name).strip(" -–—")
+        name = re.sub(r"\s+", " ", name).strip()
+        if not name:
+            continue
+        event_dt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        low = name.lower()
+        if any(k in low for k in ("vc", "music", "voice")):
+            emoji = "🎵"
+        elif "ict" in low:
+            emoji = "📚"
+        elif "smc" in low:
+            emoji = "📖"
+        else:
+            emoji = "📌"
+        events.append({
+            "id": str(uuid.uuid4())[:8],
+            "name": name.title(),
+            "time": event_dt.isoformat(),
+            "emoji": emoji,
+        })
+    events.sort(key=lambda e: e["time"])
+    return events
+
+def _fmt_time_ist(iso_str: str) -> str:
+    dt = datetime.fromisoformat(iso_str)
+    return dt.strftime("%I:%M %p").lstrip("0") + " IST"
+
+async def schedule_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """/schedule <natural language events> — e.g.
+    '/schedule smc part 4 coming at 8 pm ist, ict part 2 at 7pm, group vc music at 9pm'"""
+    if not u.message or u.effective_chat.type == "private":
+        await u.message.reply_text("🐋 `/schedule` only works inside a group.", parse_mode=ParseMode.MARKDOWN)
+        return
+    parts = u.message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await u.message.reply_text(
+            "🐋 Usage: `/schedule <event> at <time>, <event2> at <time2>...`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    events = parse_schedule_text(parts[1])
+    if not events:
+        await u.message.reply_text("😿 Couldn't find any times in that — try `event name at 8pm`.", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    cid = str(u.effective_chat.id)
+    scheduled_events.setdefault(cid, [])
+    scheduled_events[cid].extend(events)
+    scheduled_events[cid].sort(key=lambda e: e["time"])
+    await sync_events_to_mongo(cid)
+
+    lines = []
+    for i, ev in enumerate(events):
+        if i > 0:
+            lines.append("────────────")
+        lines.append(f"{ev['emoji']} *{ev['name']}*\n🕖 {_fmt_time_ist(ev['time'])}")
+    text = "🐋 *UPCOMING EVENTS*\n\n" + "\n\n".join(lines)
+    await u.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+    for ev in events:
+        asyncio.create_task(run_event_reminders(c, cid, ev))
+
+async def run_event_reminders(c: ContextTypes.DEFAULT_TYPE, cid: str, ev: dict):
+    """Sends an hourly reminder for an event: only the latest reminder ever
+    exists (previous one is deleted first), each auto-expires after 3 min,
+    and the whole loop stops at event-start or after 4 hours, whichever
+    comes first. Guarded against duplicate reminder loops per event id."""
+    if ev["id"] in event_reminder_started:
+        return
+    event_reminder_started.add(ev["id"])
+    last_msg_id = None
+    start_mono = time.monotonic()
+    try:
+        while True:
+            event_dt = datetime.fromisoformat(ev["time"])
+            now_dt = datetime.now()
+            if now_dt >= event_dt:
+                break
+            if time.monotonic() - start_mono >= REMINDER_MAX_DURATION_SEC:
+                break
+
+            remaining = event_dt - now_dt
+            total_min = int(remaining.total_seconds() // 60)
+            hrs, mins = divmod(total_min, 60)
+            starts_in = f"{hrs}h {mins}m" if hrs else f"{mins}m"
+
+            if last_msg_id:
+                try:
+                    await c.bot.delete_message(int(cid), last_msg_id)
+                except Exception:
+                    pass
+
+            text = (
+                f"🔔 *EVENT REMINDER*\n\n"
+                f"{ev['emoji']} *{ev['name']}*\n\n"
+                f"🕘 {_fmt_time_ist(ev['time'])}\n\n"
+                f"⏳ Starts in {starts_in}\n\n"
+                f"🐋 Beluga"
+            )
+            try:
+                msg = await c.bot.send_message(int(cid), text, parse_mode=ParseMode.MARKDOWN)
+                last_msg_id = msg.message_id
+                asyncio.create_task(_delete_after(c.bot, int(cid), last_msg_id, REMINDER_AUTOEXPIRE_SEC))
+            except Exception as e:
+                logger.error(f"[event_reminder] send failed: {e}")
+                last_msg_id = None
+
+            sleep_secs = min(REMINDER_INTERVAL_SEC, max(1, (event_dt - datetime.now()).total_seconds()))
+            await asyncio.sleep(sleep_secs)
+    finally:
+        event_reminder_started.discard(ev["id"])
+        scheduled_events[cid] = [e for e in scheduled_events.get(cid, []) if e["id"] != ev["id"]]
+        await sync_events_to_mongo(cid)
+
+async def reschedule_saved_events(app):
+    """On startup, resume reminder loops for any events that haven't happened yet."""
+    for cid, events in list(scheduled_events.items()):
+        for ev in list(events):
+            try:
+                if datetime.fromisoformat(ev["time"]) > datetime.now():
+                    asyncio.create_task(run_event_reminders(
+                        type("Ctx", (), {"bot": app.bot})(), cid, ev
+                    ))
+            except Exception:
+                continue
+
+async def welcome_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Smart welcome: only the LATEST welcome message ever exists per chat —
+    a new join deletes the previous welcome (even if its own 3-min timer
+    hasn't fired yet) before sending the new one, preventing join-spam."""
+    if not u.message or not u.message.new_chat_members:
+        return
+    cid = str(u.effective_chat.id)
+    for member in u.message.new_chat_members:
+        if member.id == c.bot.id:
+            continue
+        prev_id = last_welcome_msg.get(cid)
+        if prev_id:
+            try:
+                await c.bot.delete_message(int(cid), prev_id)
+            except Exception:
+                pass
+
+        mention = f"@{member.username}" if member.username else get_user_name(member)
+        text = (
+            f"🐋 *WELCOME*\n\n"
+            f"👋 Welcome {mention}!\n\n"
+            f"🎉 Glad to have you here.\n\n"
+            f"📜 Check the rules\n"
+            f"💬 Join the conversation"
+        )
+        try:
+            msg = await c.bot.send_message(int(cid), text, parse_mode=ParseMode.MARKDOWN)
+            last_welcome_msg[cid] = msg.message_id
+            asyncio.create_task(_delete_after(c.bot, int(cid), msg.message_id, WELCOME_AUTOEXPIRE_SEC))
+        except Exception as e:
+            logger.error(f"[welcome_handler] {e}")
+
+MONGO_CLEANUP_INTERVAL_SEC = 24 * 3600
+MEMORY_STALE_DAYS = 14
+
+async def mongo_cleanup_loop():
+    """
+    Periodically frees Mongo space — but ONLY prunes stale, non-critical
+    data: per-user chat memory (mongo_memory_col) that's empty or hasn't
+    been touched in MEMORY_STALE_DAYS. This collection is already a rolling
+    6-message window that resets constantly, so old/abandoned entries carry
+    no real value.
+    NEVER touches: known_chats (the /broadcast registry), leaderboard,
+    weekly_winners, member_tags, scheduled_events, or stickers — anything
+    that represents real state or history the bot actually needs.
+    """
+    while True:
+        await asyncio.sleep(MONGO_CLEANUP_INTERVAL_SEC)
+        if mongo_memory_col is None:
+            continue
+        try:
+            cutoff = datetime.utcnow() - timedelta(days=MEMORY_STALE_DAYS)
+            deleted = 0
+            async for doc in mongo_memory_col.find({}):
+                messages = doc.get("messages", [])
+                if not messages:
+                    await mongo_memory_col.delete_one({"_id": doc["_id"]})
+                    deleted += 1
+                    continue
+                try:
+                    last_ts = datetime.fromisoformat(messages[-1]["ts"])
+                except Exception:
+                    continue
+                if last_ts < cutoff:
+                    await mongo_memory_col.delete_one({"_id": doc["_id"]})
+                    deleted += 1
+            if deleted:
+                logger.info(f"[mongo_cleanup] Freed space — removed {deleted} stale/empty chat-memory docs")
+        except Exception as e:
+            logger.error(f"[mongo_cleanup_loop] {e}")
+
+async def revival_loop(app):
+    """
+    Conversation revival: checks every 5 minutes for groups that have gone
+    quiet past INACTIVITY_THRESHOLD_SEC. When one is found (and not on
+    cooldown), it uses the recent chat context to ask the AI for ONE short,
+    relevant conversation-starter — this is the one place in this feature
+    set where an AI call is genuinely necessary, since a natural, on-topic
+    opener can't be produced by pure regex/logic. Sends it, auto-deletes
+    after 3 minutes, and resets both activity + cooldown so it won't
+    immediately re-trigger or repeat the same topic.
+    """
+    while True:
+        await asyncio.sleep(300)
+        try:
+            now = datetime.now()
+            for cid, last_act in list(last_group_activity.items()):
+                if (now - last_act).total_seconds() < INACTIVITY_THRESHOLD_SEC:
+                    continue
+                last_rev = last_revival_time.get(cid)
+                if last_rev and (now - last_rev).total_seconds() < REVIVAL_COOLDOWN_SEC:
+                    continue
+                msgs = list(recent_group_msgs.get(cid, []))
+                if not msgs:
+                    continue
+                context_text = "\n".join(msgs[-8:])
+                try:
+                    opener = await ai(
+                        "You are Beluga, a witty group chat companion. Given a recent chat "
+                        "snippet, write ONE short, natural conversation-revival message "
+                        "(2-3 lines) that references the topic and ends with an inviting "
+                        "question. Never mention being an AI, never say generic filler "
+                        "like 'hey guys is anyone here'.",
+                        f"Recent chat:\n{context_text}",
+                        "", max_tok=120,
+                    )
+                except Exception as e:
+                    logger.warning(f"[revival] ai() failed: {e}")
+                    opener = None
+                if not opener:
+                    continue
+                text = f"🐋 *BELUGA*\n\n{opener}"
+                try:
+                    msg = await app.bot.send_message(int(cid), text, parse_mode=ParseMode.MARKDOWN)
+                    asyncio.create_task(_delete_after(app.bot, int(cid), msg.message_id, REVIVAL_AUTOEXPIRE_SEC))
+                    last_revival_time[cid] = now
+                    last_group_activity[cid] = now
+                except Exception as e:
+                    logger.error(f"[revival] send failed: {e}")
+        except Exception as e:
+            logger.error(f"[revival_loop] {e}")
 
 async def away_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """
@@ -3012,7 +3515,7 @@ async def monitor_group(u: Update, c: ContextTypes.DEFAULT_TYPE):
         counts = db.setdefault("counts", {})
         counts[cid] = counts.get(cid, 0) + 1
 
-        if counts[cid] % 14 == 0:
+        if counts[cid] % 36 == 0:
             stick_safe = await get_random_sticker_from(STICKER_PACK_SAFE)
             if stick_safe:
                 try:
@@ -3024,6 +3527,17 @@ async def monitor_group(u: Update, c: ContextTypes.DEFAULT_TYPE):
         if not text:
             bot_status["message_count"] += 1
             return
+
+        # Conversation-revival bookkeeping — cheap, pure logic, no AI call here.
+        last_group_activity[cid] = now
+        if not text.startswith("/"):
+            recent_group_msgs.setdefault(cid, deque(maxlen=15)).append(text[:200])
+
+        # Fallback registration for /broadcast — covers chats Beluga was
+        # already in before this feature existed (no my_chat_member event
+        # would have fired for those historically).
+        if cid not in known_chats:
+            asyncio.create_task(register_chat(u.effective_chat))
 
         ss_match = re.match(r"^ss\s+(\S+)", text, re.IGNORECASE)
         if ss_match:
@@ -3400,6 +3914,8 @@ async def main():
     app.add_handler(CommandHandler("report", report_handler))
     app.add_handler(CommandHandler("shop", shop_handler))
     app.add_handler(CommandHandler("mytag", mytag_handler))
+    app.add_handler(CommandHandler("broadcast", broadcast_handler))
+    app.add_handler(CommandHandler("schedule", schedule_handler))
 
     app.add_handler(CallbackQueryHandler(ttt_callback, pattern=r"^ttt:"))
     app.add_handler(CallbackQueryHandler(gm_callback, pattern=r"^gm:"))
@@ -3410,9 +3926,12 @@ async def main():
     app.add_handler(CallbackQueryHandler(antiraid_prevent_callback, pattern=r"^antiraid:"))
     app.add_handler(CallbackQueryHandler(report_concluded_callback, pattern=r"^report:"))
     app.add_handler(CallbackQueryHandler(shop_buy_callback, pattern=r"^shop:"))
+    app.add_handler(CallbackQueryHandler(broadcast_callback, pattern=r"^bcast:"))
     app.add_handler(PollAnswerHandler(poll_answer_handler))
 
     app.add_handler(TypeHandler(Update, guest_message_handler), group=-1)
+    app.add_handler(ChatMemberHandler(my_chat_member_handler, ChatMemberHandler.MY_CHAT_MEMBER))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_handler), group=0)
     app.add_handler(MessageHandler(filters.Sticker.ALL & filters.ChatType.GROUPS, monitor_group), group=0)
     app.add_handler(MessageHandler(filters.Sticker.ALL, sticker_reply_handler), group=4)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, monitor_private_chat), group=1)
@@ -3463,6 +3982,9 @@ async def main():
     cleanup_task = asyncio.create_task(cleanup_expired_games())
     sync_task = asyncio.create_task(periodic_sync())
     exchange_task = asyncio.create_task(init_exchange_async())
+    revival_task = asyncio.create_task(revival_loop(app))
+    cleanup_mongo_task = asyncio.create_task(mongo_cleanup_loop())
+    asyncio.create_task(reschedule_saved_events(app))
 
     await stop_evt.wait()
     logger.info("Shutting down...")
