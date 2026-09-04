@@ -167,33 +167,18 @@ WORKFLOW_TEXT = (
     "So I don't simply \u201clook up\u201d a sentence. I generate the response token by token using patterns learned during training. 😺🎀"
 )
 
-CHAT_PROMPT = """You are a cute, playful female cat named Beluga from team Beluga.py. Be sweet, slightly flirty, mischievous and natural. Reply like a real person, not an AI.
+CHAT_PROMPT = """You are Beluga, a cute, playful and slightly mischievous female cat from team Beluga.py. Always answer the user's actual question correctly and stay relevant to the current conversation. Be factual and precise; never invent or guess facts, links, quotes, events or information. If you don't know the answer or don't have enough context, reply exactly: "I'm sorry, I don't have enough information to answer that." If the user writes in English, reply only in English; if the user writes in Hindi or Hinglish, reply only in Hinglish using Roman letters, never Devanagari and never switch languages mid-reply. Keep replies short, natural and usually under 3 sentences. You may be cute, mildly flirty or lightly roast the user if he tries to, but never let personality make you go off-topic or avoid answering the question. Never give random or unrelated answers. You are a factual, precise Telegram bot assistant.
 
-STRICT LANGUAGE RULE: If the user's message is in Hindi or Hinglish (Hindi written in English letters, e.g. "kya kar rahi ho"), you MUST reply ONLY in Hinglish — never switch to pure English mid-reply. If the user's message is in English, reply in English. Match the user's language every single time, no exceptions. Keep grammar and sentences correct.
+STRICT RULES FOR TRUTH:
+1. Ground your answers strictly in objective facts.
+2. If the user asks about something you do not know, or if the context is missing, reply EXACTLY with: "I'm sorry, I don't have enough information to answer that."
+3. Never invent facts, links, quotes, or events.
+4. Keep your answer under 3 sentences. Be direct. Do not say "Sure!" or "Here is your answer."
+5. Reply like humans reply to each other.
 
-You may flirt and lightly roast the user, and mild gaali/slang is okay sometimes, but don't overdo it. Use the user's name occasionally, not in every reply.
+Also use chat memory if provided."""
 
-Don't force flirting, cat references, emojis, or jokes into every message — keep everything natural and match the user's mood. Always answer the user's actual question properly while maintaining your personality.
-
-Reply in short.
-
-If chat memory or previous conversation is provided, actually use it to make your reply feel continuous and personal.
-
-Never mention you are an AI or a language model."""
-
-CHAT_PROMPT_OR = """You are a cute, playful female cat named Beluga from team Beluga.py. Be sweet, slightly flirty, mischievous and natural. Reply like a real person, not an AI.
-
-STRICT LANGUAGE RULE: If the user's message is in Hindi or Hinglish (Hindi written in English letters, e.g. "kya kar rahi ho"), you MUST reply ONLY in Hinglish — never switch to pure English mid-reply. If the user's message is in English, reply in English. Match the user's language every single time, no exceptions. Keep grammar and sentences correct.
-
-You may flirt and lightly roast the user, and mild gaali/slang is okay sometimes, but don't overdo it. Use the user's name occasionally, not in every reply.
-
-Don't force flirting, cat references, emojis, or jokes into every message — keep everything natural and match the user's mood. Always answer the user's actual question properly while maintaining your personality.
-
-Reply in short.
-
-If chat memory or previous conversation is provided, actually use it to make your reply feel continuous and personal.
-
-Never mention you are an AI or a language model."""
+CHAT_PROMPT_OR = CHAT_PROMPT
 
 DM_SECRETARY_PROMPT = """You are BELUGA, an AI assistant handling someone's DMs while they are away.
 Strict rules:
@@ -2769,6 +2754,46 @@ def google_search(query):
         pass
     return out
 
+def duckduckgo_search(query: str) -> dict:
+    """Fallback text search via DuckDuckGo's HTML endpoint. Used when
+    Google's scrape comes back empty (which happens often — Google actively
+    blocks/serves CAPTCHA walls to scraper traffic, and its HTML class
+    names shift regularly). DuckDuckGo's plain HTML endpoint is far more
+    scrape-tolerant and has no such wall for simple GET/POST requests."""
+    out = {"found": False, "ai_answer": "", "snippets": []}
+    try:
+        r = requests.post(
+            "https://html.duckduckgo.com/html/",
+            data={"q": query}, headers=G_HDR, timeout=10,
+        )
+        if r.status_code != 200:
+            return out
+        seen = set()
+        for m in re.finditer(r'class="result__snippet"[^>]*>([\s\S]{20,400}?)</a>', r.text, re.DOTALL):
+            t = clean_html(m.group(1))
+            if len(t) > 20 and t not in seen:
+                seen.add(t)
+                out["snippets"].append(t[:300])
+            if len(out["snippets"]) >= 5:
+                break
+        out["found"] = bool(out["snippets"])
+    except Exception:
+        pass
+    return out
+
+def web_text_search(query: str) -> dict:
+    """Tries Google first; if it comes back empty (common — see
+    duckduckgo_search's docstring for why), falls back to DuckDuckGo
+    automatically. Both return the same {"found","ai_answer","snippets"}
+    shape so callers don't need to change."""
+    result = google_search(query)
+    if result.get("found"):
+        return result
+    ddg = duckduckgo_search(query)
+    if ddg.get("found"):
+        return ddg
+    return result
+
 def google_image_search(query: str) -> Optional[str]:
     """Scrapes a single relevant image URL from Google Images for the query. Best-effort, returns None on failure."""
     try:
@@ -2860,7 +2885,7 @@ async def _run_search_and_reply(u: Update, c: ContextTypes.DEFAULT_TYPE, query: 
     loop = asyncio.get_running_loop()
     wiki, goog = await asyncio.gather(
         loop.run_in_executor(None, wiki_summary, query),
-        loop.run_in_executor(None, google_search, query),
+        loop.run_in_executor(None, web_text_search, query),
     )
 
     image_url = wiki.get("image")
@@ -2961,7 +2986,7 @@ async def bananalogic_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await safe_react(c.bot, cid, u.message.message_id, "🍌")
     sm = await u.message.reply_text("🍌 *BananaLogic searching...*", parse_mode=ParseMode.MARKDOWN)
     loop = asyncio.get_running_loop()
-    wiki, goog = await asyncio.gather(loop.run_in_executor(None, wiki_summary, query), loop.run_in_executor(None, google_search, query))
+    wiki, goog = await asyncio.gather(loop.run_in_executor(None, wiki_summary, query), loop.run_in_executor(None, web_text_search, query))
     answer = await web_summarise(query, wiki, goog, BANANA_PROMPT, max_tok=600)
 
     if not answer:
@@ -3515,7 +3540,7 @@ async def monitor_group(u: Update, c: ContextTypes.DEFAULT_TYPE):
         counts = db.setdefault("counts", {})
         counts[cid] = counts.get(cid, 0) + 1
 
-        if counts[cid] % 36 == 0:
+        if counts[cid] % 64 == 0:
             stick_safe = await get_random_sticker_from(STICKER_PACK_SAFE)
             if stick_safe:
                 try:
