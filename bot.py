@@ -5,6 +5,7 @@ from aiohttp import web
 import aiohttp
 from bs4 import BeautifulSoup
 import uuid
+import base64
 from collections import deque
 from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResultArticle, InputTextMessageContent, ChatPermissions
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -21,6 +22,10 @@ import ccxt
 import feedparser, qrcode, cv2
 from PIL import Image, ImageDraw, ImageFont
 from textblob import TextBlob
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+# NOTE: image/video understanding uses a vision-capable AI model via API call
+# (see _call_groq_vision) instead of local YOLO/torch — keeps this runnable
+# on Render's free tier where heavy ML libraries won't fit in RAM.
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO, handlers=[logging.StreamHandler(sys.stdout)])
 logger = logging.getLogger("Beluga")
@@ -76,6 +81,49 @@ STICKER_PACK_ALT = "pybelu_by_fStikBot"
 
 bot_status = {"running": False, "start_time": datetime.now(), "message_count": 0, "error_count": 0, "api_calls": 0, "failed_apis": 0, "username": ""}
 away_mode_state = {"on": False}
+sleep_mode_state = {}  # cid(str) -> {"on": bool, "wake_taps": set(uid_str)}
+SLEEP_WAKE_TAPS_NEEDED = 3
+
+# --- Sentiment analysis (VADER — fast, pure-python, safe to run on every message) ---
+vader_analyzer = SentimentIntensityAnalyzer()
+
+def get_sentiment(text: str) -> dict:
+    """Returns VADER's polarity scores dict: {'neg','neu','pos','compound'}.
+    compound ranges -1 (very negative) to +1 (very positive)."""
+    try:
+        return vader_analyzer.polarity_scores(text or "")
+    except Exception:
+        return {"neg": 0.0, "neu": 1.0, "pos": 0.0, "compound": 0.0}
+
+def mood_hint(text: str) -> str:
+    """Turns VADER's sentiment score into a short instruction appended to
+    the system prompt, so the AI's reply tone is refined to actually match
+    how the user sounds (gentle for upset messages, matched energy for
+    happy ones) instead of a flat one-size-fits-all tone."""
+    score = get_sentiment(text).get("compound", 0.0)
+    if score <= -0.6:
+        return "\n\nThe user's message sounds quite upset or distressed — be extra gentle, warm and understanding in your reply, don't joke around."
+    elif score <= -0.3:
+        return "\n\nThe user's message sounds a bit annoyed or down — soften your tone and be supportive."
+    elif score >= 0.6:
+        return "\n\nThe user's message sounds very happy/excited — match that energy!"
+    elif score >= 0.3:
+        return "\n\nThe user's message sounds upbeat — keep your reply light and positive."
+    return ""
+
+# --- Peace mode (per-group, admin-toggled fight/abuse detection) ---
+peace_mode_state = {}          # cid(str) -> {"on": bool}
+recent_negative_events = {}    # cid(str) -> deque[(uid_str, name, datetime)]
+last_peace_alert = {}          # cid(str) -> datetime
+PEACE_WINDOW_SEC = 180
+PEACE_ALERT_COOLDOWN_SEC = 300
+SINGLE_ABUSE_THRESHOLD = 3
+PROFANITY_WORDS = {
+    "madarchod", "behenchod", "bhosdike", "chutiya", "randi", "gandu", "lund",
+    "chod", "harami", "kamina", "saala kutta", "fuck", "fucker", "bitch",
+    "asshole", "bastard", "slut", "whore",
+}
+
 quiz_cooldown, active_polls, spam_tracker = {}, {}, {}
 db = {"scores": {}, "weekly": {}, "seen": {}, "counts": {}}
 
@@ -109,6 +157,22 @@ TAG_SHOP = [
     {"key": "HELPER", "label": "HELPER", "emoji": "👷", "cost": 3700, "color": "success"},
 ]
 SHOP_IMAGE_URL = "https://postimg.cc/kR3myZ0S"
+
+CUSTOM_TAG_COST = 20000
+CUSTOM_TAG_TIMEOUT_SEC = 30 * 60
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"
+    "\U00002600-\U000027BF"
+    "\U0001F1E6-\U0001F1FF"
+    "\U00002190-\U000021FF"
+    "\U00002B00-\U00002BFF"
+    "\U0001F000-\U0001F0FF"
+    "\uFE0F"
+    "]", flags=re.UNICODE,
+)
+# prompt_message_id(int) -> {"cid":str, "uid":str, "user_name":str, "fulfilled":bool}
+pending_custom_tags = {}
 
 def tagged_name(cid: str, uid: str, name: str) -> str:
     """Prefixes a user's display name with their purchased shop tag, if any."""
@@ -173,7 +237,7 @@ Always react naturally to what the user says. Treat casual, emotional, imaginary
 
 LANGUAGE: If the user speaks in Hinglish, reply in Hinglish. If the user speaks in English, reply in English. If they mix both, naturally mix both. Use ONLY Roman/Latin script — NEVER Devanagari.
 
-Match the user's mood with natural emotions, humor, teasing, affection, sarcasm and reactions. If the user roasts or mildly abuses you, roast them back playfully; mild casual abuse is allowed when it fits. Don't randomly roast.
+Match the user's mood with natural emotions, humor, teasing, affection, sarcasm and reactions. If the user roasts or mildly abuses you, roast them back ; abuse is allowed when it fits. Don't randomly roast.
 
 Stay relevant and answer exactly what the user asks. Use provided chat memory whenever relevant. Never invent memories or facts.
 
@@ -676,6 +740,7 @@ def bump_score(cid: str, uid: str, name: str, delta: int) -> int:
     return e["score"]
 
 GROQ_MODEL = "openai/gpt-oss-20b"
+GROQ_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 OR_MODEL = "google/gemma-4-26b-a4b-it:free"
 OR_BASE = "https://openrouter.ai/api/v1"
 
@@ -986,6 +1051,7 @@ async def shop_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     current_pts = db.get("scores", {}).get(cid, {}).get(uid, {}).get("score", 0)
 
     lines = [f"*{t['label']}* {t['emoji']}  —  *{t['cost']:,}* points" for t in TAG_SHOP]
+    lines.append(f"*CUSTOM TAG* ✨  —  *{CUSTOM_TAG_COST:,}* points _(pick your own name!)_")
     text = (
         "🎀 *FOLLOWING TAGS ARE AVAILABLE FOR PURCHASE* 🎀\n"
         "━━━━━━━━━━━━━━━━━━━━\n" + "\n\n".join(lines) +
@@ -993,7 +1059,8 @@ async def shop_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     )
     row1 = [InlineKeyboardButton(str(t["cost"]), callback_data=f"shop:buy:{t['key']}", style=t["color"]) for t in TAG_SHOP[:2]]
     row2 = [InlineKeyboardButton(str(t["cost"]), callback_data=f"shop:buy:{t['key']}", style=t["color"]) for t in TAG_SHOP[2:]]
-    kb = InlineKeyboardMarkup([row1, row2])
+    row3 = [InlineKeyboardButton(f"✨ CUSTOM — {CUSTOM_TAG_COST:,}", callback_data="shop:buy:CUSTOM", style="success")]
+    kb = InlineKeyboardMarkup([row1, row2, row3])
 
     sent = await send_photo_safe(c.bot, u.effective_chat.id, SHOP_IMAGE_URL, caption=text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
     if not sent:
@@ -1021,6 +1088,28 @@ async def shop_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         _, _, tag_key = q.data.split(":", 2)
+
+        if tag_key == "CUSTOM":
+            cid, uid = str(q.message.chat_id), str(q.from_user.id)
+            current_pts = db.get("scores", {}).get(cid, {}).get(uid, {}).get("score", 0)
+            if current_pts < CUSTOM_TAG_COST:
+                await q.answer(f"😿 Not enough points! You have {current_pts:,}, need {CUSTOM_TAG_COST:,}.", show_alert=True)
+                return
+            bump_score(cid, uid, get_user_name(q.from_user), -CUSTOM_TAG_COST)
+            await sync_leaderboard_chat_to_mongo(cid)
+            await q.answer("🎉 Purchased!")
+            user_name = get_user_name(q.from_user)
+            prompt = await context.bot.send_message(
+                q.message.chat_id,
+                f"Hi {user_name} 🎀 CONGRATS ON BUYING THE EXCLUSIVE CUSTOM TAG! "
+                f"SEND ME THE TAG NAME YOU WANT TO SET (reply to this message).",
+            )
+            pending_custom_tags[prompt.message_id] = {
+                "cid": cid, "uid": uid, "user_name": user_name, "fulfilled": False,
+            }
+            asyncio.create_task(_expire_custom_tag_request(context, prompt.message_id))
+            return
+
         tag = next((t for t in TAG_SHOP if t["key"] == tag_key), None)
         if not tag:
             await q.answer("😿 Unknown tag.", show_alert=True)
@@ -1066,6 +1155,73 @@ async def shop_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
     except Exception as e:
         logger.error(f"[shop_buy_callback] {e}")
+
+async def _expire_custom_tag_request(context: ContextTypes.DEFAULT_TYPE, prompt_msg_id: int):
+    """If the user hasn't sent a valid tag name within 30 minutes, refund their points."""
+    await asyncio.sleep(CUSTOM_TAG_TIMEOUT_SEC)
+    req = pending_custom_tags.get(prompt_msg_id)
+    if not req or req["fulfilled"]:
+        return
+    req["fulfilled"] = True  # stop the reply handler from also processing it
+    bump_score(req["cid"], req["uid"], req["user_name"], CUSTOM_TAG_COST)
+    await sync_leaderboard_chat_to_mongo(req["cid"])
+    try:
+        await context.bot.send_message(
+            int(req["cid"]),
+            f"⏰ {req['user_name']}, you didn't send a tag name in time — your "
+            f"{CUSTOM_TAG_COST:,} points have been refunded.",
+        )
+    except Exception as e:
+        logger.error(f"[_expire_custom_tag_request] {e}")
+    pending_custom_tags.pop(prompt_msg_id, None)
+
+async def handle_custom_tag_reply(u: Update, c: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    Checks if this message is a reply to a pending custom-tag prompt from
+    the SAME user, and if so, validates + applies (or explains what's
+    wrong and asks them to resend). Returns True if it handled the message
+    (so the caller — monitor_group — should stop further processing).
+    """
+    if not u.message or not u.message.reply_to_message:
+        return False
+    prompt_id = u.message.reply_to_message.message_id
+    req = pending_custom_tags.get(prompt_id)
+    if not req or req["fulfilled"]:
+        return False
+    if str(u.effective_user.id) != req["uid"]:
+        return False
+
+    tag_name = (u.message.text or "").strip()
+    problems = []
+    if len(tag_name) > 16:
+        problems.append(f"it's {len(tag_name)} characters — max is *16*")
+    if _EMOJI_RE.search(tag_name):
+        problems.append("it contains emojis, which aren't supported")
+    if not tag_name:
+        problems.append("it's empty")
+
+    if problems:
+        await u.message.reply_text(
+            f"😿 Can't use that tag — {', and '.join(problems)}. Please resend a valid tag name.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return True
+
+    try:
+        await c.bot.set_chat_member_tag(chat_id=int(req["cid"]), user_id=int(req["uid"]), tag=tag_name)
+    except Exception as e:
+        logger.error(f"[handle_custom_tag_reply] set_chat_member_tag failed: {e}")
+        await u.message.reply_text(
+            "😿 I need the 'Edit Member Tags' admin permission to set this — ask an admin to enable it for me!",
+        )
+        return True
+
+    req["fulfilled"] = True
+    member_tags.setdefault(req["cid"], {})[req["uid"]] = tag_name
+    await sync_tags_to_mongo(req["cid"])
+    pending_custom_tags.pop(prompt_id, None)
+    await u.message.reply_text(f"🎀 Done! Your tag is now set to *{tag_name}*.", parse_mode=ParseMode.MARKDOWN)
+    return True
 
 async def broadcast_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """
@@ -1424,6 +1580,293 @@ async def revival_loop(app):
                     logger.error(f"[revival] send failed: {e}")
         except Exception as e:
             logger.error(f"[revival_loop] {e}")
+
+async def peace_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Group-admin-only: /peace — shows current Peace Mode status with an
+    inline ON/OFF toggle. While ON, this group's messages get scanned for
+    fights/abuse (sentiment + keywords); it does NOT run in groups where
+    this hasn't been explicitly turned on."""
+    if not u.message or u.effective_chat.type == "private":
+        await u.message.reply_text("🐱 `/peace` only works inside a group.", parse_mode=ParseMode.MARKDOWN)
+        return
+    if not await is_group_admin(c.bot, u.effective_chat.id, u.effective_user.id):
+        await u.message.reply_text("🚫 Only group admins can toggle Peace Mode.")
+        return
+    cid = str(u.effective_chat.id)
+    st = peace_mode_state.setdefault(cid, {"on": False})
+    status = "ON ✅" if st["on"] else "OFF ❌"
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ ON", callback_data=f"peace:on:{cid}", style="success"),
+        InlineKeyboardButton("❌ OFF", callback_data=f"peace:off:{cid}", style="danger"),
+    ]])
+    await u.message.reply_text(
+        f"☮️ *PEACE MODE*\n\nCurrent status: *{status}*\n\n"
+        f"_Watches for fights/abuse and warns the group + tags admins._",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=kb,
+    )
+
+async def peace_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    try:
+        _, action, cid = q.data.split(":", 2)
+        if not await is_group_admin(context.bot, int(cid), q.from_user.id):
+            await q.answer("🚫 Admins only.", show_alert=True)
+            return
+        st = peace_mode_state.setdefault(cid, {"on": False})
+        st["on"] = (action == "on")
+        recent_negative_events.pop(cid, None)
+        await q.answer("Updated!")
+        status = "ON ✅" if st["on"] else "OFF ❌"
+        await q.edit_message_text(
+            f"☮️ *PEACE MODE*\n\nCurrent status: *{status}*\n\n"
+            f"_Watches for fights/abuse and warns the group + tags admins._",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception as e:
+        logger.error(f"[peace_callback] {e}")
+
+def is_negative_or_abusive(text: str) -> bool:
+    """Fast, always-cheap check: VADER strong-negative OR a profanity hit.
+    Ambiguous short-negative messages get a lightweight TextBlob second
+    opinion (pure-python, no model download) instead of a heavy model."""
+    if not text:
+        return False
+    low = text.lower()
+    if any(w in low for w in PROFANITY_WORDS):
+        return True
+    score = get_sentiment(text).get("compound", 0.0)
+    if score <= -0.6:
+        return True
+    if -0.6 < score <= -0.3 and len(text.split()) <= 6:
+        try:
+            return TextBlob(text).sentiment.polarity <= -0.3
+        except Exception:
+            return False
+    return False
+
+async def check_peace_mode(c: ContextTypes.DEFAULT_TYPE, cid: str, uid: int, name: str, text: str, now: datetime):
+    """Only runs at all when Peace Mode is ON for this specific chat."""
+    if not peace_mode_state.get(cid, {}).get("on"):
+        return
+    if not is_negative_or_abusive(text):
+        return
+
+    last_alert = last_peace_alert.get(cid)
+    if last_alert and (now - last_alert).total_seconds() < PEACE_ALERT_COOLDOWN_SEC:
+        return
+
+    events = recent_negative_events.setdefault(cid, deque(maxlen=20))
+    events.append((str(uid), name, now))
+    cutoff = now - timedelta(seconds=PEACE_WINDOW_SEC)
+    while events and events[0][2] < cutoff:
+        events.popleft()
+
+    distinct_users = {}
+    for u_id, u_name, ts in events:
+        distinct_users[u_id] = u_name
+
+    try:
+        if len(distinct_users) >= 2:
+            names = list(distinct_users.values())[-2:]
+            text_alert = (
+                f"🚨 {names[0]} and {names[1]} stop fighting in the group and maintain peace 🙏 "
+                f"Or else strict actions will be taken 😡.\n\n"
+                f"Dear admins, mute them ASAP..."
+            )
+            await c.bot.send_message(int(cid), text_alert)
+            last_peace_alert[cid] = now
+            recent_negative_events[cid] = deque(maxlen=20)
+        else:
+            same_user_count = sum(1 for u_id, _, _ in events if u_id == str(uid))
+            if same_user_count >= SINGLE_ABUSE_THRESHOLD:
+                text_alert = (
+                    f"🚨 {name} stop the abusive language and maintain peace in the group 🙏 "
+                    f"Or else strict actions will be taken 😡.\n\n"
+                    f"Dear admins, mute them ASAP..."
+                )
+                await c.bot.send_message(int(cid), text_alert)
+                last_peace_alert[cid] = now
+                recent_negative_events[cid] = deque(maxlen=20)
+    except Exception as e:
+        logger.error(f"[check_peace_mode] {e}")
+
+IMAGE_QUERY_RE = re.compile(
+    r"what('?s| is)?\s*(in|this|it)|ye\s*kya|yeh\s*kya|kya\s*hai\s*(is|ye|yeh)|"
+    r"what('?s| is)?\s*(happening|going on)|is\s*mein\s*kya",
+    re.IGNORECASE,
+)
+
+async def _call_groq_vision(image_b64: str, question: str) -> Optional[str]:
+    """Sends an image straight to Groq's vision-capable chat model. No local
+    ML at all (no torch/YOLO/opencv-DNN) — this is a single lightweight API
+    call, which is what makes 'seeing' images possible on Render's free
+    tier where heavy ML libraries simply won't fit in RAM."""
+    if not GROQ_KEY:
+        return None
+    payload = {
+        "model": GROQ_VISION_MODEL,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": question},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+            ],
+        }],
+        "max_tokens": 200,
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
+                json=payload, timeout=aiohttp.ClientTimeout(total=20),
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    return data["choices"][0]["message"]["content"].strip()
+                logger.error(f"[vision] Groq error {r.status}: {(await r.text())[:200]}")
+    except Exception as e:
+        logger.error(f"[vision] {e}")
+    return None
+
+def _extract_video_frame_b64(buf: io.BytesIO) -> Optional[str]:
+    """Grabs ONE middle frame from a video via cv2 (already a dependency for
+    QR scanning — no extra weight) and returns it as base64 JPEG."""
+    tmp_path = f"/tmp/{uuid.uuid4().hex}.mp4"
+    try:
+        with open(tmp_path, "wb") as f:
+            f.write(buf.read())
+        cap = cv2.VideoCapture(tmp_path)
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+        cap.set(cv2.CAP_PROP_POS_FRAMES, total // 2)
+        ok, frame = cap.read()
+        cap.release()
+        if not ok:
+            return None
+        ok2, jpg = cv2.imencode(".jpg", frame)
+        if not ok2:
+            return None
+        return base64.b64encode(jpg.tobytes()).decode()
+    except Exception as e:
+        logger.error(f"[_extract_video_frame_b64] {e}")
+        return None
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+async def image_understanding_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """
+    Runs when someone tags/mentions Beluga on a photo/video, or asks an
+    explicit 'what's in this' style question as the caption. Sends the
+    image (or one extracted video frame) directly to a vision-capable AI
+    model in Beluga's own voice — no local ML models involved at all.
+    """
+    if not u.message:
+        return
+    photo, video = u.message.photo, u.message.video
+    if not photo and not video:
+        return
+    caption = (u.message.caption or "").strip()
+    bot_username = bot_status.get("username", "")
+    mentioned = bool(bot_username) and f"@{bot_username}" in caption.lower()
+    is_question = bool(IMAGE_QUERY_RE.search(caption))
+    is_reply_to_bot = bool(
+        u.message.reply_to_message
+        and u.message.reply_to_message.from_user
+        and u.message.reply_to_message.from_user.id == c.bot.id
+    )
+    if not (mentioned or is_question or is_reply_to_bot):
+        return
+
+    sm = await u.message.reply_text("👀 *Looking...*", parse_mode=ParseMode.MARKDOWN)
+    loop = asyncio.get_running_loop()
+    try:
+        buf = io.BytesIO()
+        if photo:
+            f = await c.bot.get_file(photo[-1].file_id)
+            await f.download_to_memory(buf)
+            buf.seek(0)
+            image_b64 = base64.b64encode(buf.read()).decode()
+        else:
+            f = await c.bot.get_file(video.file_id)
+            await f.download_to_memory(buf)
+            buf.seek(0)
+            image_b64 = await loop.run_in_executor(None, _extract_video_frame_b64, buf)
+
+        if not image_b64:
+            await sm.edit_text("😿 Couldn't read that file.")
+            return
+
+        question = caption if is_question else "What's in this image? Describe it naturally in 1-2 sentences."
+        summary = await _call_groq_vision(image_b64, question)
+        if not summary:
+            summary = "I looked, but couldn't quite make it out! 🐾"
+        try:
+            await sm.edit_text(summary)
+        except Exception:
+            await u.message.reply_text(summary)
+    except Exception as e:
+        logger.error(f"[image_understanding_handler] {e}")
+        try:
+            await sm.edit_text("😿 Couldn't analyze that — try again?")
+        except Exception:
+            pass
+
+async def sleep_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Group-admin-only: /sleep — toggles sleep mode for THIS group. While
+    asleep, Beluga ignores everything except being tagged/mentioned/replied
+    to, in which case she posts the sleeping notice with a WAKE ME UP button
+    — 3 distinct people tapping it auto-wakes her for that group."""
+    if not u.message or u.effective_chat.type == "private":
+        await u.message.reply_text("🐱 `/sleep` only works inside a group.", parse_mode=ParseMode.MARKDOWN)
+        return
+    if not await is_group_admin(c.bot, u.effective_chat.id, u.effective_user.id):
+        await u.message.reply_text("🚫 Only group admins can toggle sleep mode.")
+        return
+    cid = str(u.effective_chat.id)
+    st = sleep_mode_state.setdefault(cid, {"on": False, "wake_taps": set()})
+    st["on"] = not st["on"]
+    st["wake_taps"] = set()
+    if st["on"]:
+        await u.message.reply_text("😴 *Sleep mode ON* — I'll stay quiet unless someone tags me.", parse_mode=ParseMode.MARKDOWN)
+    else:
+        await u.message.reply_text("☀️ *Sleep mode OFF* — I'm back!", parse_mode=ParseMode.MARKDOWN)
+
+async def _send_sleeping_notice(c: ContextTypes.DEFAULT_TYPE, cid: str):
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("WAKE ME UP 😴", callback_data=f"wake:{cid}", style="primary")]])
+    try:
+        await c.bot.send_message(int(cid), "I am sleeping 😴 brah!!", reply_markup=kb)
+    except Exception as e:
+        logger.error(f"[sleep_notice] {e}")
+
+async def wake_me_up_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    try:
+        _, cid = q.data.split(":", 1)
+        st = sleep_mode_state.setdefault(cid, {"on": False, "wake_taps": set()})
+        if not st["on"]:
+            await q.answer("Already awake!")
+            return
+        st["wake_taps"].add(str(q.from_user.id))
+        remaining = SLEEP_WAKE_TAPS_NEEDED - len(st["wake_taps"])
+        if remaining > 0:
+            await q.answer(f"👋 {remaining} more tap(s) needed to wake me up!")
+            return
+        st["on"] = False
+        st["wake_taps"] = set()
+        await q.answer("😻 Waking up!")
+        try:
+            await q.edit_message_text("☀️ *Beluga is awake now!*", parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"[wake_me_up_callback] {e}")
 
 async def away_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """
@@ -1816,44 +2259,6 @@ async def qr_scan_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             await sm.edit_text("😿 QR data unreadable.")
     except Exception as e:
         logger.error(f"[qr_scan] {e}")
-
-async def img_handler(u: Update, c: ContextTypes.DEFAULT_TYPE, action: str):
-    if not u.message or not u.message.reply_to_message or not u.message.reply_to_message.photo:
-        await u.message.reply_text("🐱 Reply to a photo.")
-        return
-    try:
-        sm = await u.message.reply_text("📦 *Processing image...*", parse_mode=ParseMode.MARKDOWN)
-        p = u.message.reply_to_message.photo[-1]
-        f = await c.bot.get_file(p.file_id)
-        b = io.BytesIO()
-        await f.download_to_memory(b)
-        b.seek(0)
-        loop = asyncio.get_running_loop()
-        if action == "info":
-            im = Image.open(b)
-            await sm.edit_text(
-                f"🖼 *Image Report*\n━━━━━━━━━━━━━━━━━━━━\n📐 *Resolution:* `{im.size[0]} x {im.size[1]} pixels`\n🎨 *Color Mode:* `{im.mode}`\n💾 *Size:* `{p.file_size / 1024:.2f} KB`\n━━━━━━━━━━━━━━━━━━━━",
-                parse_mode=ParseMode.MARKDOWN
-            )
-        elif action == "resize":
-            def _scale():
-                im = Image.open(b)
-                out = im.resize((512, 512), Image.Resampling.LANCZOS)
-                out_b = io.BytesIO(); out.save(out_b, "PNG"); out_b.seek(0)
-                return out_b
-            res_b = await loop.run_in_executor(None, _scale)
-            await sm.delete()
-            await u.message.reply_photo(photo=res_b, caption="📐 *Resized to 512×512.*")
-        elif action == "compress":
-            def _crunch():
-                im = Image.open(b)
-                out_b = io.BytesIO(); im.save(out_b, "JPEG", quality=22); out_b.seek(0)
-                return out_b
-            res_b = await loop.run_in_executor(None, _crunch)
-            await sm.delete()
-            await u.message.reply_photo(photo=res_b, caption="💾 *Compressed.*")
-    except Exception as e:
-        logger.error(f"[img_handler] {e}")
 
 def _wrap_text(draw, text: str, font, max_width: int) -> list:
     words = text.split()
@@ -3170,30 +3575,6 @@ async def yt_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             pass
 
 
-async def block_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Owner-only. /block <pack_name OR t.me/addstickers/ URL> bans a sticker pack."""
-    if not u.message:
-        return
-    try:
-        if not is_owner(u.effective_user.id if u.effective_user else 0):
-            await u.message.reply_text("🚫 Owner only.")
-            return
-        parts = u.message.text.split(maxsplit=1)
-        if len(parts) < 2:
-            await u.message.reply_text("⚠️ Usage: `/block pack_name` or `/block https://t.me/addstickers/packname`")
-            return
-        pack_input = parts[1].strip()
-        pack_name = pack_input.split("t.me/addstickers/")[-1].strip("/") if "t.me/addstickers/" in pack_input else pack_input
-        await ban_sticker_pack(pack_name)
-        await u.message.reply_text(
-            f"🚫 *Pack blocked:* `{pack_name}`\n"
-            f"Any sticker from this pack sent by anyone in this group will now be auto-deleted.",
-            parse_mode=ParseMode.MARKDOWN
-        )
-    except Exception as e:
-        logger.error(f"[block] {e}")
-        await u.message.reply_text(f"❌ Error: `{str(e)[:60]}`")
-
 async def monitor_private_chat(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """
     Plain AI chat for DMs by default. If /away mode is ON and the sender
@@ -3238,7 +3619,7 @@ async def monitor_private_chat(u: Update, c: ContextTypes.DEFAULT_TYPE):
         memory = await get_user_memory(uid)
         mem_ctx = build_memory_context(memory)
         hist_ctx = build_chat_history_context(memory)
-        system = f"{CHAT_PROMPT}\nThe user's name is {user_name}.{mem_ctx}{hist_ctx}"
+        system = f"{CHAT_PROMPT}\nThe user's name is {user_name}.{mem_ctx}{hist_ctx}{mood_hint(text)}"
         reply = await ai(system, text, f"Hey {user_name}! 🐾", max_tok=250)
 
         try:
@@ -3285,7 +3666,7 @@ async def monitor_ghost_mode(u: Update, c: ContextTypes.DEFAULT_TYPE):
         memory = await get_user_memory(uid)
         mem_ctx = build_memory_context(memory)
         hist_ctx = build_chat_history_context(memory)
-        system = f"{CHAT_PROMPT}\nThe user's name is {user_name}.{mem_ctx}{hist_ctx}"
+        system = f"{CHAT_PROMPT}\nThe user's name is {user_name}.{mem_ctx}{hist_ctx}{mood_hint(text)}"
         reply = await ai(system, msg_content, f"Hey {user_name}! 🐾", max_tok=250)
         await u.message.reply_text(reply, reply_to_message_id=u.message.message_id)
         await append_chat_history(uid, msg_content, reply)
@@ -3495,6 +3876,12 @@ async def monitor_group(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return
     try:
         uid, cid, now = u.effective_user.id, str(u.effective_chat.id), datetime.now()
+        text_early = (u.message.text or u.message.caption or "").strip()
+
+        if pending_custom_tags and u.message.reply_to_message and u.message.text:
+            handled = await handle_custom_tag_reply(u, c)
+            if handled:
+                return
 
         if u.message.sticker:
             pack_of_sticker = getattr(u.message.sticker, "set_name", None)
@@ -3535,6 +3922,9 @@ async def monitor_group(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 await c.bot.send_message(int(cid), f"*{dstat['messages']} messages reached 💖*", parse_mode=ParseMode.MARKDOWN)
             except Exception:
                 pass
+
+        if text_early and peace_mode_state.get(cid, {}).get("on"):
+            asyncio.create_task(check_peace_mode(c, cid, uid, get_user_name(u.effective_user), text_early, now))
 
         db.setdefault("seen", {}).setdefault(cid, {})[str(uid)] = {
             "id": uid, "un": u.effective_user.username, "n": u.effective_user.first_name or "User"
@@ -3593,6 +3983,12 @@ async def monitor_group(u: Update, c: ContextTypes.DEFAULT_TYPE):
                     and u.message.reply_to_message.from_user.id == c.bot.id)
 
         if contains_beluga or contains_username or is_reply:
+            sleep_st = sleep_mode_state.get(cid)
+            if sleep_st and sleep_st.get("on"):
+                await _send_sleeping_notice(c, cid)
+                bot_status["message_count"] += 1
+                return
+
             try: await asyncio.wait_for(c.bot.send_chat_action(u.effective_chat.id, "typing"), timeout=4.0)
             except Exception: pass
 
@@ -3604,7 +4000,7 @@ async def monitor_group(u: Update, c: ContextTypes.DEFAULT_TYPE):
             memory = await get_user_memory(uid)
             mem_ctx = build_memory_context(memory)
             hist_ctx = build_chat_history_context(memory)
-            system = f"{CHAT_PROMPT}\nThe user's name is {user_name}.{mem_ctx}{hist_ctx}"
+            system = f"{CHAT_PROMPT}\nThe user's name is {user_name}.{mem_ctx}{hist_ctx}{mood_hint(text)}"
             reply = await ai(system, text, f"Hey {user_name}! 🐾", max_tok=250)
 
             try:
@@ -3699,16 +4095,12 @@ WHAT_I_CAN_DO_TEXT = (
     "*🖼️ Image Tools*\n"
     "`/qr` — QR code generator\n"
     "`/scanqr` — scan a QR code\n"
-    "`/resize` `/compress` — image tools\n"
-    "`/watermark` — add a watermark\n"
-    "`/imginfo` — image details\n\n"
-    "*🏆 Leaderboard*\n"
+    "`/watermark` — add a watermark\n\n"
+    "*🏆 Leaderboard & Shop*\n"
     "`/lb` — view rankings\n"
-    "`/gm` `/nw` `/pump` `/dump` — admin tools\n\n"
+    "`/shop` — spend points on a tag\n"
+    "`/mytag` — check your tag\n\n"
     "*🎀 Extras*\n"
-    "`/model` — pick AI engine (admin)\n"
-    "`/block` — ban a sticker pack (admin)\n"
-    "`/clearmemory` — wipe memory (admin)\n"
     "`/workflow` — how I think"
 )
 
@@ -3919,10 +4311,7 @@ async def main():
     app.add_handler(CommandHandler("yt", yt_handler))
     app.add_handler(CommandHandler("qr", qr_generate_handler))
     app.add_handler(CommandHandler("scanqr", qr_scan_handler))
-    app.add_handler(CommandHandler("resize", lambda u, c: img_handler(u, c, "resize")))
-    app.add_handler(CommandHandler("compress", lambda u, c: img_handler(u, c, "compress")))
     app.add_handler(CommandHandler("watermark", watermark_handler))
-    app.add_handler(CommandHandler("imginfo", lambda u, c: img_handler(u, c, "info")))
     app.add_handler(CommandHandler("quiz", quiz_handler))
     app.add_handler(CommandHandler(["lb", "leaderboard"], lb_handler))
     app.add_handler(CommandHandler("nw", nw_handler))
@@ -3931,7 +4320,6 @@ async def main():
     app.add_handler(CommandHandler("mine", mine_handler))
     app.add_handler(CommandHandler("gm", gm_handler))
     app.add_handler(CommandHandler(["gay", "couple"], fun_dispatcher))
-    app.add_handler(CommandHandler("block", block_handler))
     app.add_handler(CommandHandler("clearmemory", clearmemory_handler))
     app.add_handler(CommandHandler("ping", ping_handler))
     app.add_handler(CommandHandler("model", model_command_handler))
@@ -3941,6 +4329,8 @@ async def main():
     app.add_handler(CommandHandler("report", report_handler))
     app.add_handler(CommandHandler("shop", shop_handler))
     app.add_handler(CommandHandler("mytag", mytag_handler))
+    app.add_handler(CommandHandler("sleep", sleep_handler))
+    app.add_handler(CommandHandler("peace", peace_handler))
     app.add_handler(CommandHandler("broadcast", broadcast_handler))
     app.add_handler(CommandHandler("schedule", schedule_handler))
 
@@ -3953,12 +4343,15 @@ async def main():
     app.add_handler(CallbackQueryHandler(antiraid_prevent_callback, pattern=r"^antiraid:"))
     app.add_handler(CallbackQueryHandler(report_concluded_callback, pattern=r"^report:"))
     app.add_handler(CallbackQueryHandler(shop_buy_callback, pattern=r"^shop:"))
+    app.add_handler(CallbackQueryHandler(wake_me_up_callback, pattern=r"^wake:"))
+    app.add_handler(CallbackQueryHandler(peace_callback, pattern=r"^peace:"))
     app.add_handler(CallbackQueryHandler(broadcast_callback, pattern=r"^bcast:"))
     app.add_handler(PollAnswerHandler(poll_answer_handler))
 
     app.add_handler(TypeHandler(Update, guest_message_handler), group=-1)
     app.add_handler(ChatMemberHandler(my_chat_member_handler, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_handler), group=0)
+    app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, image_understanding_handler), group=0)
     app.add_handler(MessageHandler(filters.Sticker.ALL & filters.ChatType.GROUPS, monitor_group), group=0)
     app.add_handler(MessageHandler(filters.Sticker.ALL, sticker_reply_handler), group=4)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, monitor_private_chat), group=1)
