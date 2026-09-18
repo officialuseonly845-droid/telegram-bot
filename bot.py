@@ -58,7 +58,19 @@ mongo_tags_col = mongo_db["member_tags"] if mongo_db is not None else None
 mongo_chats_col = mongo_db["known_chats"] if mongo_db is not None else None
 mongo_events_col = mongo_db["scheduled_events"] if mongo_db is not None else None
 mongo_stories_col = mongo_db["stories"] if mongo_db is not None else None
-story_gridfs = AsyncIOMotorGridFSBucket(mongo_db, bucket_name="story_pdfs") if mongo_db is not None else None
+# NOTE: AsyncIOMotorGridFSBucket must NOT be constructed at import time — its
+# __init__ eagerly calls database.get_io_loop(), which needs a RUNNING event
+# loop. On Python 3.14, asyncio.get_event_loop() no longer auto-creates one,
+# so building this at module level raises "no current event loop" on startup.
+# Build it lazily on first use, once the bot's event loop is actually running.
+_story_gridfs = None
+def get_story_gridfs():
+    global _story_gridfs
+    if mongo_db is None:
+        return None
+    if _story_gridfs is None:
+        _story_gridfs = AsyncIOMotorGridFSBucket(mongo_db, bucket_name="story_pdfs")
+    return _story_gridfs
 _story_pdf_cache = {}  # story_id(str) -> raw pdf bytes (small in-memory cache to avoid re-downloading on every page flip)
 STORY_PDF_CACHE_MAX = 8
 
@@ -1072,6 +1084,7 @@ async def publish_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not is_owner(u.effective_user.id if u.effective_user else 0):
         await u.message.reply_text("🚫 Owner only.")
         return
+    story_gridfs = get_story_gridfs()
     if story_gridfs is None or mongo_stories_col is None:
         await u.message.reply_text("😿 MongoDB isn't configured — can't publish stories.")
         return
@@ -1109,7 +1122,6 @@ async def publish_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             return
 
         story_id = str(uuid.uuid4())[:12]
-        loop = asyncio.get_running_loop()
         gridfs_id = await story_gridfs.upload_from_stream(f"{story_id}.pdf", pdf_bytes)
         await mongo_stories_col.insert_one({
             "_id": story_id, "name": story_name, "gridfs_id": gridfs_id,
@@ -1136,7 +1148,7 @@ async def _get_story_pdf_bytes(story_id: str) -> Optional[bytes]:
         return None
     try:
         stream = io.BytesIO()
-        await story_gridfs.download_to_stream(story["gridfs_id"], stream)
+        await get_story_gridfs().download_to_stream(story["gridfs_id"], stream)
         pdf_bytes = stream.getvalue()
     except Exception as e:
         logger.error(f"[_get_story_pdf_bytes] {e}")
