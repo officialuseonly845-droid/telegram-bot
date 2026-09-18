@@ -6,9 +6,10 @@ import aiohttp
 from bs4 import BeautifulSoup
 import uuid
 import base64
+import fitz  # PyMuPDF — used only by /publish + /story to render PDF pages as images
 from collections import deque
-from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResultArticle, InputTextMessageContent, ChatPermissions
-from motor.motor_asyncio import AsyncIOMotorClient
+from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResultArticle, InputTextMessageContent, ChatPermissions, InputMediaPhoto
+from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorGridFSBucket
 from telegram.ext import (
     Application as TGApp, CommandHandler, ContextTypes, MessageHandler, PollAnswerHandler,
     CallbackQueryHandler, TypeHandler, ChatMemberHandler, filters,
@@ -56,6 +57,10 @@ mongo_tags_col = mongo_db["member_tags"] if mongo_db is not None else None
 # ever touches mongo_memory_col, so this registry is NEVER wiped by it.
 mongo_chats_col = mongo_db["known_chats"] if mongo_db is not None else None
 mongo_events_col = mongo_db["scheduled_events"] if mongo_db is not None else None
+mongo_stories_col = mongo_db["stories"] if mongo_db is not None else None
+story_gridfs = AsyncIOMotorGridFSBucket(mongo_db, bucket_name="story_pdfs") if mongo_db is not None else None
+_story_pdf_cache = {}  # story_id(str) -> raw pdf bytes (small in-memory cache to avoid re-downloading on every page flip)
+STORY_PDF_CACHE_MAX = 8
 
 known_chats = {}          # cid(str) -> {"id":int,"title":str,"username":str|None,"type":str}
 scheduled_events = {}     # cid(str) -> [ {id,name,time(iso str),emoji} ]
@@ -78,6 +83,7 @@ FILE_STICKERS = "beluga_stickers.json"
 STICKER_PACK_MAIN = "t_me_belugapack_mystickers_by_fStikBot"
 STICKER_PACK_SAFE = "t_me_staysafebelu_by_fStikBot"
 STICKER_PACK_ALT = "pybelu_by_fStikBot"
+STICKER_PACK_WELCOME = "BELUGA_WELCOMES_YOU_by_fStikBot"
 
 bot_status = {"running": False, "start_time": datetime.now(), "message_count": 0, "error_count": 0, "api_calls": 0, "failed_apis": 0, "username": ""}
 away_mode_state = {"on": False}
@@ -1041,6 +1047,215 @@ async def report_concluded_callback(update: Update, context: ContextTypes.DEFAUL
     except Exception as e:
         logger.error(f"[report_concluded_callback] {e}")
 
+def fancy_title(text: str) -> str:
+    """Renders text in Mathematical Bold Script unicode (𝓑𝓮𝓵𝓾𝓰𝓪-style) —
+    used as the 'premium font' for story titles. Non-letters pass through
+    unchanged."""
+    out = []
+    for ch in text:
+        if "A" <= ch <= "Z":
+            out.append(chr(0x1D4D0 + (ord(ch) - ord("A"))))
+        elif "a" <= ch <= "z":
+            out.append(chr(0x1D4EA + (ord(ch) - ord("a"))))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+async def publish_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """
+    Owner-only: /publish <story name> — as a reply to a PDF document (or
+    with the PDF attached directly and the command in the caption). Saves
+    the PDF into MongoDB GridFS so /story can serve it to anyone, paged.
+    """
+    if not u.message:
+        return
+    if not is_owner(u.effective_user.id if u.effective_user else 0):
+        await u.message.reply_text("🚫 Owner only.")
+        return
+    if story_gridfs is None or mongo_stories_col is None:
+        await u.message.reply_text("😿 MongoDB isn't configured — can't publish stories.")
+        return
+
+    raw_text = u.message.text or u.message.caption or ""
+    parts = raw_text.split(maxsplit=1)
+    story_name = parts[1].strip() if len(parts) > 1 else ""
+    if not story_name:
+        await u.message.reply_text(
+            "🐋 Usage: reply to a PDF with `/publish <story name>`, "
+            "or attach the PDF with `/publish <story name>` as the caption.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    doc_msg = u.message.reply_to_message if (u.message.reply_to_message and u.message.reply_to_message.document) else u.message
+    document = doc_msg.document if doc_msg else None
+    if not document or document.mime_type != "application/pdf":
+        await u.message.reply_text("🐋 I need a PDF — reply to one, or attach it with the caption.", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    sm = await u.message.reply_text("📖 *Publishing story...*", parse_mode=ParseMode.MARKDOWN)
+    try:
+        f = await c.bot.get_file(document.file_id)
+        buf = io.BytesIO()
+        await f.download_to_memory(buf)
+        pdf_bytes = buf.getvalue()
+
+        try:
+            pdf_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            page_count = pdf_doc.page_count
+            pdf_doc.close()
+        except Exception as e:
+            await sm.edit_text(f"😿 That doesn't look like a valid PDF: `{str(e)[:80]}`", parse_mode=ParseMode.MARKDOWN)
+            return
+
+        story_id = str(uuid.uuid4())[:12]
+        loop = asyncio.get_running_loop()
+        gridfs_id = await story_gridfs.upload_from_stream(f"{story_id}.pdf", pdf_bytes)
+        await mongo_stories_col.insert_one({
+            "_id": story_id, "name": story_name, "gridfs_id": gridfs_id,
+            "page_count": page_count, "published_by": get_user_name(u.effective_user),
+            "published_at": datetime.utcnow().isoformat(),
+        })
+        await sm.edit_text(
+            f"✅ *Published!*\n\n📖 *{fancy_title(story_name)}*\n📄 {page_count} pages\n\n"
+            f"Readable via `/story`.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception as e:
+        logger.error(f"[publish_handler] {e}")
+        try:
+            await sm.edit_text(f"😿 Failed to publish: `{str(e)[:100]}`", parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            pass
+
+async def _get_story_pdf_bytes(story_id: str) -> Optional[bytes]:
+    if story_id in _story_pdf_cache:
+        return _story_pdf_cache[story_id]
+    story = await mongo_stories_col.find_one({"_id": story_id})
+    if not story:
+        return None
+    try:
+        stream = io.BytesIO()
+        await story_gridfs.download_to_stream(story["gridfs_id"], stream)
+        pdf_bytes = stream.getvalue()
+    except Exception as e:
+        logger.error(f"[_get_story_pdf_bytes] {e}")
+        return None
+    if len(_story_pdf_cache) >= STORY_PDF_CACHE_MAX:
+        _story_pdf_cache.pop(next(iter(_story_pdf_cache)))
+    _story_pdf_cache[story_id] = pdf_bytes
+    return pdf_bytes
+
+def _render_pdf_page(pdf_bytes: bytes, page_num: int) -> Optional[bytes]:
+    """page_num is 1-indexed. Returns PNG bytes of that page."""
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        if not (1 <= page_num <= doc.page_count):
+            doc.close()
+            return None
+        page = doc.load_page(page_num - 1)
+        pix = page.get_pixmap(dpi=150)
+        png_bytes = pix.tobytes("png")
+        doc.close()
+        return png_bytes
+    except Exception as e:
+        logger.error(f"[_render_pdf_page] {e}")
+        return None
+
+def _story_reader_keyboard(story_id: str, page: int, total: int) -> InlineKeyboardMarkup:
+    row = [
+        InlineKeyboardButton("⬅️ Previous", callback_data=f"story:page:{story_id}:{page-1}" if page > 1 else "story:noop", style="primary"),
+        InlineKeyboardButton(f"{page}/{total}", callback_data="story:noop", style="primary"),
+        InlineKeyboardButton("Next ➡️", callback_data=f"story:page:{story_id}:{page+1}" if page < total else "story:noop", style="primary"),
+    ]
+    return InlineKeyboardMarkup([row, [InlineKeyboardButton("📚 All Stories", callback_data="story:list", style="success")]])
+
+async def story_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """/story — lists available stories, or /story <name> opens one directly."""
+    if not u.message:
+        return
+    if mongo_stories_col is None:
+        await u.message.reply_text("😿 MongoDB isn't configured — no stories available.")
+        return
+    parts = u.message.text.split(maxsplit=1)
+    query = parts[1].strip().lower() if len(parts) > 1 else ""
+
+    if query:
+        story = await mongo_stories_col.find_one({"name": {"$regex": re.escape(query), "$options": "i"}})
+        if not story:
+            await u.message.reply_text(f"😿 No story found matching '{query}'. Try `/story` to see the list.", parse_mode=ParseMode.MARKDOWN)
+            return
+        await _send_story_page(u.effective_chat.id, c, story["_id"], 1, as_new=True, reply_to=u.message.message_id)
+        return
+
+    stories = [s async for s in mongo_stories_col.find({})]
+    if not stories:
+        await u.message.reply_text("📖 No stories published yet!")
+        return
+    kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton(f"📖 {s['name']}", callback_data=f"story:page:{s['_id']}:1", style="primary")] for s in stories]
+    )
+    await u.message.reply_text("📚 *AVAILABLE STORIES*\n\nTap one to start reading:", parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+
+async def _send_story_page(chat_id, c: ContextTypes.DEFAULT_TYPE, story_id: str, page: int, as_new: bool, reply_to=None, edit_msg=None):
+    story = await mongo_stories_col.find_one({"_id": story_id})
+    if not story:
+        if edit_msg:
+            try:
+                await edit_msg.edit_caption("😿 This story no longer exists.")
+            except Exception:
+                pass
+        return
+    pdf_bytes = await _get_story_pdf_bytes(story_id)
+    if not pdf_bytes:
+        return
+    loop = asyncio.get_running_loop()
+    png_bytes = await loop.run_in_executor(None, _render_pdf_page, pdf_bytes, page)
+    if not png_bytes:
+        return
+    total = story["page_count"]
+    caption = f"📖 *{fancy_title(story['name'])}*"
+    kb = _story_reader_keyboard(story_id, page, total)
+    photo_file = io.BytesIO(png_bytes)
+    photo_file.name = "page.png"
+    if as_new:
+        await c.bot.send_photo(chat_id, photo_file, caption=caption, parse_mode=ParseMode.MARKDOWN, reply_markup=kb, reply_to_message_id=reply_to)
+    elif edit_msg:
+        media = InputMediaPhoto(photo_file, caption=caption, parse_mode=ParseMode.MARKDOWN)
+        try:
+            await edit_msg.edit_media(media=media, reply_markup=kb)
+        except Exception as e:
+            logger.error(f"[_send_story_page edit] {e}")
+
+async def story_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    try:
+        if q.data == "story:noop":
+            await q.answer()
+            return
+        if q.data == "story:list":
+            await q.answer()
+            stories = [s async for s in mongo_stories_col.find({})]
+            if not stories:
+                await q.edit_message_caption("📖 No stories published yet!")
+                return
+            kb = InlineKeyboardMarkup(
+                [[InlineKeyboardButton(f"📖 {s['name']}", callback_data=f"story:page:{s['_id']}:1", style="primary")] for s in stories]
+            )
+            try:
+                await q.edit_message_caption("📚 *AVAILABLE STORIES*\n\nTap one to start reading:", parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+            except Exception:
+                await context.bot.send_message(q.message.chat_id, "📚 *AVAILABLE STORIES*\n\nTap one to start reading:", parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+            return
+
+        _, _, story_id, page_str = q.data.split(":", 3)
+        await q.answer()
+        await _send_story_page(q.message.chat_id, context, story_id, int(page_str), as_new=False, edit_msg=q.message)
+    except Exception as e:
+        logger.error(f"[story_callback] {e}")
+
 async def shop_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """/shop — spend game points on a cosmetic name tag (CEO/MANAGER/ACTIVE/HELPER), shown in /lb and /stats."""
     if not u.message or u.effective_chat.type == "private":
@@ -1835,6 +2050,24 @@ async def sleep_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text("😴 *Sleep mode ON* — I'll stay quiet unless someone tags me.", parse_mode=ParseMode.MARKDOWN)
     else:
         await u.message.reply_text("☀️ *Sleep mode OFF* — I'm back!", parse_mode=ParseMode.MARKDOWN)
+
+async def unsleep_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Group-admin-only: /unsleep — explicitly forces sleep mode OFF for
+    this group (unlike /sleep, which toggles either way)."""
+    if not u.message or u.effective_chat.type == "private":
+        await u.message.reply_text("🐱 `/unsleep` only works inside a group.", parse_mode=ParseMode.MARKDOWN)
+        return
+    if not await is_group_admin(c.bot, u.effective_chat.id, u.effective_user.id):
+        await u.message.reply_text("🚫 Only group admins can do that.")
+        return
+    cid = str(u.effective_chat.id)
+    st = sleep_mode_state.setdefault(cid, {"on": False, "wake_taps": set()})
+    if not st["on"]:
+        await u.message.reply_text("☀️ I'm already awake!", parse_mode=ParseMode.MARKDOWN)
+        return
+    st["on"] = False
+    st["wake_taps"] = set()
+    await u.message.reply_text("☀️ *Sleep mode OFF* — I'm back!", parse_mode=ParseMode.MARKDOWN)
 
 async def _send_sleeping_notice(c: ContextTypes.DEFAULT_TYPE, cid: str):
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("WAKE ME UP 😴", callback_data=f"wake:{cid}", style="primary")]])
@@ -4123,6 +4356,12 @@ def _back_only_kb() -> InlineKeyboardMarkup:
 async def start_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if not u.message:
         return
+    stick = await get_random_sticker_from(STICKER_PACK_WELCOME)
+    if stick:
+        try:
+            await c.bot.send_sticker(chat_id=u.effective_chat.id, sticker=stick)
+        except Exception:
+            pass
     kb = _start_main_menu_kb()
     sent = await send_photo_safe(
         c.bot, u.effective_chat.id, START_MENU_IMAGE_PAGE,
@@ -4328,8 +4567,11 @@ async def main():
     app.add_handler(CommandHandler("stats", stats_handler))
     app.add_handler(CommandHandler("report", report_handler))
     app.add_handler(CommandHandler("shop", shop_handler))
+    app.add_handler(CommandHandler("publish", publish_handler))
+    app.add_handler(CommandHandler("story", story_handler))
     app.add_handler(CommandHandler("mytag", mytag_handler))
     app.add_handler(CommandHandler("sleep", sleep_handler))
+    app.add_handler(CommandHandler("unsleep", unsleep_handler))
     app.add_handler(CommandHandler("peace", peace_handler))
     app.add_handler(CommandHandler("broadcast", broadcast_handler))
     app.add_handler(CommandHandler("schedule", schedule_handler))
@@ -4343,6 +4585,7 @@ async def main():
     app.add_handler(CallbackQueryHandler(antiraid_prevent_callback, pattern=r"^antiraid:"))
     app.add_handler(CallbackQueryHandler(report_concluded_callback, pattern=r"^report:"))
     app.add_handler(CallbackQueryHandler(shop_buy_callback, pattern=r"^shop:"))
+    app.add_handler(CallbackQueryHandler(story_callback, pattern=r"^story:"))
     app.add_handler(CallbackQueryHandler(wake_me_up_callback, pattern=r"^wake:"))
     app.add_handler(CallbackQueryHandler(peace_callback, pattern=r"^peace:"))
     app.add_handler(CallbackQueryHandler(broadcast_callback, pattern=r"^bcast:"))
@@ -4366,6 +4609,7 @@ async def main():
     await load_sticker_pack(app.bot, STICKER_PACK_MAIN)
     await load_sticker_pack(app.bot, STICKER_PACK_SAFE)
     await load_sticker_pack(app.bot, STICKER_PACK_ALT)
+    await load_sticker_pack(app.bot, STICKER_PACK_WELCOME)
     await save_all_data()
 
     try:
