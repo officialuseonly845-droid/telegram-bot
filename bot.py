@@ -757,18 +757,25 @@ def bump_score(cid: str, uid: str, name: str, delta: int) -> int:
     db["scores"][cid][uid] = e
     return e["score"]
 
-GROQ_MODEL = "openai/gpt-oss-20b"
+GROQ_MODEL = "openai/gpt-oss-120b"
 GROQ_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
-OR_MODEL = "google/gemma-4-26b-a4b-it:free"
+OR_MODEL = "openai/gpt-oss-120b"
 OR_BASE = "https://openrouter.ai/api/v1"
 
-ai_model_state = {"mode": "gro", "groq_rl_until": 0.0, "or_rl_until": 0.0}
+NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
+NVIDIA_MODEL = "google/gemma-4-31b-it"
+NVIDIA_BASE = "https://integrate.api.nvidia.com/v1"
+
+ai_model_state = {"mode": "gro", "groq_rl_until": 0.0, "or_rl_until": 0.0, "nvi_rl_until": 0.0}
 
 def _groq_rate_limited() -> bool:
     return time.time() < ai_model_state["groq_rl_until"]
 
 def _or_rate_limited() -> bool:
     return time.time() < ai_model_state["or_rl_until"]
+
+def _nvi_rate_limited() -> bool:
+    return time.time() < ai_model_state["nvi_rl_until"]
 
 def _set_groq_rl():
     ai_model_state["groq_rl_until"] = time.time() + 20
@@ -777,6 +784,10 @@ def _set_groq_rl():
 def _set_or_rl():
     ai_model_state["or_rl_until"] = time.time() + 20
     logger.warning("[AI] OpenRouter rate-limited — backing off 20s")
+
+def _set_nvi_rl():
+    ai_model_state["nvi_rl_until"] = time.time() + 20
+    logger.warning("[AI] NVIDIA rate-limited — backing off 20s")
 
 async def _call_groq(system: str, user: str, max_tok: int) -> Optional[str]:
     if not GROQ_KEY:
@@ -864,12 +875,57 @@ async def _call_openrouter(system: str, user: str, max_tok: int) -> Optional[str
         bot_status["failed_apis"] += 1
     return None
 
+async def _call_nvidia(system: str, user: str, max_tok: int) -> Optional[str]:
+    if not NVIDIA_API_KEY:
+        logger.warning("[AI] NVIDIA_API_KEY not set")
+        return None
+    bot_status["api_calls"] += 1
+    safe_max_tok = max(max_tok, 60)
+    try:
+        async with aiohttp.ClientSession() as session:
+            payload = {
+                "model": NVIDIA_MODEL,
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                "max_tokens": safe_max_tok,
+                "temperature": 0.5,
+                "top_p": 1,
+                "frequency_penalty": 0,
+                "presence_penalty": 0,
+                "seed": 0,
+                "stream": False,
+            }
+            async with session.post(
+                f"{NVIDIA_BASE}/chat/completions",
+                headers={"Authorization": f"Bearer {NVIDIA_API_KEY}", "Accept": "application/json", "Content-Type": "application/json"},
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    choice = data["choices"][0]
+                    content = choice["message"]["content"].strip()
+                    if not content and choice.get("finish_reason") == "length":
+                        logger.warning("[AI] NVIDIA: response truncated by max_tokens")
+                    return content or None
+                elif r.status == 429:
+                    _set_nvi_rl()
+                    return None
+                else:
+                    body = await r.text()
+                    logger.error(f"[AI] NVIDIA error {r.status}: {body[:300]}")
+                    bot_status["failed_apis"] += 1
+    except Exception as e:
+        logger.error(f"[AI] NVIDIA exception: {e}")
+        bot_status["failed_apis"] += 1
+    return None
+
 async def ai(system: str, user: str, fallback: str = "Meow! 🐾", max_tok: int = 200) -> str:
     """
-    Smart dual-provider AI call.
-    Mode 'gro' → Groq ONLY. Retries Groq itself up to 3x, never switches to OR.
-    Mode 'rou' → OpenRouter ONLY. Retries OR itself up to 3x, never switches to Groq.
-    Mode 'auto' → tries Groq first, then OR, with a second full retry pass across both.
+    Smart multi-provider AI call.
+    Mode 'gro' → Groq ONLY. Retries Groq itself up to 3x, never switches.
+    Mode 'rou' → OpenRouter ONLY. Retries OR itself up to 3x, never switches.
+    Mode 'nvi' → NVIDIA ONLY. Retries NVIDIA itself up to 3x, never switches.
+    Mode 'auto' → tries Groq, then OR, then NVIDIA, with a second full retry pass across all three.
     If OpenRouter is active, uses CHAT_PROMPT_OR (Hinglish+English).
     """
     mode = ai_model_state["mode"]
@@ -880,20 +936,24 @@ async def ai(system: str, user: str, fallback: str = "Meow! 🐾", max_tok: int 
                 if _groq_rate_limited():
                     return None
                 return await asyncio.wait_for(_call_groq(system, user, max_tok), timeout=14)
-            else:
+            elif provider == "or":
                 if _or_rate_limited():
                     return None
                 or_system = CHAT_PROMPT_OR if system.startswith(CHAT_PROMPT) else system
                 return await asyncio.wait_for(_call_openrouter(or_system, user, max_tok), timeout=16)
+            else:  # nvi
+                if _nvi_rate_limited():
+                    return None
+                return await asyncio.wait_for(_call_nvidia(system, user, max_tok), timeout=16)
         except asyncio.TimeoutError:
             logger.warning(f"[AI] {provider} timed out")
         except Exception as e:
             logger.warning(f"[AI] {provider} error: {e}")
         return None
 
-    if mode in ("gro", "rou"):
+    if mode in ("gro", "rou", "nvi"):
         # Locked to one provider — retry only that provider, never cross over.
-        provider = "groq" if mode == "gro" else "or"
+        provider = {"gro": "groq", "rou": "or", "nvi": "nvi"}[mode]
         for attempt in range(3):
             res = await _try(provider)
             if res:
@@ -903,8 +963,8 @@ async def ai(system: str, user: str, fallback: str = "Meow! 🐾", max_tok: int 
         logger.error(f"[AI] {provider} failed 3x in locked mode — returning fallback")
         return fallback
 
-    # auto mode: try both providers, then a second full pass across both.
-    order = ["groq", "or"]
+    # auto mode: try all three providers, then a second full pass across them.
+    order = ["groq", "or", "nvi"]
     for provider in order:
         res = await _try(provider)
         if res:
@@ -916,7 +976,7 @@ async def ai(system: str, user: str, fallback: str = "Meow! 🐾", max_tok: int 
             logger.info(f"[AI] {provider} succeeded on retry pass")
             return res
 
-    logger.error("[AI] Both providers failed twice — returning fallback")
+    logger.error("[AI] All providers failed twice — returning fallback")
     return fallback
 
 async def ai_emoji(text: str) -> str:
@@ -2173,6 +2233,19 @@ async def ping_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     else:
         or_status = "❌ OPENROUTER_API_KEY not set"
 
+    # --- NVIDIA live test ---
+    nvi_status = "❌ not reachable"
+    if NVIDIA_API_KEY:
+        t0 = time.time()
+        try:
+            res = await asyncio.wait_for(_call_nvidia("Reply with only the word: pong", "ping", 20), timeout=12)
+            nvi_ms = int((time.time() - t0) * 1000)
+            nvi_status = f"✅ OK ({nvi_ms}ms)" if res else "⚠️ no response"
+        except Exception as e:
+            nvi_status = f"❌ error: {str(e)[:40]}"
+    else:
+        nvi_status = "❌ NVIDIA_API_KEY not set"
+
     # --- MongoDB live test ---
     mongo_status = "❌ not configured"
     if mongo_client is not None:
@@ -2190,6 +2263,7 @@ async def ping_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🤖 *Groq* (`{GROQ_MODEL}`)\n{groq_status}\n\n"
         f"🌐 *OpenRouter* (`{OR_MODEL}`)\n{or_status}\n\n"
+        f"🟩 *NVIDIA* (`{NVIDIA_MODEL}`)\n{nvi_status}\n\n"
         f"🗄 *MongoDB*\n{mongo_status}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Active AI mode: `{mode.upper()}`"
@@ -2210,10 +2284,13 @@ async def model_command_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     mode = ai_model_state["mode"]
     groq_ok = "✅" if not _groq_rate_limited() else "⛔RL"
     or_ok = "✅" if not _or_rate_limited() else "⛔RL"
+    nvi_ok = "✅" if not _nvi_rate_limited() else "⛔RL"
 
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton(f"{'▶' if mode=='gro' else ''} GRO {groq_ok}", callback_data="model:gro", style="primary"),
         InlineKeyboardButton(f"{'▶' if mode=='rou' else ''} ROU {or_ok}", callback_data="model:rou", style="primary"),
+    ], [
+        InlineKeyboardButton(f"{'▶' if mode=='nvi' else ''} NVI {nvi_ok}", callback_data="model:nvi", style="primary"),
         InlineKeyboardButton(f"{'▶' if mode=='auto' else ''} AUTO", callback_data="model:auto", style="success"),
     ]])
 
@@ -2223,7 +2300,8 @@ async def model_command_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         f"Current: `{mode.upper()}`\n\n"
         f"• *GRO* — Groq `{GROQ_MODEL}` {groq_ok}\n"
         f"• *ROU* — OpenRouter `{OR_MODEL}` {or_ok}\n"
-        f"• *AUTO* — Tries Groq first, falls back to OpenRouter on rate limit\n\n"
+        f"• *NVI* — NVIDIA `{NVIDIA_MODEL}` {nvi_ok}\n"
+        f"• *AUTO* — Tries Groq → OpenRouter → NVIDIA in order\n\n"
         f"_Rate limit auto-recovers after 20s_"
     )
     await u.message.reply_text(status, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
@@ -2239,12 +2317,13 @@ async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         _, mode = q.data.split(":", 1)
         ai_model_state["mode"] = mode
-        label = {"gro": "Groq (GRO)", "rou": "OpenRouter (ROU)", "auto": "Auto Switch"}.get(mode, mode)
+        label = {"gro": "Groq (GRO)", "rou": "OpenRouter (ROU)", "nvi": "NVIDIA (NVI)", "auto": "Auto Switch"}.get(mode, mode)
         await q.edit_message_text(
             f"✅ *AI model switched to: {label}*\n\n"
             f"GRO → `{GROQ_MODEL}`\n"
             f"ROU → `{OR_MODEL}`\n"
-            f"AUTO → Groq first, fallback to OpenRouter on rate limit",
+            f"NVI → `{NVIDIA_MODEL}`\n"
+            f"AUTO → Groq → OpenRouter → NVIDIA in order",
             parse_mode=ParseMode.MARKDOWN
         )
         logger.info(f"[AI] Model mode switched to: {mode}")
