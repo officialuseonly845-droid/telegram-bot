@@ -1,5 +1,5 @@
 import os, logging, random, json, asyncio, requests, re, urllib.parse, sys, hashlib, time, base64, io
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from aiohttp import web
 import aiohttp
@@ -895,12 +895,23 @@ async def _call_nvidia(system: str, user: str, max_tok: int) -> Optional[str]:
     hood, and this way no new pip dependency is needed. If you'd rather use
     the official `openai` client, add `openai` to requirements.txt and swap
     the aiohttp block below for the OpenAI() client call.
+
+    muse-glimmer-30b is a REASONING model on NVIDIA's NIM stack — by default
+    it "thinks" first via a separate reasoning_content field, and if it
+    doesn't finish thinking before hitting max_tokens, message.content comes
+    back as null (not ""), which used to crash .strip(). chat_template_kwargs
+    below tells the template to skip the thinking step so content is filled
+    directly; we still handle a null/empty content defensively in case a
+    future model swap re-introduces reasoning-only replies.
     """
     if not NVIDIA_KEY:
         logger.warning("[AI] NVIDIA_API_KEY not set")
         return None
     bot_status["api_calls"] += 1
-    safe_max_tok = max(max_tok, 60)
+    # Reasoning models can eat a small budget entirely on hidden thinking
+    # tokens before ever reaching content, even with thinking nominally off —
+    # give it more headroom than Groq/OR get.
+    safe_max_tok = max(max_tok, 512)
     try:
         async with aiohttp.ClientSession() as session:
             payload = {
@@ -910,6 +921,11 @@ async def _call_nvidia(system: str, user: str, max_tok: int) -> Optional[str]:
                 "top_p": 0.95,
                 "max_tokens": safe_max_tok,
                 "stream": False,
+                # Different NIM model families read different keys here
+                # ("thinking" for Nemotron/Granite-style, "enable_thinking"
+                # for DeepSeek/GLM-style); unrecognized keys are ignored, so
+                # sending both is safe and covers muse-glimmer either way.
+                "chat_template_kwargs": {"thinking": False, "enable_thinking": False},
             }
             async with session.post(
                 f"{NVIDIA_BASE}/chat/completions",
@@ -920,9 +936,19 @@ async def _call_nvidia(system: str, user: str, max_tok: int) -> Optional[str]:
                 if r.status == 200:
                     data = await r.json()
                     choice = data["choices"][0]
-                    content = choice["message"]["content"].strip()
-                    if not content and choice.get("finish_reason") == "length":
-                        logger.warning("[AI] NVIDIA: response truncated by max_tokens")
+                    msg = choice.get("message", {}) or {}
+                    content = (msg.get("content") or "").strip()
+                    if not content:
+                        # Fell back to reasoning-only output — use it rather
+                        # than returning nothing, and log the raw shape once
+                        # so it's easy to see if this model needs a different
+                        # thinking-off key.
+                        reasoning = (msg.get("reasoning_content") or msg.get("reasoning") or "").strip()
+                        if reasoning:
+                            logger.warning("[AI] NVIDIA: content empty, using reasoning_content as fallback")
+                            content = reasoning
+                        else:
+                            logger.warning(f"[AI] NVIDIA: empty content, finish_reason={choice.get('finish_reason')}, raw_message={msg}")
                     return content or None
                 elif r.status == 429:
                     _set_nvi_rl()
@@ -1203,7 +1229,7 @@ async def publish_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await mongo_stories_col.insert_one({
             "_id": story_id, "name": story_name, "gridfs_id": gridfs_id,
             "page_count": page_count, "published_by": get_user_name(u.effective_user),
-            "published_at": datetime.utcnow().isoformat(),
+            "published_at": datetime.now(timezone.utc).isoformat(),
         })
         await sm.edit_text(
             f"✅ *Published!*\n\n📖 *{fancy_title(story_name)}*\n📄 {page_count} pages\n\n"
@@ -1814,7 +1840,7 @@ async def mongo_cleanup_loop():
         if mongo_memory_col is None:
             continue
         try:
-            cutoff = datetime.utcnow() - timedelta(days=MEMORY_STALE_DAYS)
+            cutoff = datetime.now(timezone.utc) - timedelta(days=MEMORY_STALE_DAYS)
             deleted = 0
             async for doc in mongo_memory_col.find({}):
                 messages = doc.get("messages", [])
@@ -4579,8 +4605,8 @@ async def append_chat_history(user_id, user_text: str, bot_reply: str, name: str
     try:
         doc = await mongo_memory_col.find_one({"_id": str(user_id)}) or {"messages": []}
         messages = doc.get("messages", [])
-        messages.append({"role": "user", "text": user_text[:500], "ts": datetime.utcnow().isoformat()})
-        messages.append({"role": "bot", "text": bot_reply[:500], "ts": datetime.utcnow().isoformat()})
+        messages.append({"role": "user", "text": user_text[:500], "ts": datetime.now(timezone.utc).isoformat()})
+        messages.append({"role": "bot", "text": bot_reply[:500], "ts": datetime.now(timezone.utc).isoformat()})
         if len(messages) > MEMORY_TTL_MESSAGES:
             messages = []
         update_doc = {"_id": str(user_id), "messages": messages}
