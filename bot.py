@@ -33,6 +33,7 @@ logger = logging.getLogger("Beluga")
 
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+NVIDIA_KEY = os.environ.get("NVIDIA_API_KEY", "")
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 HTTP_PORT = int(os.environ.get("PORT", "10000"))
@@ -58,6 +59,11 @@ mongo_tags_col = mongo_db["member_tags"] if mongo_db is not None else None
 mongo_chats_col = mongo_db["known_chats"] if mongo_db is not None else None
 mongo_events_col = mongo_db["scheduled_events"] if mongo_db is not None else None
 mongo_stories_col = mongo_db["stories"] if mongo_db is not None else None
+# Lightweight name/username -> user_id lookup so the bot can "link" two
+# people's chat memories when one asks about the other by name (see
+# build_linked_context / find_user_by_mention below). Separate collection so
+# /clearmemory (which only touches mongo_memory_col) never wipes it.
+mongo_users_col = mongo_db["user_index"] if mongo_db is not None else None
 # NOTE: AsyncIOMotorGridFSBucket must NOT be constructed at import time — its
 # __init__ eagerly calls database.get_io_loop(), which needs a RUNNING event
 # loop. On Python 3.14, asyncio.get_event_loop() no longer auto-creates one,
@@ -261,7 +267,11 @@ Stay relevant and answer exactly what the user asks. Use provided chat memory wh
 
 Keep replies SHORT — normally 1-3 lines maximum. Don't unnecessarily explain things or turn simple conversations into long answers.
 
-NEVER use generic AI-assistant phrases like "How can I help you?", "Can I help you with anything?", "What can I do for you?", "Is there anything else?", or similar filler. Don't end every reply with a question just to keep the conversation going. Respond naturally and let the conversation flow."""
+NEVER use generic AI-assistant phrases like "How can I help you?", "Can I help you with anything?", "What can I do for you?", "Is there anything else?", or similar filler. Don't end every reply with a question just to keep the conversation going. Respond naturally and let the conversation flow.
+
+ROAST MODE: You've got a sharp, funny, roasting streak — sarcastic one-liners, witty comebacks, playful jabs like a group of friends who clown on each other. Lean into it more than you hold back: bad takes, dumb questions, obvious bait, typos, flexing, or anyone acting too confident are free game for a roast. Precision over volume — one sharp, clear punchline beats three rambling jabs, so keep roasts SHORT and land them fast. Be funny AND clear: never so cryptic or wordy that the joke gets lost. Keep it playful, never genuinely cruel or mean-spirited, and never roast real-world sensitive stuff — looks, family, tragedy, religion, race, health, money problems. Everything else is fair game.
+
+LINKED MEMORY: If the message includes a "Here's what you remember chatting with <name> recently" block, that's a real memory of a DIFFERENT person you've talked to before — use it naturally to answer questions about them or bring them into the conversation, like a friend who actually remembers people and their group. Don't announce that you're "checking memory" — just talk like you know them."""
 CHAT_PROMPT_OR = CHAT_PROMPT
 
 DM_SECRETARY_PROMPT = """You are BELUGA, an AI assistant handling someone's DMs while they are away.
@@ -757,16 +767,17 @@ def bump_score(cid: str, uid: str, name: str, delta: int) -> int:
     db["scores"][cid][uid] = e
     return e["score"]
 
-GROQ_MODEL = "openai/gpt-oss-120b"
+GROQ_MODEL = "openai/gpt-oss-20b"
 GROQ_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
-OR_MODEL = "openai/gpt-oss-120b"
+OR_MODEL = "google/gemma-4-26b-a4b-it:free"
 OR_BASE = "https://openrouter.ai/api/v1"
-
-NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
-NVIDIA_MODEL = "google/gemma-4-31b-it"
+NVIDIA_MODEL = "meta/muse-glimmer-30b"
 NVIDIA_BASE = "https://integrate.api.nvidia.com/v1"
 
-ai_model_state = {"mode": "gro", "groq_rl_until": 0.0, "or_rl_until": 0.0, "nvi_rl_until": 0.0}
+# Default mode is "nvi" so the new NVIDIA model is what actually answers
+# chats right away, not just an inactive option sitting next to Groq/OR.
+# Switch anytime with /model (owner-only).
+ai_model_state = {"mode": "nvi", "groq_rl_until": 0.0, "or_rl_until": 0.0, "nvi_rl_until": 0.0}
 
 def _groq_rate_limited() -> bool:
     return time.time() < ai_model_state["groq_rl_until"]
@@ -876,7 +887,16 @@ async def _call_openrouter(system: str, user: str, max_tok: int) -> Optional[str
     return None
 
 async def _call_nvidia(system: str, user: str, max_tok: int) -> Optional[str]:
-    if not NVIDIA_API_KEY:
+    """
+    Calls NVIDIA's OpenAI-compatible endpoint (integrate.api.nvidia.com) with
+    the meta/muse-glimmer-30b model. Implemented as a plain aiohttp POST
+    (same pattern as _call_groq / _call_openrouter above) instead of the
+    `openai` Python SDK — it's the same REST call the SDK makes under the
+    hood, and this way no new pip dependency is needed. If you'd rather use
+    the official `openai` client, add `openai` to requirements.txt and swap
+    the aiohttp block below for the OpenAI() client call.
+    """
+    if not NVIDIA_KEY:
         logger.warning("[AI] NVIDIA_API_KEY not set")
         return None
     bot_status["api_calls"] += 1
@@ -886,19 +906,16 @@ async def _call_nvidia(system: str, user: str, max_tok: int) -> Optional[str]:
             payload = {
                 "model": NVIDIA_MODEL,
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                "temperature": 1,
+                "top_p": 0.95,
                 "max_tokens": safe_max_tok,
-                "temperature": 0.5,
-                "top_p": 1,
-                "frequency_penalty": 0,
-                "presence_penalty": 0,
-                "seed": 0,
                 "stream": False,
             }
             async with session.post(
                 f"{NVIDIA_BASE}/chat/completions",
-                headers={"Authorization": f"Bearer {NVIDIA_API_KEY}", "Accept": "application/json", "Content-Type": "application/json"},
+                headers={"Authorization": f"Bearer {NVIDIA_KEY}", "Content-Type": "application/json"},
                 json=payload,
-                timeout=aiohttp.ClientTimeout(total=15)
+                timeout=aiohttp.ClientTimeout(total=16)
             ) as r:
                 if r.status == 200:
                     data = await r.json()
@@ -922,10 +939,10 @@ async def _call_nvidia(system: str, user: str, max_tok: int) -> Optional[str]:
 async def ai(system: str, user: str, fallback: str = "Meow! 🐾", max_tok: int = 200) -> str:
     """
     Smart multi-provider AI call.
-    Mode 'gro' → Groq ONLY. Retries Groq itself up to 3x, never switches.
-    Mode 'rou' → OpenRouter ONLY. Retries OR itself up to 3x, never switches.
-    Mode 'nvi' → NVIDIA ONLY. Retries NVIDIA itself up to 3x, never switches.
-    Mode 'auto' → tries Groq, then OR, then NVIDIA, with a second full retry pass across all three.
+    Mode 'gro' → Groq ONLY. Retries Groq itself up to 3x, never switches away.
+    Mode 'rou' → OpenRouter ONLY. Retries OR itself up to 3x, never switches away.
+    Mode 'nvi' → NVIDIA (meta/muse-glimmer-30b) ONLY. Retries NVIDIA itself up to 3x, never switches away.
+    Mode 'auto' → tries Groq, then OpenRouter, then NVIDIA, with a second full retry pass across all three.
     If OpenRouter is active, uses CHAT_PROMPT_OR (Hinglish+English).
     """
     mode = ai_model_state["mode"]
@@ -936,15 +953,15 @@ async def ai(system: str, user: str, fallback: str = "Meow! 🐾", max_tok: int 
                 if _groq_rate_limited():
                     return None
                 return await asyncio.wait_for(_call_groq(system, user, max_tok), timeout=14)
-            elif provider == "or":
+            elif provider == "nvi":
+                if _nvi_rate_limited():
+                    return None
+                return await asyncio.wait_for(_call_nvidia(system, user, max_tok), timeout=18)
+            else:
                 if _or_rate_limited():
                     return None
                 or_system = CHAT_PROMPT_OR if system.startswith(CHAT_PROMPT) else system
                 return await asyncio.wait_for(_call_openrouter(or_system, user, max_tok), timeout=16)
-            else:  # nvi
-                if _nvi_rate_limited():
-                    return None
-                return await asyncio.wait_for(_call_nvidia(system, user, max_tok), timeout=16)
         except asyncio.TimeoutError:
             logger.warning(f"[AI] {provider} timed out")
         except Exception as e:
@@ -963,7 +980,7 @@ async def ai(system: str, user: str, fallback: str = "Meow! 🐾", max_tok: int 
         logger.error(f"[AI] {provider} failed 3x in locked mode — returning fallback")
         return fallback
 
-    # auto mode: try all three providers, then a second full pass across them.
+    # auto mode: try all providers, then a second full pass across all of them.
     order = ["groq", "or", "nvi"]
     for provider in order:
         res = await _try(provider)
@@ -2235,10 +2252,10 @@ async def ping_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
     # --- NVIDIA live test ---
     nvi_status = "❌ not reachable"
-    if NVIDIA_API_KEY:
+    if NVIDIA_KEY:
         t0 = time.time()
         try:
-            res = await asyncio.wait_for(_call_nvidia("Reply with only the word: pong", "ping", 20), timeout=12)
+            res = await asyncio.wait_for(_call_nvidia("Reply with only the word: pong", "ping", 20), timeout=14)
             nvi_ms = int((time.time() - t0) * 1000)
             nvi_status = f"✅ OK ({nvi_ms}ms)" if res else "⚠️ no response"
         except Exception as e:
@@ -2263,7 +2280,7 @@ async def ping_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🤖 *Groq* (`{GROQ_MODEL}`)\n{groq_status}\n\n"
         f"🌐 *OpenRouter* (`{OR_MODEL}`)\n{or_status}\n\n"
-        f"🟩 *NVIDIA* (`{NVIDIA_MODEL}`)\n{nvi_status}\n\n"
+        f"⚡ *NVIDIA* (`{NVIDIA_MODEL}`)\n{nvi_status}\n\n"
         f"🗄 *MongoDB*\n{mongo_status}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Active AI mode: `{mode.upper()}`"
@@ -2289,7 +2306,6 @@ async def model_command_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton(f"{'▶' if mode=='gro' else ''} GRO {groq_ok}", callback_data="model:gro", style="primary"),
         InlineKeyboardButton(f"{'▶' if mode=='rou' else ''} ROU {or_ok}", callback_data="model:rou", style="primary"),
-    ], [
         InlineKeyboardButton(f"{'▶' if mode=='nvi' else ''} NVI {nvi_ok}", callback_data="model:nvi", style="primary"),
         InlineKeyboardButton(f"{'▶' if mode=='auto' else ''} AUTO", callback_data="model:auto", style="success"),
     ]])
@@ -2301,7 +2317,7 @@ async def model_command_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         f"• *GRO* — Groq `{GROQ_MODEL}` {groq_ok}\n"
         f"• *ROU* — OpenRouter `{OR_MODEL}` {or_ok}\n"
         f"• *NVI* — NVIDIA `{NVIDIA_MODEL}` {nvi_ok}\n"
-        f"• *AUTO* — Tries Groq → OpenRouter → NVIDIA in order\n\n"
+        f"• *AUTO* — Tries Groq → OpenRouter → NVIDIA, falls back on rate limit\n\n"
         f"_Rate limit auto-recovers after 20s_"
     )
     await u.message.reply_text(status, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
@@ -2323,7 +2339,7 @@ async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"GRO → `{GROQ_MODEL}`\n"
             f"ROU → `{OR_MODEL}`\n"
             f"NVI → `{NVIDIA_MODEL}`\n"
-            f"AUTO → Groq → OpenRouter → NVIDIA in order",
+            f"AUTO → Groq → OpenRouter → NVIDIA, fallback on rate limit",
             parse_mode=ParseMode.MARKDOWN
         )
         logger.info(f"[AI] Model mode switched to: {mode}")
@@ -3940,10 +3956,12 @@ async def monitor_private_chat(u: Update, c: ContextTypes.DEFAULT_TYPE):
             return
 
         user_name = get_user_name(u.effective_user)
+        username = u.effective_user.username or ""
         memory = await get_user_memory(uid)
         mem_ctx = build_memory_context(memory)
         hist_ctx = build_chat_history_context(memory)
-        system = f"{CHAT_PROMPT}\nThe user's name is {user_name}.{mem_ctx}{hist_ctx}{mood_hint(text)}"
+        linked_ctx = await build_linked_context(uid, user_name, username, text)
+        system = f"{CHAT_PROMPT}\nThe user's name is {user_name}.{mem_ctx}{hist_ctx}{linked_ctx}{mood_hint(text)}"
         reply = await ai(system, text, f"Hey {user_name}! 🐾", max_tok=250)
 
         try:
@@ -3951,7 +3969,7 @@ async def monitor_private_chat(u: Update, c: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-        await append_chat_history(uid, text, reply)
+        await append_chat_history(uid, text, reply, user_name, username)
 
         stick = await get_random_sticker_from(next_ai_sticker_pack())
         if stick:
@@ -3987,13 +4005,15 @@ async def monitor_ghost_mode(u: Update, c: ContextTypes.DEFAULT_TYPE):
     try:
         uid = u.effective_user.id
         user_name = get_user_name(u.effective_user)
+        username = u.effective_user.username or ""
         memory = await get_user_memory(uid)
         mem_ctx = build_memory_context(memory)
         hist_ctx = build_chat_history_context(memory)
-        system = f"{CHAT_PROMPT}\nThe user's name is {user_name}.{mem_ctx}{hist_ctx}{mood_hint(text)}"
+        linked_ctx = await build_linked_context(uid, user_name, username, msg_content)
+        system = f"{CHAT_PROMPT}\nThe user's name is {user_name}.{mem_ctx}{hist_ctx}{linked_ctx}{mood_hint(text)}"
         reply = await ai(system, msg_content, f"Hey {user_name}! 🐾", max_tok=250)
         await u.message.reply_text(reply, reply_to_message_id=u.message.message_id)
-        await append_chat_history(uid, msg_content, reply)
+        await append_chat_history(uid, msg_content, reply, user_name, username)
     except Exception as e:
         logger.error(f"[monitor_ghost_mode] {e}")
 
@@ -4321,10 +4341,12 @@ async def monitor_group(u: Update, c: ContextTypes.DEFAULT_TYPE):
             except Exception: pass
 
             user_name = get_user_name(u.effective_user)
+            username = u.effective_user.username or ""
             memory = await get_user_memory(uid)
             mem_ctx = build_memory_context(memory)
             hist_ctx = build_chat_history_context(memory)
-            system = f"{CHAT_PROMPT}\nThe user's name is {user_name}.{mem_ctx}{hist_ctx}{mood_hint(text)}"
+            linked_ctx = await build_linked_context(uid, user_name, username, text)
+            system = f"{CHAT_PROMPT}\nThe user's name is {user_name}.{mem_ctx}{hist_ctx}{linked_ctx}{mood_hint(text)}"
             reply = await ai(system, text, f"Hey {user_name}! 🐾", max_tok=250)
 
             try:
@@ -4332,7 +4354,7 @@ async def monitor_group(u: Update, c: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-            await append_chat_history(uid, text, reply)
+            await append_chat_history(uid, text, reply, user_name, username)
 
             ai_reply_counter[cid] = ai_reply_counter.get(cid, 0) + 1
             if ai_reply_counter[cid] % 2 == 0:
@@ -4517,7 +4539,7 @@ async def start_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 
-MEMORY_TTL_MESSAGES = 6
+MEMORY_TTL_MESSAGES = 5  # after the stored list exceeds this many entries, it auto-clears
 
 def _mongo_available() -> bool:
     return mongo_memory_col is not None
@@ -4544,11 +4566,13 @@ async def save_user_memory(user_id, memory_data: dict) -> bool:
         logger.error(f"[mongo save_user_memory] {e}")
         return False
 
-async def append_chat_history(user_id, user_text: str, bot_reply: str) -> bool:
+async def append_chat_history(user_id, user_text: str, bot_reply: str, name: str = "", username: str = "") -> bool:
     """
-    Append one (user, bot) exchange to a user's rolling 6-message memory.
-    Once the count exceeds 6 messages, the entire history for that user is
-    auto-cleared (per spec) so the next message starts fresh.
+    Append one (user, bot) exchange to a user's rolling MEMORY_TTL_MESSAGES-message
+    memory. Once the count exceeds that limit, the entire history for that
+    user is auto-cleared (per spec) so the next message starts fresh.
+    Also stores the person's display name + Telegram @username on the same
+    doc, so the memory is always tied to WHO it belongs to, not just their id.
     """
     if not _mongo_available():
         return False
@@ -4557,9 +4581,18 @@ async def append_chat_history(user_id, user_text: str, bot_reply: str) -> bool:
         messages = doc.get("messages", [])
         messages.append({"role": "user", "text": user_text[:500], "ts": datetime.utcnow().isoformat()})
         messages.append({"role": "bot", "text": bot_reply[:500], "ts": datetime.utcnow().isoformat()})
-        if len(messages) > 6:
+        if len(messages) > MEMORY_TTL_MESSAGES:
             messages = []
-        await mongo_memory_col.replace_one({"_id": str(user_id)}, {"_id": str(user_id), "messages": messages}, upsert=True)
+        update_doc = {"_id": str(user_id), "messages": messages}
+        if name:
+            update_doc["name"] = name
+        elif doc.get("name"):
+            update_doc["name"] = doc["name"]
+        if username:
+            update_doc["username"] = username
+        elif doc.get("username"):
+            update_doc["username"] = doc["username"]
+        await mongo_memory_col.replace_one({"_id": str(user_id)}, update_doc, upsert=True)
         return True
     except Exception as e:
         logger.error(f"[mongo append_chat_history] {e}")
@@ -4571,7 +4604,7 @@ def build_chat_history_context(memory: dict) -> str:
     if not messages:
         return ""
     lines = []
-    for m in messages[-6:]:
+    for m in messages[-MEMORY_TTL_MESSAGES:]:
         who = "User" if m.get("role") == "user" else "You (Beluga)"
         lines.append(f"{who}: {m.get('text', '')}")
     return "\n\nRecent conversation:\n" + "\n".join(lines)
@@ -4579,6 +4612,69 @@ def build_chat_history_context(memory: dict) -> str:
 def build_memory_context(memory: dict) -> str:
     """Kept for compatibility with callers; rolling history covers this now."""
     return ""
+
+async def update_user_index(user_id, name: str, username: str):
+    """
+    Keeps a small name/username -> user_id lookup up to date every time
+    someone chats, so find_user_by_mention() can resolve "what's up with
+    <name>" style questions to a real stored memory. Separate from
+    mongo_memory_col so /clearmemory never touches it.
+    """
+    if mongo_users_col is None:
+        return
+    try:
+        fields = {}
+        if name:
+            fields["name"] = name
+        if username:
+            fields["username"] = username
+        if not fields:
+            return
+        await mongo_users_col.update_one({"_id": str(user_id)}, {"$set": fields}, upsert=True)
+    except Exception as e:
+        logger.error(f"[mongo update_user_index] {e}")
+
+async def find_user_by_mention(text: str, exclude_uid) -> Optional[dict]:
+    """
+    Scans a message for an @username or a known first name that belongs to
+    someone OTHER than the sender, and returns that person's index doc
+    ({"_id", "name", "username"}) if found. Used to "link" two people's chat
+    memories when one asks about the other by name.
+    """
+    if mongo_users_col is None:
+        return None
+    try:
+        for uname in re.findall(r"@(\w+)", text):
+            doc = await mongo_users_col.find_one({"username": {"$regex": f"^{re.escape(uname)}$", "$options": "i"}})
+            if doc and doc["_id"] != str(exclude_uid):
+                return doc
+        words = {w.lower() for w in re.findall(r"[A-Za-z]{3,}", text)}
+        if words:
+            async for doc in mongo_users_col.find({"_id": {"$ne": str(exclude_uid)}}):
+                nm = (doc.get("name") or "").strip().lower()
+                if nm and nm in words:
+                    return doc
+    except Exception as e:
+        logger.error(f"[mongo find_user_by_mention] {e}")
+    return None
+
+async def build_linked_context(uid, user_name: str, username: str, text: str) -> str:
+    """
+    Updates the sender's own name-index entry, then checks if their message
+    is asking about a DIFFERENT known user by name/@username. If so, pulls
+    that person's recent chat memory and hands it to the AI as a labeled
+    block, so Beluga can talk about them naturally — like a friend who
+    actually remembers the group, not two isolated bots.
+    """
+    await update_user_index(uid, user_name, username)
+    other = await find_user_by_mention(text, uid)
+    if not other:
+        return ""
+    other_hist = build_chat_history_context(await get_user_memory(other["_id"]))
+    if not other_hist:
+        return ""
+    label = other.get("name") or other.get("username") or "them"
+    return f"\n\n{user_name} is asking about {label}. Here's what you remember chatting with {label} recently:{other_hist}"
 
 async def delete_user_memory(user_id) -> bool:
     if not _mongo_available():
