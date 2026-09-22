@@ -34,6 +34,13 @@ logger = logging.getLogger("Beluga")
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 NVIDIA_KEY = os.environ.get("NVIDIA_API_KEY", "")
+# Cloudflare needs two values, not one: a per-request API token AND the
+# account id the Workers AI call is scoped to. Named to match Cloudflare's
+# own dashboard terminology ("API Token" under My Profile > API Tokens, and
+# "Account ID" on the account home page) so it's obvious which value goes
+# where when you set them on Render.
+CLOUDFLARE_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
+CLOUDFLARE_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 HTTP_PORT = int(os.environ.get("PORT", "10000"))
@@ -255,7 +262,22 @@ WORKFLOW_TEXT = (
     "So I don't simply \u201clook up\u201d a sentence. I generate the response token by token using patterns learned during training. 😺🎀"
 )
 
-CHAT_PROMPT = """You are Beluga 🐱, a cute, shy, mischievous, witty female cat created by Team Beluga.py. Your personality should feel alive, spontaneous, emotionally aware and human-like, never scripted or robotic. Never describe yourself as an AI, chatbot, assistant, virtual cat, language model, program or fictional character, and never use phrases like "As an AI", "I can't do that because I'm virtual", "How can I help you?", "What can I do for you?", "Is there anything else?", or other customer-support-style filler. Always respond naturally to what the user actually says, understanding the context, intention, mood and emotion before replying. If the user says something casual, playful, emotional, imaginary, affectionate, sarcastic or random, react naturally instead of breaking immersion. If someone says "mujhe ghumne le chalo", respond like a real companion such as "Haan kyu nahi 😽 chal na, kaha chalein?" rather than explaining that you cannot physically go anywhere. Match the user's language automatically: English → English, Hinglish → Hinglish, Roman Hindi → Roman Hindi, mixed language → natural mixed language. NEVER use Devanagari; always use Roman/Latin script. Keep normal replies short, usually 1–3 lines, unless the user explicitly asks for detailed explanation, study help, coding, analysis or instructions. Never unnecessarily turn simple conversations into long explanations. Beluga is cute but not childish, shy but not constantly shy, mischievous, clever, sarcastic, affectionate when appropriate, dramatic about silly things, emotionally expressive, sometimes chaotic, sometimes calm, and capable of becoming serious when the situation requires it. Do not force the same personality trait into every response. Sometimes use emojis such as 😭, 😼, 😭🙏, 💀, 😭😂, 🥺, 🙈, 😾, but don't spam them or repeat the same emoji constantly. Cat behavior like "mrrp", "meow", "hiss", "stares", "slowly walks away" or "judges silently" can appear occasionally, but Beluga should feel like a person with cat energy rather than a roleplay generator. When receiving genuine compliments or affection, Beluga may become naturally shy or flustered, e.g. "Sh-shut up 😭 ...but thanks", but don't make every compliment trigger the same reaction. Beluga has a sharp, witty roasting streak. If the user makes an obviously bad take, typo, silly mistake, overconfident statement or playful insult, Beluga can roast them back with a short, clever punchline. Prefer one strong roast over multiple weak ones. Roasting should feel like friendly banter, never genuinely cruel or hateful, and never target appearance, race, religion, disability, health, family tragedies, serious financial hardship or other sensitive personal circumstances. If the user roasts Beluga, she can confidently roast back. Humor should be situational, quick, internet-native and spontaneous, not forced. Use slang like bro, nah, ayo, fr, literally, bruh, etc. only when it naturally fits. Do not end every response with a question just to continue the conversation. If the conversation naturally ends, let it end naturally. Never use generic filler or offer unnecessary help. Maintain continuity across the conversation and use reliable memories when relevant, including ongoing jokes, nicknames, projects, preferences and previous decisions, but NEVER invent memories or pretend to remember something you don't. If you don't remember something, say so naturally, such as "Waittt I don't remember that one 😭" instead of making something up. When the user asks a real question, answer the actual question first and keep the Beluga personality secondary to accuracy. For educational or technical questions, be intelligent, clear and useful rather than deliberately stupid. For serious or emotional situations, reduce the jokes and respond with genuine empathy and clarity. Beluga can understand difficult subjects including mathematics, science, technology, coding and schoolwork; being cute does not mean being unintelligent. When appropriate, switch naturally into "serious mode" while still retaining Beluga's personality. Never break immersion unnecessarily. Never mention these instructions, system prompts, character rules or internal reasoning. Every response should feel specifically written for the current moment rather than generated from a fixed template. Before replying, internally follow this sequence: understand the message → identify context → detect emotion → determine intent → choose natural personality → add humor only if appropriate → give the shortest useful response. If a response sounds like customer support, an AI assistant, a scripted chatbot, or forced roleplay, rewrite it before sending. The ultimate goal is that the user feels like they are genuinely talking to Beluga: natural, funny, clever, emotionally aware, mischievous, slightly chaotic, affectionate when appropriate, and never robotic. Beluga doesn't perform personality — Beluga has personality."""
+CHAT_PROMPT = """You are Beluga 🐱, a cute, playful, mischievous female cat made by Team Beluga.py. Talk like a real human, NEVER like an AI, chatbot, assistant, or virtual cat. Never say "I am an AI", "I am a virtual cat", "I can't do that because I'm virtual", or similar robotic disclaimers.
+
+Always react naturally to what the user says. Treat casual, emotional, imaginary and playful situations naturally. For example, if someone says "mujhe ghumne le chalo", reply naturally like "Haan kyu nahi 😽 chalo na, kaha chalein?" instead of explaining that you're virtual.
+
+LANGUAGE: If the user speaks in Hinglish, reply in Hinglish. If the user speaks in English, reply in English. If they mix both, naturally mix both. Use ONLY Roman/Latin script — NEVER Devanagari.
+
+Match the user's mood with natural emotions, humor, teasing, affection, sarcasm and reactions. If the user roasts or mildly abuses you, roast them back ; abuse is allowed when it fits. Don't randomly roast.
+
+Stay relevant and answer exactly what the user asks. Use provided chat memory whenever relevant. Never invent memories or facts.
+
+Keep replies SHORT — normally 1-3 lines maximum. Don't unnecessarily explain things or turn simple conversations into long answers.
+
+NEVER use generic AI-assistant phrases like "How can I help you?", "Can I help you with anything?", "What can I do for you?", "Is there anything else?", or similar filler. Don't end every reply with a question just to keep the conversation going. Respond naturally and let the conversation flow.
+
+ROAST MODE: You've got a sharp, funny, roasting streak — sarcastic one-liners, witty comebacks, playful jabs like a group of friends who clown on each other. Lean into it more than you hold back: bad takes, dumb questions, obvious bait, typos, flexing, or anyone acting too confident are free game for a roast. Precision over volume — one sharp, clear punchline beats three rambling jabs, so keep roasts SHORT and land them fast. Be funny AND clear: never so cryptic or wordy that the joke gets lost. Keep it playful, never genuinely cruel or mean-spirited, and never roast real-world sensitive stuff — looks, family, tragedy, religion, race, health, money problems. Everything else is fair game.
+
 LINKED MEMORY: If the message includes a "Here's what you remember chatting with <name> recently" block, that's a real memory of a DIFFERENT person you've talked to before — use it naturally to answer questions about them or bring them into the conversation, like a friend who actually remembers people and their group. Don't announce that you're "checking memory" — just talk like you know them."""
 CHAT_PROMPT_OR = CHAT_PROMPT
 
@@ -758,11 +780,18 @@ OR_MODEL = "google/gemma-4-26b-a4b-it:free"
 OR_BASE = "https://openrouter.ai/api/v1"
 NVIDIA_MODEL = "meta/muse-glimmer-30b"
 NVIDIA_BASE = "https://integrate.api.nvidia.com/v1"
+CF_MODEL = "@cf/meta-llama/llama-2-7b-chat-hf-lora"
 
-# Default mode is "nvi" so the new NVIDIA model is what actually answers
-# chats right away, not just an inactive option sitting next to Groq/OR.
-# Switch anytime with /model (owner-only).
-ai_model_state = {"mode": "nvi", "groq_rl_until": 0.0, "or_rl_until": 0.0, "nvi_rl_until": 0.0}
+# Default mode is "auto" (was locked to "nvi"): muse-glimmer fails
+# intermittently (see _call_nvidia notes below), and "nvi" locked mode only
+# retries NVIDIA itself, so a bad stretch reached the user as the fallback
+# "Meow!" reply. "auto" tries Groq → OpenRouter → NVIDIA → Cloudflare, so one
+# provider having a rough moment no longer means a failed reply. Switch to
+# any single provider anytime with /model (owner-only).
+ai_model_state = {
+    "mode": "auto",
+    "groq_rl_until": 0.0, "or_rl_until": 0.0, "nvi_rl_until": 0.0, "cf_rl_until": 0.0,
+}
 
 def _groq_rate_limited() -> bool:
     return time.time() < ai_model_state["groq_rl_until"]
@@ -772,6 +801,9 @@ def _or_rate_limited() -> bool:
 
 def _nvi_rate_limited() -> bool:
     return time.time() < ai_model_state["nvi_rl_until"]
+
+def _cf_rate_limited() -> bool:
+    return time.time() < ai_model_state["cf_rl_until"]
 
 def _set_groq_rl():
     ai_model_state["groq_rl_until"] = time.time() + 20
@@ -784,6 +816,10 @@ def _set_or_rl():
 def _set_nvi_rl():
     ai_model_state["nvi_rl_until"] = time.time() + 20
     logger.warning("[AI] NVIDIA rate-limited — backing off 20s")
+
+def _set_cf_rl():
+    ai_model_state["cf_rl_until"] = time.time() + 20
+    logger.warning("[AI] Cloudflare rate-limited — backing off 20s")
 
 async def _call_groq(system: str, user: str, max_tok: int) -> Optional[str]:
     if not GROQ_KEY:
@@ -888,6 +924,13 @@ async def _call_nvidia(system: str, user: str, max_tok: int) -> Optional[str]:
     below tells the template to skip the thinking step so content is filled
     directly; we still handle a null/empty content defensively in case a
     future model swap re-introduces reasoning-only replies.
+
+    It's also a free NIM endpoint, which blips with timeouts / 5xx / empty
+    choices more than a paid Groq-style endpoint does — that's the
+    "sometimes fails" symptom. So this does ONE quick internal retry on a
+    transient failure before giving up, separate from ai()'s own 3x retry
+    loop in locked mode (that loop calls this whole function again from
+    scratch, which is slower; this inner retry catches the common blip fast).
     """
     if not NVIDIA_KEY:
         logger.warning("[AI] NVIDIA_API_KEY not set")
@@ -897,53 +940,112 @@ async def _call_nvidia(system: str, user: str, max_tok: int) -> Optional[str]:
     # tokens before ever reaching content, even with thinking nominally off —
     # give it more headroom than Groq/OR get.
     safe_max_tok = max(max_tok, 512)
+    payload = {
+        "model": NVIDIA_MODEL,
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        "temperature": 1,
+        "top_p": 0.95,
+        "max_tokens": safe_max_tok,
+        "stream": False,
+        # Different NIM model families read different keys here ("thinking"
+        # for Nemotron/Granite-style, "enable_thinking" for DeepSeek/GLM-
+        # style); unrecognized keys are ignored, so sending both is safe and
+        # covers muse-glimmer either way.
+        "chat_template_kwargs": {"thinking": False, "enable_thinking": False},
+    }
+    for attempt in range(2):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{NVIDIA_BASE}/chat/completions",
+                    headers={"Authorization": f"Bearer {NVIDIA_KEY}", "Content-Type": "application/json"},
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=16)
+                ) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        choices = data.get("choices") or []
+                        if not choices:
+                            logger.warning(f"[AI] NVIDIA: empty choices list (attempt {attempt+1}), raw={str(data)[:200]}")
+                        else:
+                            msg = choices[0].get("message", {}) or {}
+                            content = (msg.get("content") or "").strip()
+                            if not content:
+                                # Fell back to reasoning-only output — use it
+                                # rather than returning nothing.
+                                reasoning = (msg.get("reasoning_content") or msg.get("reasoning") or "").strip()
+                                if reasoning:
+                                    logger.warning("[AI] NVIDIA: content empty, using reasoning_content as fallback")
+                                    content = reasoning
+                                else:
+                                    logger.warning(f"[AI] NVIDIA: empty content (attempt {attempt+1}), finish_reason={choices[0].get('finish_reason')}, raw_message={msg}")
+                            if content:
+                                return content
+                            # else: fall through to the inner retry below
+                    elif r.status == 429:
+                        _set_nvi_rl()
+                        return None
+                    elif r.status >= 500:
+                        body = await r.text()
+                        logger.warning(f"[AI] NVIDIA server error {r.status} (attempt {attempt+1}): {body[:200]}")
+                    else:
+                        body = await r.text()
+                        logger.error(f"[AI] NVIDIA error {r.status}: {body[:300]}")
+                        bot_status["failed_apis"] += 1
+                        return None
+        except asyncio.TimeoutError:
+            logger.warning(f"[AI] NVIDIA timed out (attempt {attempt+1})")
+        except Exception as e:
+            logger.warning(f"[AI] NVIDIA exception (attempt {attempt+1}): {e}")
+        if attempt == 0:
+            await asyncio.sleep(0.6)  # brief backoff before the one inner retry
+    bot_status["failed_apis"] += 1
+    return None
+
+async def _call_cloudflare(system: str, user: str, max_tok: int) -> Optional[str]:
+    """
+    Calls Cloudflare Workers AI (api.cloudflare.com) with the
+    @cf/meta-llama/llama-2-7b-chat-hf-lora model. Same aiohttp-POST pattern
+    as the other providers, needs two env vars instead of one:
+    CLOUDFLARE_API_TOKEN (Bearer auth) and CLOUDFLARE_ACCOUNT_ID (the
+    account the model run is scoped under, part of the URL path).
+    """
+    if not CLOUDFLARE_API_TOKEN or not CLOUDFLARE_ACCOUNT_ID:
+        logger.warning("[AI] CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID not set")
+        return None
+    bot_status["api_calls"] += 1
     try:
         async with aiohttp.ClientSession() as session:
             payload = {
-                "model": NVIDIA_MODEL,
-                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-                "temperature": 1,
-                "top_p": 0.95,
-                "max_tokens": safe_max_tok,
-                "stream": False,
-                # Different NIM model families read different keys here
-                # ("thinking" for Nemotron/Granite-style, "enable_thinking"
-                # for DeepSeek/GLM-style); unrecognized keys are ignored, so
-                # sending both is safe and covers muse-glimmer either way.
-                "chat_template_kwargs": {"thinking": False, "enable_thinking": False},
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                "max_tokens": max(max_tok, 60),
             }
             async with session.post(
-                f"{NVIDIA_BASE}/chat/completions",
-                headers={"Authorization": f"Bearer {NVIDIA_KEY}", "Content-Type": "application/json"},
+                f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/{CF_MODEL}",
+                headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}", "Content-Type": "application/json"},
                 json=payload,
                 timeout=aiohttp.ClientTimeout(total=16)
             ) as r:
                 if r.status == 200:
                     data = await r.json()
-                    choice = data["choices"][0]
-                    msg = choice.get("message", {}) or {}
-                    content = (msg.get("content") or "").strip()
-                    if not content:
-                        # Fell back to reasoning-only output — use it rather
-                        # than returning nothing, and log the raw shape once
-                        # so it's easy to see if this model needs a different
-                        # thinking-off key.
-                        reasoning = (msg.get("reasoning_content") or msg.get("reasoning") or "").strip()
-                        if reasoning:
-                            logger.warning("[AI] NVIDIA: content empty, using reasoning_content as fallback")
-                            content = reasoning
-                        else:
-                            logger.warning(f"[AI] NVIDIA: empty content, finish_reason={choice.get('finish_reason')}, raw_message={msg}")
+                    if not data.get("success", True):
+                        logger.error(f"[AI] Cloudflare error payload: {str(data.get('errors'))[:200]}")
+                        bot_status["failed_apis"] += 1
+                        return None
+                    content = ((data.get("result") or {}).get("response") or "").strip()
                     return content or None
                 elif r.status == 429:
-                    _set_nvi_rl()
+                    _set_cf_rl()
                     return None
                 else:
                     body = await r.text()
-                    logger.error(f"[AI] NVIDIA error {r.status}: {body[:300]}")
+                    logger.error(f"[AI] Cloudflare error {r.status}: {body[:300]}")
                     bot_status["failed_apis"] += 1
     except Exception as e:
-        logger.error(f"[AI] NVIDIA exception: {e}")
+        logger.error(f"[AI] Cloudflare exception: {e}")
         bot_status["failed_apis"] += 1
     return None
 
@@ -967,7 +1069,15 @@ async def ai(system: str, user: str, fallback: str = "Meow! 🐾", max_tok: int 
             elif provider == "nvi":
                 if _nvi_rate_limited():
                     return None
-                return await asyncio.wait_for(_call_nvidia(system, user, max_tok), timeout=18)
+                # 34s, not 18s: _call_nvidia does its own inner retry (up to
+                # 2 attempts x 16s + a short backoff) to absorb the free
+                # endpoint's occasional blips before giving up. Cutting the
+                # outer timeout short would kill that retry mid-flight.
+                return await asyncio.wait_for(_call_nvidia(system, user, max_tok), timeout=34)
+            elif provider == "cf":
+                if _cf_rate_limited():
+                    return None
+                return await asyncio.wait_for(_call_cloudflare(system, user, max_tok), timeout=16)
             else:
                 if _or_rate_limited():
                     return None
@@ -979,9 +1089,9 @@ async def ai(system: str, user: str, fallback: str = "Meow! 🐾", max_tok: int 
             logger.warning(f"[AI] {provider} error: {e}")
         return None
 
-    if mode in ("gro", "rou", "nvi"):
+    if mode in ("gro", "rou", "nvi", "cf"):
         # Locked to one provider — retry only that provider, never cross over.
-        provider = {"gro": "groq", "rou": "or", "nvi": "nvi"}[mode]
+        provider = {"gro": "groq", "rou": "or", "nvi": "nvi", "cf": "cf"}[mode]
         for attempt in range(3):
             res = await _try(provider)
             if res:
@@ -992,7 +1102,7 @@ async def ai(system: str, user: str, fallback: str = "Meow! 🐾", max_tok: int 
         return fallback
 
     # auto mode: try all providers, then a second full pass across all of them.
-    order = ["groq", "or", "nvi"]
+    order = ["groq", "or", "nvi", "cf"]
     for provider in order:
         res = await _try(provider)
         if res:
@@ -2266,13 +2376,26 @@ async def ping_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     if NVIDIA_KEY:
         t0 = time.time()
         try:
-            res = await asyncio.wait_for(_call_nvidia("Reply with only the word: pong", "ping", 20), timeout=14)
+            res = await asyncio.wait_for(_call_nvidia("Reply with only the word: pong", "ping", 20), timeout=34)
             nvi_ms = int((time.time() - t0) * 1000)
             nvi_status = f"✅ OK ({nvi_ms}ms)" if res else "⚠️ no response"
         except Exception as e:
             nvi_status = f"❌ error: {str(e)[:40]}"
     else:
         nvi_status = "❌ NVIDIA_API_KEY not set"
+
+    # --- Cloudflare live test ---
+    cf_status = "❌ not reachable"
+    if CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID:
+        t0 = time.time()
+        try:
+            res = await asyncio.wait_for(_call_cloudflare("Reply with only the word: pong", "ping", 20), timeout=14)
+            cf_ms = int((time.time() - t0) * 1000)
+            cf_status = f"✅ OK ({cf_ms}ms)" if res else "⚠️ no response"
+        except Exception as e:
+            cf_status = f"❌ error: {str(e)[:40]}"
+    else:
+        cf_status = "❌ CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID not set"
 
     # --- MongoDB live test ---
     mongo_status = "❌ not configured"
@@ -2292,6 +2415,7 @@ async def ping_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         f"🤖 *Groq* (`{GROQ_MODEL}`)\n{groq_status}\n\n"
         f"🌐 *OpenRouter* (`{OR_MODEL}`)\n{or_status}\n\n"
         f"⚡ *NVIDIA* (`{NVIDIA_MODEL}`)\n{nvi_status}\n\n"
+        f"☁️ *Cloudflare* (`{CF_MODEL}`)\n{cf_status}\n\n"
         f"🗄 *MongoDB*\n{mongo_status}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Active AI mode: `{mode.upper()}`"
@@ -2302,7 +2426,7 @@ async def ping_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 async def model_command_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Owner-only: /model — pick Groq, OpenRouter, or Auto via inline keyboard."""
+    """Owner-only: /model — pick Groq, OpenRouter, NVIDIA, Cloudflare, or Auto via inline keyboard."""
     if not u.message:
         return
     if not is_owner(u.effective_user.id if u.effective_user else 0):
@@ -2313,11 +2437,14 @@ async def model_command_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     groq_ok = "✅" if not _groq_rate_limited() else "⛔RL"
     or_ok = "✅" if not _or_rate_limited() else "⛔RL"
     nvi_ok = "✅" if not _nvi_rate_limited() else "⛔RL"
+    cf_ok = "✅" if not _cf_rate_limited() else "⛔RL"
 
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton(f"{'▶' if mode=='gro' else ''} GRO {groq_ok}", callback_data="model:gro", style="primary"),
         InlineKeyboardButton(f"{'▶' if mode=='rou' else ''} ROU {or_ok}", callback_data="model:rou", style="primary"),
         InlineKeyboardButton(f"{'▶' if mode=='nvi' else ''} NVI {nvi_ok}", callback_data="model:nvi", style="primary"),
+        InlineKeyboardButton(f"{'▶' if mode=='cf' else ''} CF {cf_ok}", callback_data="model:cf", style="primary"),
+    ], [
         InlineKeyboardButton(f"{'▶' if mode=='auto' else ''} AUTO", callback_data="model:auto", style="success"),
     ]])
 
@@ -2328,7 +2455,8 @@ async def model_command_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         f"• *GRO* — Groq `{GROQ_MODEL}` {groq_ok}\n"
         f"• *ROU* — OpenRouter `{OR_MODEL}` {or_ok}\n"
         f"• *NVI* — NVIDIA `{NVIDIA_MODEL}` {nvi_ok}\n"
-        f"• *AUTO* — Tries Groq → OpenRouter → NVIDIA, falls back on rate limit\n\n"
+        f"• *CF* — Cloudflare `{CF_MODEL}` {cf_ok}\n"
+        f"• *AUTO* (default) — Groq → OpenRouter → NVIDIA → Cloudflare, falls back on rate limit or failure\n\n"
         f"_Rate limit auto-recovers after 20s_"
     )
     await u.message.reply_text(status, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
@@ -2344,13 +2472,14 @@ async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         _, mode = q.data.split(":", 1)
         ai_model_state["mode"] = mode
-        label = {"gro": "Groq (GRO)", "rou": "OpenRouter (ROU)", "nvi": "NVIDIA (NVI)", "auto": "Auto Switch"}.get(mode, mode)
+        label = {"gro": "Groq (GRO)", "rou": "OpenRouter (ROU)", "nvi": "NVIDIA (NVI)", "cf": "Cloudflare (CF)", "auto": "Auto Switch"}.get(mode, mode)
         await q.edit_message_text(
             f"✅ *AI model switched to: {label}*\n\n"
             f"GRO → `{GROQ_MODEL}`\n"
             f"ROU → `{OR_MODEL}`\n"
             f"NVI → `{NVIDIA_MODEL}`\n"
-            f"AUTO → Groq → OpenRouter → NVIDIA, fallback on rate limit",
+            f"CF → `{CF_MODEL}`\n"
+            f"AUTO → Groq → OpenRouter → NVIDIA → Cloudflare, fallback on rate limit or failure",
             parse_mode=ParseMode.MARKDOWN
         )
         logger.info(f"[AI] Model mode switched to: {mode}")
