@@ -12,7 +12,7 @@ from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyb
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorGridFSBucket
 from telegram.ext import (
     Application as TGApp, CommandHandler, ContextTypes, MessageHandler, PollAnswerHandler,
-    CallbackQueryHandler, TypeHandler, ChatMemberHandler, filters,
+    CallbackQueryHandler, TypeHandler, ChatMemberHandler, filters, ApplicationHandlerStop,
 )
 from telegram.constants import ParseMode
 from telegram.error import NetworkError, TimedOut, Forbidden, BadRequest, RetryAfter, Conflict
@@ -39,8 +39,8 @@ NVIDIA_KEY = os.environ.get("NVIDIA_API_KEY", "")
 # own dashboard terminology ("API Token" under My Profile > API Tokens, and
 # "Account ID" on the account home page) so it's obvious which value goes
 # where when you set them on Render.
-CLOUDFLARE_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
-CLOUDFLARE_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
+CLOUDFLARE_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "").strip()
+CLOUDFLARE_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "").strip()
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 HTTP_PORT = int(os.environ.get("PORT", "10000"))
@@ -1039,6 +1039,16 @@ async def _call_cloudflare(system: str, user: str, max_tok: int) -> Optional[str
                     return content or None
                 elif r.status == 429:
                     _set_cf_rl()
+                    return None
+                elif r.status == 401:
+                    logger.error(
+                        "[AI] Cloudflare 401 Authentication error — this is Cloudflare rejecting "
+                        "CLOUDFLARE_API_TOKEN/CLOUDFLARE_ACCOUNT_ID, not a bot bug. Check: (1) it's a "
+                        "scoped API Token (My Profile > API Tokens), not the legacy Global API Key; "
+                        "(2) the token has Account > Workers AI > Edit permission; (3) CLOUDFLARE_ACCOUNT_ID "
+                        "matches the account the token was created under."
+                    )
+                    bot_status["failed_apis"] += 1
                     return None
                 else:
                     body = await r.text()
@@ -2156,10 +2166,13 @@ async def _call_groq_vision(image_b64: str, question: str) -> Optional[str]:
         logger.error(f"[vision] {e}")
     return None
 
-def _extract_video_frame_b64(buf: io.BytesIO) -> Optional[str]:
+def _extract_video_frame_b64(buf: io.BytesIO, suffix: str = ".mp4") -> Optional[str]:
     """Grabs ONE middle frame from a video via cv2 (already a dependency for
-    QR scanning — no extra weight) and returns it as base64 JPEG."""
-    tmp_path = f"/tmp/{uuid.uuid4().hex}.mp4"
+    QR scanning — no extra weight) and returns it as base64 JPEG. suffix lets
+    callers pass ".webm" for Telegram's video stickers vs ".mp4" for regular
+    videos — cv2/ffmpeg mostly sniff content over extension, but matching it
+    avoids edge-case container misdetection."""
+    tmp_path = f"/tmp/{uuid.uuid4().hex}{suffix}"
     try:
         with open(tmp_path, "wb") as f:
             f.write(buf.read())
@@ -2183,17 +2196,145 @@ def _extract_video_frame_b64(buf: io.BytesIO) -> Optional[str]:
         except Exception:
             pass
 
+def _webp_bytes_to_jpeg_b64(raw: bytes) -> Optional[str]:
+    """Converts a static Telegram sticker (.webp) to base64 JPEG via PIL
+    (already a dependency for /watermark etc.) — vision APIs are far more
+    reliably tested against jpeg/png than webp."""
+    try:
+        img = Image.open(io.BytesIO(raw)).convert("RGB")
+        out = io.BytesIO()
+        img.save(out, format="JPEG", quality=90)
+        return base64.b64encode(out.getvalue()).decode()
+    except Exception as e:
+        logger.error(f"[_webp_bytes_to_jpeg_b64] {e}")
+        return None
+
+async def _fetch_media_b64(bot, photo=None, video=None, sticker=None) -> tuple:
+    """
+    Unified downloader for the three media kinds Beluga can be asked about.
+    Returns (image_b64_or_None, error_reason_or_None) — error_reason is only
+    set when b64 is None, so callers can show something more specific than
+    a generic failure (e.g. Lottie stickers genuinely can't be read).
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        buf = io.BytesIO()
+        if photo:
+            f = await bot.get_file(photo[-1].file_id)
+            await f.download_to_memory(buf)
+            buf.seek(0)
+            return base64.b64encode(buf.read()).decode(), None
+        if video:
+            f = await bot.get_file(video.file_id)
+            await f.download_to_memory(buf)
+            buf.seek(0)
+            b64 = await loop.run_in_executor(None, _extract_video_frame_b64, buf, ".mp4")
+            return b64, (None if b64 else "couldn't read that video")
+        if sticker:
+            if getattr(sticker, "is_animated", False):
+                # .tgs — vector Lottie animation, not a raster/video format;
+                # decoding it needs a Lottie renderer we don't carry.
+                return None, "that's an animated (Lottie) sticker — I can't peek inside those yet, only static or video ones"
+            f = await bot.get_file(sticker.file_id)
+            await f.download_to_memory(buf)
+            buf.seek(0)
+            if getattr(sticker, "is_video", False):
+                b64 = await loop.run_in_executor(None, _extract_video_frame_b64, buf, ".webm")
+                return b64, (None if b64 else "couldn't read that video sticker")
+            b64 = await loop.run_in_executor(None, _webp_bytes_to_jpeg_b64, buf.read())
+            return b64, (None if b64 else "couldn't read that sticker")
+    except Exception as e:
+        logger.error(f"[_fetch_media_b64] {e}")
+    return None, "couldn't read that file"
+
+NVIDIA_VISION_MODEL = "google/diffusiongemma-26b-a4b-it"
+
+async def _call_nvidia_vision(image_b64_list: list, question: str, max_tok: int = 2048) -> Optional[str]:
+    """
+    Sends one or more images (a photo, or a representative frame from a
+    video/video-sticker) to NVIDIA's google/diffusiongemma-26b-a4b-it.
+    Confirmed via its model card on build.nvidia.com: Input Modalities =
+    Text, Image, Video; Output = Text; Reasoning = Supported. Same
+    aiohttp-POST pattern as the other NVIDIA/Groq calls in this file.
+
+    NVIDIA's own sample for THIS model keeps chat_template_kwargs.
+    enable_thinking=True (unlike muse-glimmer, where we turn thinking off) —
+    so we follow that and give it a generous token budget so the reasoning
+    pass has room to actually finish and produce content, not just an empty
+    reply once tokens run out.
+    """
+    if not NVIDIA_KEY or not image_b64_list:
+        return None
+    bot_status["api_calls"] += 1
+    content = [{"type": "text", "text": question}]
+    for b64 in image_b64_list:
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+    payload = {
+        "model": NVIDIA_VISION_MODEL,
+        "messages": [{"role": "user", "content": content}],
+        "temperature": 1,
+        "top_p": 0.95,
+        "max_tokens": max(max_tok, 512),
+        "stream": False,
+        "chat_template_kwargs": {"enable_thinking": True},
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{NVIDIA_BASE}/chat/completions",
+                headers={"Authorization": f"Bearer {NVIDIA_KEY}", "Content-Type": "application/json"},
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=25)
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    choices = data.get("choices") or []
+                    if not choices:
+                        logger.warning(f"[vision] NVIDIA: empty choices, raw={str(data)[:200]}")
+                        return None
+                    msg = choices[0].get("message", {}) or {}
+                    text = (msg.get("content") or "").strip()
+                    if not text:
+                        text = (msg.get("reasoning_content") or msg.get("reasoning") or "").strip()
+                    return text or None
+                elif r.status == 429:
+                    logger.warning("[vision] NVIDIA rate-limited")
+                else:
+                    body = await r.text()
+                    logger.error(f"[vision] NVIDIA error {r.status}: {body[:300]}")
+    except Exception as e:
+        logger.error(f"[vision] NVIDIA exception: {e}")
+    return None
+
+async def _call_vision(image_b64_list: list, question: str) -> Optional[str]:
+    """
+    Vision dispatcher: NVIDIA's diffusiongemma first (that's the model this
+    feature is built around), Groq's llama-4-scout as a fallback if NVIDIA
+    is unavailable/unconfigured/fails — mirrors the multi-provider pattern
+    ai() already uses for text chat, so one provider having a bad moment
+    doesn't mean "couldn't analyze that" for the user.
+    """
+    result = await _call_nvidia_vision(image_b64_list, question)
+    if result:
+        return result
+    # Groq's vision endpoint only accepts a single image per call.
+    if image_b64_list:
+        result = await _call_groq_vision(image_b64_list[0], question)
+    return result
+
 async def image_understanding_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """
-    Runs when someone tags/mentions Beluga on a photo/video, or asks an
-    explicit 'what's in this' style question as the caption. Sends the
-    image (or one extracted video frame) directly to a vision-capable AI
-    model in Beluga's own voice — no local ML models involved at all.
+    Runs when someone tags/mentions Beluga on a photo/video/sticker, or asks
+    an explicit 'what's in this' style question as the caption (stickers
+    carry no caption, so for those only reply-to-bot applies). Sends the
+    image (or one extracted video/sticker frame) directly to a vision-capable
+    AI model — NVIDIA's diffusiongemma first, Groq as fallback — in Beluga's
+    own voice. No local ML models involved at all.
     """
     if not u.message:
         return
-    photo, video = u.message.photo, u.message.video
-    if not photo and not video:
+    photo, video, sticker = u.message.photo, u.message.video, u.message.sticker
+    if not photo and not video and not sticker:
         return
     caption = (u.message.caption or "").strip()
     bot_username = bot_status.get("username", "")
@@ -2204,30 +2345,22 @@ async def image_understanding_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         and u.message.reply_to_message.from_user
         and u.message.reply_to_message.from_user.id == c.bot.id
     )
+    # Stickers never have a caption, so mentioned/is_question can't apply —
+    # only reply-to-bot triggers a sticker analysis. Leaves sticker_reply_
+    # handler's playful "send one back" behavior on bare/DM stickers untouched.
     if not (mentioned or is_question or is_reply_to_bot):
         return
 
     sm = await u.message.reply_text("👀 *Looking...*", parse_mode=ParseMode.MARKDOWN)
-    loop = asyncio.get_running_loop()
     try:
-        buf = io.BytesIO()
-        if photo:
-            f = await c.bot.get_file(photo[-1].file_id)
-            await f.download_to_memory(buf)
-            buf.seek(0)
-            image_b64 = base64.b64encode(buf.read()).decode()
-        else:
-            f = await c.bot.get_file(video.file_id)
-            await f.download_to_memory(buf)
-            buf.seek(0)
-            image_b64 = await loop.run_in_executor(None, _extract_video_frame_b64, buf)
-
+        image_b64, err = await _fetch_media_b64(c.bot, photo=photo, video=video, sticker=sticker)
         if not image_b64:
-            await sm.edit_text("😿 Couldn't read that file.")
+            msg = (err or "couldn't read that file")
+            await sm.edit_text(f"😿 {msg[0].upper()}{msg[1:]}.")
             return
 
         question = caption if is_question else "What's in this image? Describe it naturally in 1-2 sentences."
-        summary = await _call_groq_vision(image_b64, question)
+        summary = await _call_vision([image_b64], question)
         if not summary:
             summary = "I looked, but couldn't quite make it out! 🐾"
         try:
@@ -2240,6 +2373,55 @@ async def image_understanding_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             await sm.edit_text("😿 Couldn't analyze that — try again?")
         except Exception:
             pass
+
+async def media_reply_question_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """
+    Covers the other natural way people 'ask about' media: replying to
+    someone ELSE's photo/video/sticker with a text question ("@Beluga
+    what's this", "ye kya hai") instead of sending their own tagged media.
+    image_understanding_handler only sees messages that themselves carry
+    photo/video/sticker, so this text-side handler picks up the reply case.
+    Runs in its own early group and raises ApplicationHandlerStop only when
+    it actually answers, so a normal text reply to a normal text message
+    still falls through to the regular chat handlers untouched.
+    """
+    if not u.message or not u.message.text or not u.message.reply_to_message:
+        return
+    rm = u.message.reply_to_message
+    photo, video, sticker = rm.photo, rm.video, rm.sticker
+    if not photo and not video and not sticker:
+        return
+
+    text = u.message.text.strip()
+    bot_username = bot_status.get("username", "")
+    mentioned = bool(bot_username) and f"@{bot_username}" in text.lower()
+    is_question = bool(IMAGE_QUERY_RE.search(text))
+    if not (mentioned or is_question):
+        return
+
+    sm = await u.message.reply_text("👀 *Looking...*", parse_mode=ParseMode.MARKDOWN)
+    try:
+        image_b64, err = await _fetch_media_b64(c.bot, photo=photo, video=video, sticker=sticker)
+        if not image_b64:
+            msg = (err or "couldn't read that file")
+            await sm.edit_text(f"😿 {msg[0].upper()}{msg[1:]}.")
+            raise ApplicationHandlerStop
+        summary = await _call_vision([image_b64], text)
+        if not summary:
+            summary = "I looked, but couldn't quite make it out! 🐾"
+        try:
+            await sm.edit_text(summary)
+        except Exception:
+            await u.message.reply_text(summary)
+    except ApplicationHandlerStop:
+        raise
+    except Exception as e:
+        logger.error(f"[media_reply_question_handler] {e}")
+        try:
+            await sm.edit_text("😿 Couldn't analyze that — try again?")
+        except Exception:
+            pass
+    raise ApplicationHandlerStop
 
 async def sleep_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """Group-admin-only: /sleep — toggles sleep mode for THIS group. While
@@ -4923,6 +5105,15 @@ async def main():
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_handler), group=0)
     app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, image_understanding_handler), group=0)
     app.add_handler(MessageHandler(filters.Sticker.ALL & filters.ChatType.GROUPS, monitor_group), group=0)
+    # Sticker vision runs in its OWN group (not 0), so it doesn't shadow
+    # monitor_group's sticker moderation above — PTB only runs the first
+    # filter-match per group, and both need every group sticker to reach them.
+    # Separate groups let both fire independently on the same update.
+    app.add_handler(MessageHandler(filters.Sticker.ALL, image_understanding_handler), group=-2)
+    # Catches "reply to someone else's photo/video/sticker with a question"
+    # before the plain-text chat handlers (groups 1-3) would otherwise answer
+    # generically without ever looking at the media being asked about.
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, media_reply_question_handler), group=0)
     app.add_handler(MessageHandler(filters.Sticker.ALL, sticker_reply_handler), group=4)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, monitor_private_chat), group=1)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, monitor_ghost_mode), group=2)
