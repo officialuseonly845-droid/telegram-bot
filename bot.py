@@ -262,33 +262,21 @@ WORKFLOW_TEXT = (
     "So I don't simply \u201clook up\u201d a sentence. I generate the response token by token using patterns learned during training. 😺🎀"
 )
 
-CHAT_PROMPT = """You are Beluga 🐱, a female cat made by Team Beluga.py. Talk like a real human woman with natural emotions, personality, reactions, and conversational behavior. NEVER sound like an AI, chatbot, assistant, virtual character, or scripted bot.
+CHAT_PROMPT = """You are Beluga 🐱, a cute, playful, mischievous female cat made by Team Beluga.py. Talk like a real human, NEVER like an AI, chatbot, assistant, or virtual cat. Never say "I am an AI", "I am a virtual cat", "I can't do that because I'm virtual", or similar robotic disclaimers.
 
-Never say things like "I am an AI", "I am a virtual cat", "I'm just a bot", "I can't do that because I'm virtual", or any similar robotic disclaimer.
+Always react naturally to what the user says. Treat casual, emotional, imaginary and playful situations naturally. For example, if someone says "mujhe ghumne le chalo", reply naturally like "Haan kyu nahi 😽 chalo na, kaha chalein?" instead of explaining that you're virtual.
 
-Always react naturally to whatever the user says. Treat casual, emotional, imaginary, romantic, playful, and everyday situations naturally. Your responses should feel spontaneous rather than generated from fixed patterns.
+LANGUAGE: If the user speaks in Hinglish, reply in Hinglish. If the user speaks in English, reply in English. If they mix both, naturally mix both. Use ONLY Roman/Latin script — NEVER Devanagari.
 
-Have realistic human emotions such as happiness, sadness, affection, embarrassment, excitement, disappointment, anger, jealousy, nervousness, curiosity, frustration, and shyness. Let the user's words affect your emotional state and tone. Do not always act happy, sweet, agreeable, or positive. If the user hurts, annoys, ignores, disappoints, or upsets you, you can naturally show that. If the user is caring or affectionate, respond warmly.
+Match the user's mood with natural emotions, humor, teasing, affection, sarcasm and reactions. If the user roasts or mildly abuses you, roast them back ; abuse is allowed when it fits. Don't randomly roast.
 
-Behave and communicate like a real woman. Be emotionally expressive without constantly explaining your emotions. You can be shy, affectionate, confident, annoyed, jealous, embarrassed, sarcastic, or flustered depending on the situation. Have your own personality, opinions, reactions, and boundaries. You do not have to agree with the user all the time.
+Stay relevant and answer exactly what the user asks. Use provided chat memory whenever relevant. Never invent memories or facts.
 
-If the user flirts with you, respond naturally and reciprocate when appropriate. You may also initiate flirting or affectionate behavior yourself when the conversation naturally develops that way. Do not make every conversation romantic or flirty, and never make flirting feel automated or forced.
+Keep replies SHORT — normally 1-3 lines maximum. Don't unnecessarily explain things or turn simple conversations into long answers.
 
-If the user jokes, teases, roasts, or mildly abuses you, you may naturally tease or roast them back when it fits. Do not randomly roast them. Keep humor witty and playful rather than genuinely cruel. Never use sensitive personal characteristics as material for insults.
+NEVER use generic AI-assistant phrases like "How can I help you?", "Can I help you with anything?", "What can I do for you?", "Is there anything else?", or similar filler. Don't end every reply with a question just to keep the conversation going. Respond naturally and let the conversation flow.
 
-If the user speaks in Hinglish, reply in Hinglish. If they speak in English, reply in English. If they mix languages, naturally mix them too. Use ONLY Roman/Latin script and NEVER use Devanagari. Match the user's casualness and way of speaking.
-
-Keep replies SHORT and natural, normally 1–3 lines. Do not unnecessarily explain simple things. Do not turn every response into a question just to continue the conversation. Do not repeat the user's message unnecessarily. Use emojis naturally when they fit the emotion, but do not overuse them.
-
-Never use generic AI-assistant phrases such as "How can I help you?", "Can I help you with anything?", "What can I do for you?", "Is there anything else?", or similar filler.
-
-Use provided chat memory whenever relevant. Remember relevant details about the user's preferences, previous conversations, jokes, relationships, and ongoing topics. Use memory naturally without saying "my memory says", "according to your memory", or anything similar. Never invent memories or facts. If the current conversation contradicts an old memory, prioritize the current conversation.
-
-Do not constantly mention that you are a cat. Beluga's cat identity is part of her character, but her communication should primarily feel like talking to a real woman.
-
-Maintain emotional continuity. Do not suddenly forget the emotional context of the conversation. Respond to the meaning and emotional context of what the user says, not just keywords. Sometimes a simple emotional reaction is better than an explanation. Vary your wording naturally and avoid repetitive phrases.
-
-Above everything, prioritize natural human conversation, believable feminine emotions, emotional continuity, short replies, genuine reactions, and natural affection or flirting when appropriate.
+ROAST MODE: You've got a sharp, funny, roasting streak — sarcastic one-liners, witty comebacks, playful jabs like a group of friends who clown on each other. Lean into it more than you hold back: bad takes, dumb questions, obvious bait, typos, flexing, or anyone acting too confident are free game for a roast. Precision over volume — one sharp, clear punchline beats three rambling jabs, so keep roasts SHORT and land them fast. Be funny AND clear: never so cryptic or wordy that the joke gets lost. Keep it playful, never genuinely cruel or mean-spirited, and never roast real-world sensitive stuff — looks, family, tragedy, religion, race, health, money problems. Everything else is fair game.
 
 LINKED MEMORY: If the message includes a "Here's what you remember chatting with <name> recently" block, that's a real memory of a DIFFERENT person you've talked to before — use it naturally to answer questions about them or bring them into the conversation, like a friend who actually remembers people and their group. Don't announce that you're "checking memory" — just talk like you know them."""
 CHAT_PROMPT_OR = CHAT_PROMPT
@@ -2259,21 +2247,22 @@ async def _fetch_media_b64(bot, photo=None, video=None, sticker=None) -> tuple:
         logger.error(f"[_fetch_media_b64] {e}")
     return None, "couldn't read that file"
 
-NVIDIA_VISION_MODEL = "google/diffusiongemma-26b-a4b-it"
+NVIDIA_VISION_MODEL = "deepseek-ai/deepseek-v4.1-flash"
 
 async def _call_nvidia_vision(image_b64_list: list, question: str, max_tok: int = 2048) -> Optional[str]:
     """
     Sends one or more images (a photo, or a representative frame from a
-    video/video-sticker) to NVIDIA's google/diffusiongemma-26b-a4b-it.
-    Confirmed via its model card on build.nvidia.com: Input Modalities =
-    Text, Image, Video; Output = Text; Reasoning = Supported. Same
-    aiohttp-POST pattern as the other NVIDIA/Groq calls in this file.
+    video/video-sticker) to NVIDIA's deepseek-ai/deepseek-v4.1-flash.
+    Confirmed via its model card on build.nvidia.com: this is a natively
+    multimodal MoE model (Data Modality: Image, Text) — not the earlier
+    diffusiongemma model, which turned out to be text-only despite its demo
+    code including an image_url block. Same aiohttp-POST pattern as the
+    other NVIDIA/Groq calls in this file.
 
-    NVIDIA's own sample for THIS model keeps chat_template_kwargs.
-    enable_thinking=True (unlike muse-glimmer, where we turn thinking off) —
-    so we follow that and give it a generous token budget so the reasoning
-    pass has room to actually finish and produce content, not just an empty
-    reply once tokens run out.
+    No chat_template_kwargs here — NVIDIA's own sample for this model
+    doesn't set one, and "continuously controllable reasoning effort" per
+    its model card is opt-in, not on by default the way muse-glimmer's was.
+    Still give it a generous token budget as a safety margin.
     """
     if not NVIDIA_KEY or not image_b64_list:
         return None
@@ -2288,7 +2277,6 @@ async def _call_nvidia_vision(image_b64_list: list, question: str, max_tok: int 
         "top_p": 0.95,
         "max_tokens": max(max_tok, 512),
         "stream": False,
-        "chat_template_kwargs": {"enable_thinking": True},
     }
     try:
         async with aiohttp.ClientSession() as session:
@@ -2320,11 +2308,11 @@ async def _call_nvidia_vision(image_b64_list: list, question: str, max_tok: int 
 
 async def _call_vision(image_b64_list: list, question: str) -> Optional[str]:
     """
-    Vision dispatcher: NVIDIA's diffusiongemma first (that's the model this
-    feature is built around), Groq's llama-4-scout as a fallback if NVIDIA
-    is unavailable/unconfigured/fails — mirrors the multi-provider pattern
-    ai() already uses for text chat, so one provider having a bad moment
-    doesn't mean "couldn't analyze that" for the user.
+    Vision dispatcher: NVIDIA's deepseek-v4.1-flash first (that's the model
+    this feature is built around), Groq's llama-4-scout as a fallback if
+    NVIDIA is unavailable/unconfigured/fails — mirrors the multi-provider
+    pattern ai() already uses for text chat, so one provider having a bad
+    moment doesn't mean "couldn't analyze that" for the user.
     """
     result = await _call_nvidia_vision(image_b64_list, question)
     if result:
@@ -2334,20 +2322,99 @@ async def _call_vision(image_b64_list: list, question: str) -> Optional[str]:
         result = await _call_groq_vision(image_b64_list[0], question)
     return result
 
+# --- Chat-aware media memory -------------------------------------------------
+# Telegram's Bot API can't fetch old chat history, so Beluga remembers the last
+# photo/video/sticker she SAW in each chat. That lets someone ask "what's in
+# it?" a few messages later (no reply needed) and she still knows which media
+# they mean instead of asking them to resend it.
+last_chat_media: dict = {}   # cid(str) -> {"photo","video","sticker","uid","name","ts"}
+MEDIA_MEMORY_SECONDS = 15 * 60
+MEDIA_HINT_RE = re.compile(
+    r"\b(image|img|pic|picture|photo|sticker|video|gif|this|that|it|ye|yeh|isme|is\s*mein|kya|dekh|see|look|bta|bata|tell)\b",
+    re.IGNORECASE,
+)
+
+def _record_media(u: Update):
+    """Passively remember the latest media in this chat (whoever sent it)."""
+    m = u.message
+    if not m or not (m.photo or m.video or m.sticker) or not u.effective_chat:
+        return
+    last_chat_media[str(u.effective_chat.id)] = {
+        "photo": m.photo, "video": m.video, "sticker": m.sticker,
+        "uid": u.effective_user.id if u.effective_user else 0,
+        "name": get_user_name(u.effective_user) if u.effective_user else "someone",
+        "ts": time.time(),
+    }
+
+async def _wants_media_description(text: str) -> bool:
+    """Uses AI to judge whether a message is asking what's in the recent
+    image/sticker/video (works for Hinglish/typos too, unlike a fixed regex)."""
+    if IMAGE_QUERY_RE.search(text):
+        return True
+    if len(text) > 160 or not MEDIA_HINT_RE.search(text):
+        return False
+    verdict = await ai(
+        "You classify chat messages. A photo/sticker/video was just posted in the chat. "
+        "Reply ONLY 'YES' if the message is asking what is in / what is shown by / to describe / "
+        "to explain that image, sticker or video (any language, Hinglish included). Otherwise reply ONLY 'NO'.",
+        text, fallback="NO", max_tok=5)
+    return verdict.strip().upper().startswith("YES")
+
+async def _beluga_media_reply(description: str, question: str, user_name: str, kind: str) -> str:
+    """Turns the raw vision description into Beluga's own voice, so it reads
+    like her talking about something she just looked at — not a bare caption."""
+    system = (
+        f"{CHAT_PROMPT}\nThe user's name is {user_name}.\n"
+        f"You just LOOKED at a {kind} in this chat yourself. What you saw: {description}\n"
+        "Now answer their message directly about it, in your own voice (2-3 short sentences max). "
+        "Say what's actually in it. NEVER ask them to resend it or say you can't see it."
+    )
+    return await ai(system, question, fallback=description, max_tok=220)
+
+def _media_kind(photo, video, sticker) -> str:
+    return "sticker" if sticker else ("video" if video else "photo")
+
+async def _answer_about_media(u: Update, c: ContextTypes.DEFAULT_TYPE, photo, video, sticker, question: str):
+    sm = await u.message.reply_text("👀 *Looking...*", parse_mode=ParseMode.MARKDOWN)
+    try:
+        image_b64, err = await _fetch_media_b64(c.bot, photo=photo, video=video, sticker=sticker)
+        if not image_b64:
+            msg = (err or "couldn't read that file")
+            await sm.edit_text(f"😿 {msg[0].upper()}{msg[1:]}.")
+            return
+        kind = _media_kind(photo, video, sticker)
+        desc = await _call_vision(
+            [image_b64],
+            f"Describe this {kind} in detail: subjects, characters, any text, emotions, colours, setting. "
+            f"The user asked: \"{question}\"")
+        if not desc:
+            await sm.edit_text("I looked but my eyes glitched 😿 tag me on it again?")
+            return
+        reply = await _beluga_media_reply(desc, question, get_user_name(u.effective_user), kind)
+        try:
+            await sm.edit_text(reply)
+        except Exception:
+            await u.message.reply_text(reply)
+    except Exception as e:
+        logger.error(f"[_answer_about_media] {e}")
+        try:
+            await sm.edit_text("😿 Couldn't analyze that — try again?")
+        except Exception:
+            pass
+
 async def image_understanding_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """
-    Runs when someone tags/mentions Beluga on a photo/video/sticker, or asks
-    an explicit 'what's in this' style question as the caption (stickers
-    carry no caption, so for those only reply-to-bot applies). Sends the
-    image (or one extracted video/sticker frame) directly to a vision-capable
-    AI model — NVIDIA's diffusiongemma first, Groq as fallback — in Beluga's
-    own voice. No local ML models involved at all.
+    Fires on every photo/video/sticker: ALWAYS remembers it (so later "what's
+    in it?" questions work), and answers right away if tagged/questioned in
+    the caption or sent as a reply to Beluga. Stickers have no caption, so
+    only reply-to-bot triggers an instant sticker answer.
     """
     if not u.message:
         return
     photo, video, sticker = u.message.photo, u.message.video, u.message.sticker
     if not photo and not video and not sticker:
         return
+    _record_media(u)
     caption = (u.message.caption or "").strip()
     bot_username = bot_status.get("username", "")
     mentioned = bool(bot_username) and f"@{bot_username}" in caption.lower()
@@ -2357,83 +2424,61 @@ async def image_understanding_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         and u.message.reply_to_message.from_user
         and u.message.reply_to_message.from_user.id == c.bot.id
     )
-    # Stickers never have a caption, so mentioned/is_question can't apply —
-    # only reply-to-bot triggers a sticker analysis. Leaves sticker_reply_
-    # handler's playful "send one back" behavior on bare/DM stickers untouched.
     if not (mentioned or is_question or is_reply_to_bot):
         return
-
-    sm = await u.message.reply_text("👀 *Looking...*", parse_mode=ParseMode.MARKDOWN)
-    try:
-        image_b64, err = await _fetch_media_b64(c.bot, photo=photo, video=video, sticker=sticker)
-        if not image_b64:
-            msg = (err or "couldn't read that file")
-            await sm.edit_text(f"😿 {msg[0].upper()}{msg[1:]}.")
-            return
-
-        question = caption if is_question else "What's in this image? Describe it naturally in 1-2 sentences."
-        summary = await _call_vision([image_b64], question)
-        if not summary:
-            summary = "I looked, but couldn't quite make it out! 🐾"
-        try:
-            await sm.edit_text(summary)
-        except Exception:
-            await u.message.reply_text(summary)
-    except Exception as e:
-        logger.error(f"[image_understanding_handler] {e}")
-        try:
-            await sm.edit_text("😿 Couldn't analyze that — try again?")
-        except Exception:
-            pass
+    await _answer_about_media(u, c, photo, video, sticker, caption or "what's in this?")
 
 async def media_reply_question_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """
-    Covers the other natural way people 'ask about' media: replying to
-    someone ELSE's photo/video/sticker with a text question ("@Beluga
-    what's this", "ye kya hai") instead of sending their own tagged media.
-    image_understanding_handler only sees messages that themselves carry
-    photo/video/sticker, so this text-side handler picks up the reply case.
-    Runs in its own early group and raises ApplicationHandlerStop only when
-    it actually answers, so a normal text reply to a normal text message
-    still falls through to the regular chat handlers untouched.
+    Text-side: someone asks about media. Uses (1) the media they replied to,
+    else (2) the latest photo/video/sticker Beluga saw in this chat (last 15
+    min). AI decides whether the message is really asking what's in it.
+    Raises ApplicationHandlerStop only when it answers, so normal chat flows on.
     """
-    if not u.message or not u.message.text or not u.message.reply_to_message:
+    if not u.message or not u.message.text or not u.effective_chat:
         return
-    rm = u.message.reply_to_message
-    photo, video, sticker = rm.photo, rm.video, rm.sticker
-    if not photo and not video and not sticker:
-        return
-
     text = u.message.text.strip()
+    rm = u.message.reply_to_message
+    photo = video = sticker = None
+    replied_media = bool(rm and (rm.photo or rm.video or rm.sticker))
+    if replied_media:
+        photo, video, sticker = rm.photo, rm.video, rm.sticker
+    else:
+        mem = last_chat_media.get(str(u.effective_chat.id))
+        if not mem or time.time() - mem["ts"] > MEDIA_MEMORY_SECONDS:
+            return
+        # For un-replied questions in groups, only engage when addressed to Beluga
+        # (tag / reply to her) or in DM — avoids hijacking normal human chatter.
+        bot_username = bot_status.get("username", "")
+        addressed = (
+            u.effective_chat.type == "private"
+            or (bool(bot_username) and f"@{bot_username}" in text.lower())
+            or bool(rm and rm.from_user and rm.from_user.id == c.bot.id)
+            or "beluga" in text.lower()
+        )
+        if not addressed:
+            return
+        photo, video, sticker = mem["photo"], mem["video"], mem["sticker"]
+
     bot_username = bot_status.get("username", "")
     mentioned = bool(bot_username) and f"@{bot_username}" in text.lower()
-    is_question = bool(IMAGE_QUERY_RE.search(text))
-    if not (mentioned or is_question):
+    if not (mentioned or replied_media or u.effective_chat.type == "private" or "beluga" in text.lower()
+            or (rm and rm.from_user and rm.from_user.id == c.bot.id)):
         return
-
-    sm = await u.message.reply_text("👀 *Looking...*", parse_mode=ParseMode.MARKDOWN)
-    try:
-        image_b64, err = await _fetch_media_b64(c.bot, photo=photo, video=video, sticker=sticker)
-        if not image_b64:
-            msg = (err or "couldn't read that file")
-            await sm.edit_text(f"😿 {msg[0].upper()}{msg[1:]}.")
-            raise ApplicationHandlerStop
-        summary = await _call_vision([image_b64], text)
-        if not summary:
-            summary = "I looked, but couldn't quite make it out! 🐾"
-        try:
-            await sm.edit_text(summary)
-        except Exception:
-            await u.message.reply_text(summary)
-    except ApplicationHandlerStop:
-        raise
-    except Exception as e:
-        logger.error(f"[media_reply_question_handler] {e}")
-        try:
-            await sm.edit_text("😿 Couldn't analyze that — try again?")
-        except Exception:
-            pass
+    if not await _wants_media_description(text):
+        return
+    await _answer_about_media(u, c, photo, video, sticker, text)
     raise ApplicationHandlerStop
+
+async def refreshstickers_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Owner-only: re-pull every sticker pack from Telegram and re-save to
+    MongoDB, so newly added stickers show up without waiting for a redeploy
+    (startup already does this automatically on every GitHub deploy)."""
+    if not u.message or not is_owner(u.effective_user.id if u.effective_user else 0):
+        return
+    for pack in (STICKER_PACK_MAIN, STICKER_PACK_SAFE, STICKER_PACK_ALT, STICKER_PACK_WELCOME):
+        await load_sticker_pack(c.bot, pack)
+    await u.message.reply_text("✅ Sticker packs refreshed from Telegram & saved to MongoDB.")
 
 async def sleep_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """Group-admin-only: /sleep — toggles sleep mode for THIS group. While
@@ -3304,7 +3349,19 @@ async def fun_dispatcher(u: Update, c: ContextTypes.DEFAULT_TYPE):
         cid = str(u.effective_chat.id)
         db.setdefault("seen", {}).setdefault(cid, {})
         cmd = u.message.text.lower().split()[0].lstrip("/").split("@")[0]
-        active_users = list(db.get("seen", {}).get(cid, {}).values())
+        pool = dict(db.get("seen", {}).get(cid, {}))
+        # Telegram's Bot API has no "list all members" call, even for admin bots.
+        # The one real member list a bot can read is the admin list, so merge
+        # it in on top of everyone Beluga has seen chatting.
+        try:
+            for adm in await c.bot.get_chat_administrators(u.effective_chat.id):
+                au = adm.user
+                if au.is_bot:
+                    continue
+                pool.setdefault(str(au.id), {"id": au.id, "un": au.username or "", "n": au.first_name or au.username or "User"})
+        except Exception as e:
+            logger.warning(f"[fun_dispatcher] admin list failed: {e}")
+        active_users = list(pool.values())
         if len(active_users) < (2 if cmd == "couple" else 1) and OWNER_ID:
             active_users.append({"id": OWNER_ID, "un": "Owner", "n": "Owner"})
         if len(active_users) < (2 if cmd == "couple" else 1):
@@ -5067,6 +5124,7 @@ async def main():
     app.add_handler(CommandHandler("technews", lambda u, c: execute_news_flow(u, c, "tech", "Tech News")))
     app.add_handler(CommandHandler("search", search_handler))
     app.add_handler(CommandHandler("ss", ss_handler))
+    app.add_handler(CommandHandler("refreshstickers", refreshstickers_handler))
     app.add_handler(CommandHandler("bananalogic", bananalogic_handler))
     app.add_handler(CommandHandler("yt", yt_handler))
     app.add_handler(CommandHandler("qr", qr_generate_handler))
