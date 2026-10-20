@@ -314,11 +314,11 @@ async def crypto_chart_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 raise ValueError("Empty dataset from Binance")
                 
             df = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
-            df['Timestamp'] = pd.to_datetime(df['Timestamp'], unit='ms')
+            df.loc[:, 'Timestamp'] = pd.to_datetime(df['Timestamp'], unit='ms')
             
-            # Ensure all columns are numeric floats and drop any NaNs
+            # Ensure all columns are numeric floats and drop any NaNs (fixed pandas warnings)
             for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
+                df.loc[:, col] = pd.to_numeric(df[col], errors='coerce')
             df.dropna(inplace=True)
             
             df.set_index('Timestamp', inplace=True)
@@ -336,7 +336,7 @@ async def crypto_chart_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             def _plot_and_save():
                 fig, axes = mpf.plot(
                     df, type='candle', style=s, volume=True,
-                    returnfig=True, figratio=(14, 9), dpi=115
+                    returnfig=True, figratio=(14, 9)
                 )
                 fig.savefig(buf, bbox_inches='tight', dpi=115)
                 plt.close(fig) # Prevent memory buildup and recursion errors
