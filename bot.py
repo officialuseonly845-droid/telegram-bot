@@ -1,4 +1,22 @@
 """Entry point: health server, error handler, handler registration and startup. Run with `python bot.py`."""
+
+# ── handlers location shim ───────────────────────────────────────────────────
+# The handler modules are imported as `handlers.<name>`. They work whether they
+# sit in a real `handlers/` folder OR are all uploaded flat next to this file
+# (chat.py, crypto.py, search.py, ...). No renaming needed either way.
+import os as _os
+import sys as _sys
+import types as _types
+
+_HERE = _os.path.dirname(_os.path.abspath(__file__))
+if _HERE not in _sys.path:
+    _sys.path.insert(0, _HERE)
+if not _os.path.isdir(_os.path.join(_HERE, "handlers")):
+    _pkg = _types.ModuleType("handlers")
+    _pkg.__path__ = [_HERE]
+    _sys.modules["handlers"] = _pkg
+# ─────────────────────────────────────────────────────────────────────────────
+
 import asyncio
 import sys
 from aiohttp import web
