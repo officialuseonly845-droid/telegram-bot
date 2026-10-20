@@ -82,8 +82,7 @@ async def crypto_price_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         logger.error(f"[crypto_price] {e}")
 
 
-# Coins that would only pollute a "movers" list (stablecoins / fiat pairs) and the
-# minimum 24h traded value (in USDT) a coin needs before it counts.
+# Coins that would only pollute a "movers" list (stablecoins / fiat pairs)
 _STABLE_BASES = {
     "USDT", "USDC", "FDUSD", "TUSD", "BUSD", "DAI", "USDP", "USDD", "PYUSD", "USDE", "USD1", "RLUSD",
     "UST", "USTC", "EUR", "EURI", "AEUR", "GBP", "TRY", "BRL", "ARS", "UAH", "PLN", "RON", "CZK", "JPY",
@@ -105,7 +104,6 @@ def _fmt_price(p: float) -> str:
 
 def _fetch_movers_sync():
     errors = []
-
     # 1) Binance
     for host in ("https://data-api.binance.vision", "https://api.binance.com", "https://api1.binance.com"):
         try:
@@ -226,7 +224,7 @@ async def crypto_movers_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 
 async def crypto_chart_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Handles /chart command with support for timeframes: 5m, 15m, 1h, 1D/1d, 1M."""
+    """Handles /chart command with support for timeframes: 5m, 15m, 1h, 1d/1D, 1M."""
     if not u.message or not exchange:
         return
     try:
@@ -238,7 +236,7 @@ async def crypto_chart_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         if len(parts) >= 2:
             ticker = parts[1].upper()
             
-        # Mapping for timeframes as requested: 5m, 15m, 1h, 1d/1D, 1M
+        # Mapping for timeframes: 5m, 15m, 1h, 4h, 1d/1D, 1M
         tf_mapping = {
             "5m": "5m",
             "15m": "15m",
@@ -272,6 +270,9 @@ async def crypto_chart_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             df = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
             df['Timestamp'] = pd.to_datetime(df['Timestamp'], unit='ms')
             df.set_index('Timestamp', inplace=True)
+            
+            # CRITICAL FIX: Remove duplicate timestamps & sort index to prevent mplfinance recursion errors
+            df = df[~df.index.duplicated(keep='last')].sort_index()
             
             buf = io.BytesIO()
             mc = mpf.make_marketcolors(up='#00C48C', down='#ff3366', inherit=True)
@@ -361,7 +362,7 @@ async def fetch_footprint_summary(ticker: str):
 
 
 async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles clicks on Inline Keyboard buttons for Orderbook, Footprint, and Indicators."""
+    """Handles clicks on Inline Keyboard buttons for Orderbook, Footprint, Indicators, and Chart Refresh."""
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -379,3 +380,10 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
     elif data.startswith("ind_"):
         _, ticker, tf = data.split("_")
         await query.message.reply_text(f"📊 Indicator Options for *{ticker}* (`{tf}`):\n• RSI (Relative Strength Index)\n• Moving Averages (EMA/SMA)\n• Bollinger Bands\n\n*(Custom indicator toggles enabled via Beluga Engine)*", parse_mode=ParseMode.MARKDOWN)
+        
+    elif data.startswith("chart_"):
+        _, ticker, tf = data.split("_")
+        # Simulate /chart refresh
+        update.message = query.message
+        update.message.text = f"/chart {ticker} {tf}"
+        await crypto_chart_handler(update, context)
