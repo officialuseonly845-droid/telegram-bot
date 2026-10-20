@@ -1,5 +1,6 @@
 import matplotlib
 matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 import asyncio
 import time
 import ccxt
@@ -50,30 +51,75 @@ async def init_exchange_async():
     exchange = await loop.run_in_executor(None, get_exchange)
 
 
+# --- ROBUST PRICE FETCHER USING DIRECT BINANCE PUBLIC REST API ---
+def _fetch_price_sync(ticker: str):
+    """Fetches ticker data using direct public Binance endpoints with CCXT fallback."""
+    symbol = f"{ticker.upper()}USDT"
+    hosts = ("https://data-api.binance.vision", "https://api.binance.com", "https://api1.binance.com")
+    
+    for host in hosts:
+        try:
+            r = requests.get(f"{host}/api/v3/ticker/24hr", params={"symbol": symbol}, headers=_HTTP_UA, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                return {
+                    "last": float(data.get("lastPrice", 0)),
+                    "percentage": float(data.get("priceChangePercent", 0)),
+                    "baseVolume": float(data.get("volume", 0)),
+                    "high": float(data.get("highPrice", 0)),
+                    "low": float(data.get("lowPrice", 0)),
+                    "source": "Binance"
+                }
+        except Exception:
+            continue
+            
+    # Fallback to connected exchange via CCXT if direct HTTP fails
+    if exchange is not None:
+        try:
+            td = exchange.fetch_ticker(f"{ticker.upper()}/USDT")
+            return {
+                "last": td.get('last', 0.0),
+                "percentage": td.get('percentage', 0.0),
+                "baseVolume": td.get('baseVolume', 0.0),
+                "high": td.get('high', 0.0),
+                "low": td.get('low', 0.0),
+                "source": str(getattr(exchange, "name", "Exchange"))
+            }
+        except Exception:
+            pass
+    return None
+
+
 async def crypto_price_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    if not u.message or not exchange:
+    if not u.message:
         return
     try:
         ticker = (c.args[0].upper() if c.args else "BTC")
         cid = u.effective_chat.id
         await safe_react(c.bot, cid, u.message.message_id, "💰")
         sm = await u.message.reply_text(T.crypto_price_msg_1(ticker), parse_mode=ParseMode.MARKDOWN)
+        
         loop = asyncio.get_running_loop()
         try:
-            td = await loop.run_in_executor(None, exchange.fetch_ticker, f"{ticker}/USDT")
-            price = td.get('last', 0.0)
-            change = td.get('percentage', 0.0)
-            vol = td.get('baseVolume', 0.0)
-            high = td.get('high', 0.0)
-            low = td.get('low', 0.0)
+            td = await loop.run_in_executor(None, lambda: _fetch_price_sync(ticker))
+            if not td or td['last'] <= 0:
+                raise ValueError(f"Could not fetch price for {ticker}")
+                
+            price = td['last']
+            change = td['percentage']
+            vol = td['baseVolume']
+            high = td['high']
+            low = td['low']
+            source = td['source']
+            
             sign = "🟩 +" if change >= 0 else "🟥 "
             res = (f"⚡ *{ticker}/USDT*\n━━━━━━━━━━━━━━━━━━━━\n\n"
-                   f"🏷 *Price*\n`{price:,.4f} USDT`\n\n"
+                   f"🏷 *Price*\n`{_fmt_price(price)} USDT`\n\n"
                    f"📊 *24h Change*\n`{sign}{change:.2f}%`\n\n"
-                   f"📈 *24h High*\n`{high:,.4f}`\n\n"
-                   f"📉 *24h Low*\n`{low:,.4f}`\n\n"
+                   f"📈 *24h High*\n`{_fmt_price(high)}`\n\n"
+                   f"📉 *24h Low*\n`{_fmt_price(low)}`\n\n"
                    f"🔄 *Volume*\n`{vol:,.2f} {ticker}`\n\n"
-                   f"━━━━━━━━━━━━━━━━━━━━\n🐾 _via Beluga Quant Engine_")
+                   f"━━━━━━━━━━━━━━━━━━━━\n🐾 _via Beluga Quant Engine · {source}_")
             await sm.edit_text(res, parse_mode=ParseMode.MARKDOWN)
         except Exception as e:
             await sm.edit_text(T.crypto_price_msg_2(e))
@@ -224,7 +270,7 @@ async def crypto_movers_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 
 async def crypto_chart_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Handles /chart command with support for timeframes: 5m, 15m, 1h, 1d/1D, 1M."""
+    """Handles /chart command with support for timeframes: 5m, 15m, 1h, 4h, 1d/1D, 1M."""
     if not u.message or not exchange:
         return
     try:
@@ -269,19 +315,33 @@ async def crypto_chart_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 
             df = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
             df['Timestamp'] = pd.to_datetime(df['Timestamp'], unit='ms')
+            
+            # Ensure all columns are numeric floats and drop any NaNs
+            for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            df.dropna(inplace=True)
+            
             df.set_index('Timestamp', inplace=True)
             
-            # CRITICAL FIX: Remove duplicate timestamps & sort index to prevent mplfinance recursion errors
+            # Remove duplicate timestamps & sort index to prevent mplfinance recursion errors
             df = df[~df.index.duplicated(keep='last')].sort_index()
             
+            if df.empty:
+                raise ValueError("Cleaned dataset is empty")
+
             buf = io.BytesIO()
             mc = mpf.make_marketcolors(up='#00C48C', down='#ff3366', inherit=True)
             s = mpf.make_mpf_style(base_mpf_style='charles', marketcolors=mc, gridcolor='#222222', facecolor='#0d0d0d')
             
-            def _plot():
-                mpf.plot(df, type='candle', style=s, volume=True, savefig=dict(fname=buf, dpi=115, bbox_inches='tight'), figratio=(14,9))
+            def _plot_and_save():
+                fig, axes = mpf.plot(
+                    df, type='candle', style=s, volume=True,
+                    returnfig=True, figratio=(14, 9), dpi=115
+                )
+                fig.savefig(buf, bbox_inches='tight', dpi=115)
+                plt.close(fig) # Prevent memory buildup and recursion errors
                 
-            await loop.run_in_executor(None, _plot)
+            await loop.run_in_executor(None, _plot_and_save)
             buf.seek(0)
             await sm.delete()
 
@@ -383,7 +443,7 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         
     elif data.startswith("chart_"):
         _, ticker, tf = data.split("_")
-        # Simulate /chart refresh
+        # Simulate /chart refresh safely
+        query.message.text = f"/chart {ticker} {tf}"
         update.message = query.message
-        update.message.text = f"/chart {ticker} {tf}"
         await crypto_chart_handler(update, context)
