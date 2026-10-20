@@ -1,12 +1,8 @@
-import matplotlib
-matplotlib.use('Agg')
-from matplotlib.figure import Figure
-from matplotlib.backends.backend_agg import FigureCanvasAgg
-from matplotlib.patches import Rectangle
 import asyncio
 import io
 import re
 import time
+import traceback
 from datetime import datetime, timezone
 
 import ccxt
@@ -103,7 +99,7 @@ async def crypto_price_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     try:
         ticker = (c.args[0].upper() if c.args else "BTC")
         cid = u.effective_chat.id
-        await safe_react(c.bot, cid, u.message.message_id, "💰")
+        await safe_react(c.bot, cid, u.message.message_id, "⚡")
         sm = await u.message.reply_text(T.crypto_price_msg_1(ticker), parse_mode=ParseMode.MARKDOWN)
 
         loop = asyncio.get_running_loop()
@@ -276,17 +272,18 @@ async def crypto_movers_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 
 # =====================================================================
-# CHART (pure matplotlib — no mplfinance / pandas, so no recursion errors)
+# CHART — drawn with Pillow only (no matplotlib / mplfinance / pandas)
+# Requires: pillow  (add to requirements.txt)
 # =====================================================================
 _TF_MAPPING = {
     "5m": "5m", "15m": "15m", "1h": "1h", "4h": "4h",
     "1d": "1d", "1D": "1d", "1m": "1M", "1M": "1M",
 }
-_UP = "#00C48C"
-_DOWN = "#ff3366"
-_BG = "#0d0d0d"
-_GRID = "#222222"
-_TXT = "#cccccc"
+_UP = (0, 196, 140)
+_DOWN = (255, 51, 102)
+_BG = (13, 13, 13)
+_GRID = (34, 34, 34)
+_TXT = (204, 204, 204)
 
 
 def _fetch_ohlcv_sync(ticker: str, timeframe: str, limit: int = 60):
@@ -321,56 +318,84 @@ def _fetch_ohlcv_sync(ticker: str, timeframe: str, limit: int = 60):
 
 
 def _render_chart_sync(rows, ticker: str, timeframe: str) -> bytes:
-    """Draws candles + volume with a standalone Figure (no pyplot global state, thread-safe)."""
+    """Candles + volume drawn straight onto a PIL image."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    def font(size):
+        try:
+            return ImageFont.load_default(size=size)
+        except TypeError:  # very old Pillow
+            return ImageFont.load_default()
+
     rows = sorted(rows, key=lambda r: r[0])
     n = len(rows)
 
-    fig = Figure(figsize=(10, 6.4), dpi=115, facecolor=_BG)
-    FigureCanvasAgg(fig)
-    gs = fig.add_gridspec(2, 1, height_ratios=[4, 1], hspace=0.04)
-    ax = fig.add_subplot(gs[0])
-    axv = fig.add_subplot(gs[1], sharex=ax)
+    W, H = 1200, 760
+    L, R, TOP = 20, 110, 70
+    price_bottom = 530
+    vol_top, vol_bottom = 550, 690
+    plot_w = W - L - R
 
-    for a in (ax, axv):
-        a.set_facecolor(_BG)
-        a.grid(True, color=_GRID, linewidth=0.6)
-        a.tick_params(colors=_TXT, labelsize=8)
-        a.yaxis.tick_right()
-        for sp in a.spines.values():
-            sp.set_color(_GRID)
+    img = Image.new("RGB", (W, H), _BG)
+    d = ImageDraw.Draw(img)
+    f_sm, f_title = font(15), font(24)
 
-    lows = [r[3] for r in rows]
-    highs = [r[2] for r in rows]
-    min_l, max_h = min(lows), max(highs)
-    span = (max_h - min_l) or max_h * 0.01 or 1e-9
+    max_h = max(r[2] for r in rows)
+    min_l = min(r[3] for r in rows)
+    span = (max_h - min_l) or (max_h * 0.01) or 1e-9
+    hi, lo = max_h + span * 0.05, min_l - span * 0.05
+    max_v = max(r[5] for r in rows) or 1.0
+
+    def py(p):
+        return TOP + (hi - p) / (hi - lo) * (price_bottom - TOP)
+
+    def text_w(s, f):
+        return d.textlength(s, font=f)
+
+    # horizontal grid + price labels
+    for i in range(6):
+        p = lo + (hi - lo) * i / 5
+        y = py(p)
+        d.line([(L, y), (W - R, y)], fill=_GRID, width=1)
+        d.text((W - R + 8, y - 8), _fmt_price(p), fill=_TXT, font=f_sm)
+
+    cw = plot_w / n
+    body_half = max(1.0, cw * 0.35)
 
     for i, (_, o, h, l, c, v) in enumerate(rows):
+        x = L + (i + 0.5) * cw
         col = _UP if c >= o else _DOWN
-        ax.vlines(i, l, h, color=col, linewidth=1)
-        body_low = min(o, c)
-        body_h = max(abs(c - o), span * 0.002)
-        ax.add_patch(Rectangle((i - 0.35, body_low), 0.7, body_h, facecolor=col, edgecolor=col, linewidth=0.5))
-        axv.bar(i, v, width=0.7, color=col)
+        d.line([(x, py(h)), (x, py(l))], fill=col, width=1)
+        y1, y2 = py(max(o, c)), py(min(o, c))
+        if y2 - y1 < 1:
+            y2 = y1 + 1
+        d.rectangle([x - body_half, y1, x + body_half, y2], fill=col)
+        vh = v / max_v * (vol_bottom - vol_top)
+        d.rectangle([x - body_half, vol_bottom - vh, x + body_half, vol_bottom], fill=col)
 
-    ax.set_xlim(-1, n)
-    ax.set_ylim(min_l - span * 0.05, max_h + span * 0.05)
-    ax.tick_params(labelbottom=False)
+    d.line([(L, vol_bottom), (W - R, vol_bottom)], fill=_GRID, width=1)
+    d.text((W - R + 8, vol_top), "Volume", fill=_TXT, font=f_sm)
 
+    # x labels
     fmt = "%d %b" if timeframe in ("1d", "1M") else "%d %b %H:%M"
     step = max(1, n // 6)
-    idx = list(range(0, n, step))
-    axv.set_xticks(idx)
-    axv.set_xticklabels(
-        [datetime.fromtimestamp(rows[i][0] / 1000, tz=timezone.utc).strftime(fmt) for i in idx],
-        rotation=0
-    )
-    axv.set_ylabel("Vol", color=_TXT, fontsize=8)
+    for i in range(0, n, step):
+        x = L + (i + 0.5) * cw
+        lbl = datetime.fromtimestamp(rows[i][0] / 1000, tz=timezone.utc).strftime(fmt)
+        d.text((x - text_w(lbl, f_sm) / 2, vol_bottom + 10), lbl, fill=_TXT, font=f_sm)
 
+    # last price marker + title
     last = rows[-1][4]
-    fig.suptitle(f"{ticker}/USDT · {timeframe} · {_fmt_price(last)}", color="white", fontsize=12, y=0.95)
+    ly = py(last)
+    lc = _UP if rows[-1][4] >= rows[-1][1] else _DOWN
+    d.line([(L, ly), (W - R, ly)], fill=lc, width=1)
+    tag = _fmt_price(last)
+    d.rectangle([W - R + 2, ly - 11, W - R + 8 + text_w(tag, f_sm) + 6, ly + 11], fill=lc)
+    d.text((W - R + 8, ly - 8), tag, fill=(0, 0, 0), font=f_sm)
+    d.text((L, 20), f"{ticker}/USDT  ·  {timeframe}  ·  {tag}", fill=(255, 255, 255), font=f_title)
 
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", facecolor=_BG, bbox_inches="tight")
+    img.save(buf, format="PNG")
     return buf.getvalue()
 
 
@@ -415,13 +440,16 @@ async def _send_chart(message, ticker: str, timeframe: str):
                    f"🐾 _via Beluga Quant Engine · {source}_")
         await message.reply_photo(photo=bio, caption=caption, parse_mode=ParseMode.MARKDOWN,
                                   reply_markup=InlineKeyboardMarkup(keyboard))
-    except Exception as e:
-        logger.error(f"[crypto_chart] {ticker} {timeframe}: {e}")
+    except BaseException as e:  # RecursionError included
+        tail = " || ".join(traceback.format_exc().splitlines()[-10:])
+        logger.error(f"[crypto_chart] {ticker} {timeframe}: {type(e).__name__}: {str(e)[:100]} | TB: {tail}")
         bot_status["error_count"] += 1
         try:
-            await sm.edit_text(f"❌ Chart error for {ticker}/USDT: {str(e)[:200]}")
+            await sm.edit_text(f"❌ Chart error for {ticker}/USDT: {type(e).__name__}: {str(e)[:150]}")
         except Exception:
             pass
+        if isinstance(e, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+            raise
 
 
 async def crypto_chart_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -440,7 +468,7 @@ async def crypto_chart_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 timeframe = _TF_MAPPING[part.lower()]
                 break
 
-        await safe_react(c.bot, u.effective_chat.id, u.message.message_id, "📈")
+        await safe_react(c.bot, u.effective_chat.id, u.message.message_id, "⚡")
         await _send_chart(u.message, ticker, timeframe)
     except Exception as e:
         logger.error(f"[crypto_chart] {e}")
