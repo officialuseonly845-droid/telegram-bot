@@ -30,9 +30,10 @@ CLOUDFLARE_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "").strip()
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 HTTP_PORT = int(os.environ.get("PORT", "10000"))
 OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
-
 # Optional search keys. With none of them set, /search and /bananalogic still work via
 # DuckDuckGo + Bing + Wikipedia. Setting a key makes results noticeably more reliable.
+#   Google Programmable Search: https://programmablesearchengine.google.com (100 free queries/day)
+#   Brave Search API:           https://brave.com/search/api (free tier)
 GOOGLE_SEARCH_API_KEY = os.environ.get("GOOGLE_SEARCH_API_KEY", "")
 GOOGLE_SEARCH_CX = os.environ.get("GOOGLE_SEARCH_CX", "")
 BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY", "")
@@ -76,12 +77,12 @@ LOCK_DURATION_SEC = 120
 
 TAG_SHOP = [
     {"key": "CEO", "label": "CEO", "emoji": "👤", "cost": 7500, "color": "danger"},
-    {"key": "MANAGER", "label": "MANAGER", "emoji": "👨‍💼", "cost": 7000, "color": "danger"},
+    {"key": "MANAGER", "label": "MANAGER", "emoji": "👨\u200d💼", "cost": 7000, "color": "danger"},
     {"key": "ACTIVE", "label": "ACTIVE", "emoji": "😼", "cost": 4900, "color": "success"},
     {"key": "HELPER", "label": "HELPER", "emoji": "👷", "cost": 3700, "color": "success"},
 ]
 
-# Custom Tag Cost & Timeout set correctly at global scope level
+
 CUSTOM_TAG_COST = 20000
 CUSTOM_TAG_TIMEOUT_SEC = 30 * 60
 
@@ -107,4 +108,3 @@ MONGO_CLEANUP_INTERVAL_SEC = 24 * 3600
 MEMORY_STALE_DAYS = 14
 MEDIA_MEMORY_SECONDS = 15 * 60
 MEMORY_TTL_MESSAGES = 5  # after the stored list exceeds this many entries, it auto-clears
-
