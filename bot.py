@@ -60,10 +60,15 @@ from handlers.chat import (
     sticker_reply_handler,
 )
 from handlers.crypto import (
+    CHART_TEXT_REGEX,
+    button_callback_handler,
     crypto_chart_handler,
+    crypto_chart_text_handler,
     crypto_movers_handler,
     crypto_price_handler,
+    crypto_vp_handler,
     init_exchange_async,
+    start_vp_warmup,
 )
 from handlers.events import my_chat_member_handler, revival_loop, welcome_handler
 from handlers.fun import fun_dispatcher, pump_dump_handler
@@ -170,6 +175,11 @@ async def main():
     app.add_handler(CommandHandler("price", crypto_price_handler))
     app.add_handler(CommandHandler(["topgainers", "toplosers"], crypto_movers_handler))
     app.add_handler(CommandHandler(["chart", "chart5m", "chart15m", "chart1h", "chart4h", "chart1d"], crypto_chart_handler))
+    app.add_handler(CommandHandler("vp", crypto_vp_handler))
+    # Plain-text "chart btc 1h" (no slash). Own group (-3) so media_reply_question_handler in
+    # group 0 can't shadow it; the handler raises ApplicationHandlerStop so the AI chat
+    # handlers don't also answer the same message.
+    app.add_handler(MessageHandler(filters.Regex(CHART_TEXT_REGEX) & ~filters.COMMAND, crypto_chart_text_handler), group=-3)
     app.add_handler(CommandHandler("news", lambda u, c: execute_news_flow(u, c, "crypto", "Crypto News")))
     app.add_handler(CommandHandler("ainews", lambda u, c: execute_news_flow(u, c, "ai", "AI News")))
     app.add_handler(CommandHandler("technews", lambda u, c: execute_news_flow(u, c, "tech", "Tech News")))
@@ -207,6 +217,8 @@ async def main():
     app.add_handler(CallbackQueryHandler(antiraid_prevent_callback, pattern=r"^antiraid:"))
     app.add_handler(CallbackQueryHandler(shop_buy_callback, pattern=r"^shop:"))
     app.add_handler(CallbackQueryHandler(peace_callback, pattern=r"^peace:"))
+    # Chart 🔄 Refresh button (chart_) + buttons on older chart messages (ob_/fp_/ind_)
+    app.add_handler(CallbackQueryHandler(button_callback_handler, pattern=r"^(chart_|ob_|fp_|ind_)"))
     app.add_handler(PollAnswerHandler(poll_answer_handler))
 
     app.add_handler(TypeHandler(Update, guest_message_handler), group=-1)
@@ -273,6 +285,7 @@ async def main():
     cleanup_task = asyncio.create_task(cleanup_expired_games())
     sync_task = asyncio.create_task(periodic_sync())
     exchange_task = asyncio.create_task(init_exchange_async())
+    vp_task = start_vp_warmup()  # background volume-profile cache (BTC/ETH/SOL/XAU)
     revival_task = asyncio.create_task(revival_loop(app))
     cleanup_mongo_task = asyncio.create_task(mongo_cleanup_loop())
 
@@ -281,6 +294,8 @@ async def main():
     cleanup_task.cancel()
     exchange_task.cancel()
     sync_task.cancel()
+    if vp_task:
+        vp_task.cancel()
     bot_status["running"] = False
     for fn in [app.updater.stop, app.stop, app.shutdown, http_runner.cleanup]:
         try:
