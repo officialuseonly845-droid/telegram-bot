@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 import ccxt
 import requests
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
@@ -16,6 +16,20 @@ from config import logger
 from state import bot_status, cache_movers
 from utils import safe_react
 
+# =====================================================================
+# REGISTRATION (bot.py) — add these:
+#
+#   from telegram.ext import CommandHandler, MessageHandler, CallbackQueryHandler, filters
+#   app.add_handler(CommandHandler("chart", crypto_chart_handler))
+#   app.add_handler(CommandHandler("vp", crypto_vp_handler))
+#   app.add_handler(MessageHandler(filters.Regex(CHART_TEXT_REGEX) & ~filters.COMMAND, crypto_chart_text_handler))
+#   (button_callback_handler stays registered as before)
+#
+#   # right after `await init_exchange_async()`:
+#   start_vp_warmup()
+# =====================================================================
+
+BRAND = "powered by - BELUGA.PY 🍂"
 
 _HTTP_UA = {"User-Agent": "Mozilla/5.0 (compatible; BelugaBot/12)"}
 _BINANCE_HOSTS = ("https://data-api.binance.vision", "https://api.binance.com", "https://api1.binance.com")
@@ -272,33 +286,83 @@ async def crypto_movers_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 
 # =====================================================================
-# CHART — drawn with Pillow only (no matplotlib / mplfinance / pandas)
-# Requires: pillow  (add to requirements.txt)
+# SHARED HELPERS (candles from Binance, arg parsing)
+# Charts are drawn with Pillow only. Requires: pillow (requirements.txt)
 # =====================================================================
 _TF_MAPPING = {
     "5m": "5m", "15m": "15m", "1h": "1h", "4h": "4h",
     "1d": "1d", "1D": "1d", "1m": "1M", "1M": "1M",
 }
+_COIN_ALIASES = {"GOLD": "XAU", "XAUUSD": "XAU"}
+
 _UP = (0, 196, 140)
 _DOWN = (255, 51, 102)
 _BG = (13, 13, 13)
 _GRID = (34, 34, 34)
 _TXT = (204, 204, 204)
+_GOLD = (255, 204, 0)
+_BLUE = (100, 170, 255)
+
+# Text trigger: "chart btc 1h" / "chart eth" (no slash). Register with filters.Regex(CHART_TEXT_REGEX)
+CHART_TEXT_REGEX = r"(?i)^\s*chart(?:@\w+)?\s+[a-z0-9]{2,10}(?:\s+(?:5m|15m|1h|4h|1d|1m))?\s*$"
+
+
+def _clean_ticker(raw: str) -> str:
+    t = re.sub(r"[^A-Za-z0-9]", "", raw or "").upper()
+    if t.endswith("USDT") and len(t) > 4:
+        t = t[:-4]
+    t = _COIN_ALIASES.get(t, t)
+    return t[:15] or "BTC"
+
+
+def _tf_of(tok: str):
+    if tok in _TF_MAPPING:
+        return _TF_MAPPING[tok]
+    if tok.lower() in _TF_MAPPING:
+        return _TF_MAPPING[tok.lower()]
+    return None
+
+
+def _parse_ticker_tf(tokens, default_tf="1h"):
+    """tokens = words after the command, e.g. ['btc', '4h'] -> ('BTC', '4h')."""
+    if not tokens:
+        return "BTC", default_tf
+    if len(tokens) == 1 and _tf_of(tokens[0]):
+        return "BTC", _tf_of(tokens[0])
+    ticker = _clean_ticker(tokens[0])
+    tf = default_tf
+    for tok in tokens[1:]:
+        found = _tf_of(tok)
+        if found:
+            tf = found
+            break
+    return ticker, tf
+
+
+def _kline_sources(ticker: str):
+    """(url, symbol, label) list in priority order. XAU = Binance gold futures, PAXG spot as fallback."""
+    t = ticker.upper()
+    if t == "XAU":
+        return ([("https://fapi.binance.com/fapi/v1/klines", "XAUUSDT", "Binance XAUUSDT")] +
+                [(f"{h}/api/v3/klines", "PAXGUSDT", "Binance PAXG (gold)") for h in _BINANCE_HOSTS])
+    return [(f"{h}/api/v3/klines", f"{t}USDT", "Binance") for h in _BINANCE_HOSTS]
 
 
 def _fetch_ohlcv_sync(ticker: str, timeframe: str, limit: int = 60):
-    """Returns (rows, source). rows = [[ts_ms, o, h, l, c, v], ...]. Binance REST first, ccxt fallback."""
-    symbol = f"{ticker}USDT"
-    for host in _BINANCE_HOSTS:
+    """
+    Returns (rows, source). rows = [[ts_ms, o, h, l, c, v, taker_buy_vol], ...]
+    Binance public REST first (works from Render via data-api.binance.vision), ccxt fallback.
+    """
+    for url, symbol, label in _kline_sources(ticker):
         try:
-            r = requests.get(f"{host}/api/v3/klines",
-                             params={"symbol": symbol, "interval": timeframe, "limit": limit},
-                             headers=_HTTP_UA, timeout=10)
+            r = requests.get(url, params={"symbol": symbol, "interval": timeframe, "limit": limit},
+                             headers=_HTTP_UA, timeout=12)
             if r.status_code == 200:
                 data = r.json()
                 if data:
-                    rows = [[int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])] for k in data]
-                    return rows, "Binance"
+                    rows = [[int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5]),
+                             float(k[9]) if len(k) > 9 else None] for k in data]
+                    return rows, label
         except Exception:
             continue
 
@@ -309,28 +373,51 @@ def _fetch_ohlcv_sync(ticker: str, timeframe: str, limit: int = 60):
             for k in raw or []:
                 if None in k[:6]:
                     continue
-                rows.append([int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])])
+                rows.append([int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5]), None])
             if rows:
                 return rows, str(getattr(exchange, "name", "Exchange"))
         except Exception as e:
-            logger.warning(f"[chart] ccxt ohlcv failed: {str(e)[:80]}")
+            logger.warning(f"[ohlcv] ccxt fallback failed: {str(e)[:80]}")
     return None, ""
 
 
+def _png_file(data: bytes, name: str) -> io.BytesIO:
+    bio = io.BytesIO(data)
+    bio.name = name
+    return bio
+
+
+def _log_exc(tag: str, e: BaseException):
+    tail = " || ".join(traceback.format_exc().splitlines()[-10:])
+    logger.error(f"{tag} {type(e).__name__}: {str(e)[:100]} | TB: {tail}")
+
+
+def _font(size):
+    from PIL import ImageFont
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:  # very old Pillow
+        return ImageFont.load_default()
+
+
+def _dashed(d, x1, x2, y, color, dash=8, gap=5):
+    x = x1
+    while x < x2:
+        d.line([(x, y), (min(x + dash, x2), y)], fill=color, width=1)
+        x += dash + gap
+
+
+# =====================================================================
+# /chart  — candles + volume, Refresh button only
+# =====================================================================
 def _render_chart_sync(rows, ticker: str, timeframe: str) -> bytes:
     """Candles + volume drawn straight onto a PIL image."""
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw
 
-    def font(size):
-        try:
-            return ImageFont.load_default(size=size)
-        except TypeError:  # very old Pillow
-            return ImageFont.load_default()
-
-    rows = sorted(rows, key=lambda r: r[0])
+    rows = sorted((r[:6] for r in rows), key=lambda r: r[0])
     n = len(rows)
 
-    W, H = 1200, 760
+    W, H = 1200, 780
     L, R, TOP = 20, 110, 70
     price_bottom = 530
     vol_top, vol_bottom = 550, 690
@@ -338,7 +425,7 @@ def _render_chart_sync(rows, ticker: str, timeframe: str) -> bytes:
 
     img = Image.new("RGB", (W, H), _BG)
     d = ImageDraw.Draw(img)
-    f_sm, f_title = font(15), font(24)
+    f_sm, f_title = _font(15), _font(24)
 
     max_h = max(r[2] for r in rows)
     min_l = min(r[3] for r in rows)
@@ -352,7 +439,6 @@ def _render_chart_sync(rows, ticker: str, timeframe: str) -> bytes:
     def text_w(s, f):
         return d.textlength(s, font=f)
 
-    # horizontal grid + price labels
     for i in range(6):
         p = lo + (hi - lo) * i / 5
         y = py(p)
@@ -376,15 +462,13 @@ def _render_chart_sync(rows, ticker: str, timeframe: str) -> bytes:
     d.line([(L, vol_bottom), (W - R, vol_bottom)], fill=_GRID, width=1)
     d.text((W - R + 8, vol_top), "Volume", fill=_TXT, font=f_sm)
 
-    # x labels
     fmt = "%d %b" if timeframe in ("1d", "1M") else "%d %b %H:%M"
     step = max(1, n // 6)
     for i in range(0, n, step):
         x = L + (i + 0.5) * cw
         lbl = datetime.fromtimestamp(rows[i][0] / 1000, tz=timezone.utc).strftime(fmt)
-        d.text((x - text_w(lbl, f_sm) / 2, vol_bottom + 10), lbl, fill=_TXT, font=f_sm)
+        d.text((max(4, x - text_w(lbl, f_sm) / 2), vol_bottom + 10), lbl, fill=_TXT, font=f_sm)
 
-    # last price marker + title
     last = rows[-1][4]
     ly = py(last)
     lc = _UP if rows[-1][4] >= rows[-1][1] else _DOWN
@@ -393,88 +477,387 @@ def _render_chart_sync(rows, ticker: str, timeframe: str) -> bytes:
     d.rectangle([W - R + 2, ly - 11, W - R + 8 + text_w(tag, f_sm) + 6, ly + 11], fill=lc)
     d.text((W - R + 8, ly - 8), tag, fill=(0, 0, 0), font=f_sm)
     d.text((L, 20), f"{ticker}/USDT  ·  {timeframe}  ·  {tag}", fill=(255, 255, 255), font=f_title)
+    d.text((L, H - 34), "powered by - BELUGA.PY", fill=(150, 150, 150), font=f_sm)
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
 
 
-def _clean_ticker(raw: str) -> str:
-    t = re.sub(r"[^A-Za-z0-9]", "", raw or "").upper()
-    return t[:15] or "BTC"
-
-
-async def _send_chart(message, ticker: str, timeframe: str):
-    """Shared by /chart command and the Refresh button. `message` = any telegram Message."""
-    sm = await message.reply_text(
-        f"⚡ Generating chart for *{ticker}/USDT* (`{timeframe}`)...", parse_mode=ParseMode.MARKDOWN
-    )
+async def _make_chart(ticker: str, timeframe: str):
+    """Returns (png_bytes, source). Raises on failure."""
     loop = asyncio.get_running_loop()
+    rows, source = await loop.run_in_executor(None, lambda: _fetch_ohlcv_sync(ticker, timeframe, 60))
+    if not rows:
+        raise ValueError(f"No candle data for {ticker}/USDT")
+    png = await loop.run_in_executor(None, lambda: _render_chart_sync(rows, ticker, timeframe))
+    return png, source
+
+
+def _chart_keyboard(ticker: str, timeframe: str):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh", callback_data=f"chart_{ticker}_{timeframe}")]])
+
+
+def _chart_caption(ticker: str, timeframe: str, source: str) -> str:
+    return (f"⚡ *{ticker}/USDT* · `{timeframe}`\n"
+            f"📡 {source}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{BRAND}")
+
+
+async def _send_chart(message, ticker: str, timeframe: str, quiet: bool = False):
+    """Used by /chart, plain-text 'chart btc 1h' and nothing else. quiet=True -> no status/error messages."""
+    sm = None
+    if not quiet:
+        sm = await message.reply_text(
+            f"⚡ Generating chart for *{ticker}/USDT* (`{timeframe}`)...", parse_mode=ParseMode.MARKDOWN
+        )
     try:
-        rows, source = await loop.run_in_executor(None, lambda: _fetch_ohlcv_sync(ticker, timeframe))
-        if not rows:
-            raise ValueError(f"No candle data for {ticker}/USDT")
-
-        png = await loop.run_in_executor(None, lambda: _render_chart_sync(rows, ticker, timeframe))
-        bio = io.BytesIO(png)
-        bio.name = f"{ticker}_{timeframe}.png"
-
-        try:
-            await sm.delete()
-        except Exception:
-            pass
-
-        keyboard = [
-            [
-                InlineKeyboardButton("📊 Indicators (RSI/MA)", callback_data=f"ind_{ticker}_{timeframe}"),
-                InlineKeyboardButton("🗺 Volume Footprint", callback_data=f"fp_{ticker}"),
-            ],
-            [
-                InlineKeyboardButton("📚 Orderbook Depth", callback_data=f"ob_{ticker}"),
-                InlineKeyboardButton("🔄 Refresh Chart", callback_data=f"chart_{ticker}_{timeframe}"),
-            ],
-        ]
-        caption = (f"⚡ *Live Chart* : `{ticker}/USDT`\n"
-                   f"⏱ Timeframe: `{timeframe}`\n"
-                   f"━━━━━━━━━━━━━━━━━━━━\n"
-                   f"🐾 _via Beluga Quant Engine · {source}_")
-        await message.reply_photo(photo=bio, caption=caption, parse_mode=ParseMode.MARKDOWN,
-                                  reply_markup=InlineKeyboardMarkup(keyboard))
+        png, source = await _make_chart(ticker, timeframe)
+        if sm:
+            try:
+                await sm.delete()
+            except Exception:
+                pass
+        await message.reply_photo(photo=_png_file(png, f"{ticker}_{timeframe}.png"),
+                                  caption=_chart_caption(ticker, timeframe, source),
+                                  parse_mode=ParseMode.MARKDOWN,
+                                  reply_markup=_chart_keyboard(ticker, timeframe))
     except BaseException as e:  # RecursionError included
-        tail = " || ".join(traceback.format_exc().splitlines()[-10:])
-        logger.error(f"[crypto_chart] {ticker} {timeframe}: {type(e).__name__}: {str(e)[:100]} | TB: {tail}")
+        _log_exc(f"[crypto_chart] {ticker} {timeframe}:", e)
         bot_status["error_count"] += 1
-        try:
-            await sm.edit_text(f"❌ Chart error for {ticker}/USDT: {type(e).__name__}: {str(e)[:150]}")
-        except Exception:
-            pass
+        if sm:
+            try:
+                await sm.edit_text(f"❌ Chart error for {ticker}/USDT: {type(e).__name__}: {str(e)[:150]}")
+            except Exception:
+                pass
         if isinstance(e, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
             raise
 
 
 async def crypto_chart_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Handles /chart command with timeframes: 5m, 15m, 1h, 4h, 1d/1D, 1M."""
+    """/chart <coin> <tf>  e.g. /chart btc 1h  (tf: 5m, 15m, 1h, 4h, 1d, 1M)"""
     if not u.message:
         return
     try:
         parts = (u.message.text or "").split()
-        ticker = _clean_ticker(parts[1]) if len(parts) >= 2 else "BTC"
-        timeframe = "1h"
-        for part in parts[2:]:
-            if part in _TF_MAPPING:
-                timeframe = _TF_MAPPING[part]
-                break
-            if part.lower() in _TF_MAPPING:
-                timeframe = _TF_MAPPING[part.lower()]
-                break
-
+        ticker, timeframe = _parse_ticker_tf(parts[1:], "1h")
         await safe_react(c.bot, u.effective_chat.id, u.message.message_id, "⚡")
         await _send_chart(u.message, ticker, timeframe)
     except Exception as e:
         logger.error(f"[crypto_chart] {e}")
 
 
-# --- ORDERBOOK & FOOTPRINT HELPER FUNCTIONS ---
+async def crypto_chart_text_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Plain text 'chart btc 1h' (no slash). Silent on failure so normal chat never gets error spam."""
+    if not u.message or not u.message.text:
+        return
+    try:
+        parts = u.message.text.split()
+        ticker, timeframe = _parse_ticker_tf(parts[1:], "1h")
+        await _send_chart(u.message, ticker, timeframe, quiet=True)
+    except Exception as e:
+        logger.error(f"[crypto_chart_text] {e}")
+
+
+# =====================================================================
+# /vp  — VOLUME PROFILE (Binance klines, buy/sell split via taker volume)
+# Big coins are pre-built in the background so replies are instant.
+# =====================================================================
+_VP_LOOKBACK = 300                  # candles used for the profile
+_VP_BINS = 70                       # price buckets
+_VP_VALUE_AREA = 0.70
+_VP_COINS = ["BTC", "ETH", "SOL", "XAU"]
+_VP_TFS = ["15m", "1h", "4h", "1d"]
+_VP_REFRESH = 300                   # background rebuild every 5 min
+_VP_TTL = 600                       # cached image considered fresh for 10 min
+_VP_MAX_CACHE = 60
+
+_vp_cache = {}                      # (ticker, tf) -> entry dict
+_vp_locks = {}
+_warm_task = None
+_WARM_KEYS = {(c, t) for c in _VP_COINS for t in _VP_TFS}
+
+
+def _compute_vp(rows, bins: int = _VP_BINS):
+    lo = min(r[3] for r in rows)
+    hi = max(r[2] for r in rows)
+    if hi <= lo:
+        hi = lo * 1.0001 + 1e-12
+    step = (hi - lo) / bins
+    buy = [0.0] * bins
+    sell = [0.0] * bins
+
+    for r in rows:
+        o, h, l, c, v = r[1], r[2], r[3], r[4], r[5]
+        tb = r[6] if len(r) > 6 and r[6] is not None else (v if c >= o else 0.0)
+        tb = min(max(tb, 0.0), v)
+        sv = v - tb
+        i0 = min(bins - 1, max(0, int((l - lo) / step)))
+        i1 = min(bins - 1, max(0, int((h - lo) / step)))
+        n = i1 - i0 + 1
+        for i in range(i0, i1 + 1):
+            buy[i] += tb / n
+            sell[i] += sv / n
+
+    tot = [b + s for b, s in zip(buy, sell)]
+    poc = max(range(bins), key=lambda i: tot[i])
+    target = sum(tot) * _VP_VALUE_AREA
+    acc, a, b = tot[poc], poc, poc
+    while acc < target and (a > 0 or b < bins - 1):
+        up = tot[b + 1] if b < bins - 1 else -1
+        dn = tot[a - 1] if a > 0 else -1
+        if up >= dn:
+            b += 1
+            acc += tot[b]
+        else:
+            a -= 1
+            acc += tot[a]
+
+    return {
+        "lo": lo, "hi": hi, "step": step, "bins": bins,
+        "buy": buy, "sell": sell, "tot": tot,
+        "poc": poc, "va_lo": a, "va_hi": b,
+        "poc_price": lo + (poc + 0.5) * step,
+        "vah": lo + (b + 1) * step,
+        "val": lo + a * step,
+    }
+
+
+def _render_vp_sync(rows, vp, ticker: str, timeframe: str) -> bytes:
+    from PIL import Image, ImageDraw
+
+    rows = sorted(rows, key=lambda r: r[0])
+    n = len(rows)
+
+    W, H = 1300, 800
+    L, cand_r = 20, 800
+    prof_l, prof_r = 815, 1130
+    TOP, BOT = 100, 700
+
+    img = Image.new("RGB", (W, H), _BG)
+    d = ImageDraw.Draw(img)
+    f_sm, f_title = _font(15), _font(26)
+
+    data_hi = max(r[2] for r in rows)
+    data_lo = min(r[3] for r in rows)
+    pad = (data_hi - data_lo) * 0.03 or data_hi * 0.001
+    hi_ax, lo_ax = data_hi + pad, data_lo - pad
+
+    def py(p):
+        return TOP + (hi_ax - p) / (hi_ax - lo_ax) * (BOT - TOP)
+
+    def text_w(s, f):
+        return d.textlength(s, font=f)
+
+    last = rows[-1][4]
+    tags = [
+        (vp["poc_price"], "POC", _GOLD),
+        (vp["vah"], "VAH", _BLUE),
+        (vp["val"], "VAL", _BLUE),
+        (last, "LAST", _UP if rows[-1][4] >= rows[-1][1] else _DOWN),
+    ]
+    tag_ys = [py(p) for p, _, _ in tags]
+
+    # grid + price labels (skip labels that would collide with a tag)
+    for i in range(6):
+        p = lo_ax + (hi_ax - lo_ax) * i / 5
+        y = py(p)
+        d.line([(L, y), (prof_r, y)], fill=_GRID, width=1)
+        if all(abs(y - ty) > 24 for ty in tag_ys):
+            d.text((prof_r + 8, y - 8), _fmt_price(p), fill=_TXT, font=f_sm)
+
+    # candles
+    cw = (cand_r - L) / n
+    body_half = max(0.5, cw * 0.35)
+    for i, (_, o, h, l, c, v, *_rest) in enumerate(rows):
+        x = L + (i + 0.5) * cw
+        col = _UP if c >= o else _DOWN
+        d.line([(x, py(h)), (x, py(l))], fill=col, width=1)
+        y1, y2 = py(max(o, c)), py(min(o, c))
+        if y2 - y1 < 1:
+            y2 = y1 + 1
+        d.rectangle([x - body_half, y1, x + body_half, y2], fill=col)
+
+    # profile histogram (buy green + sell red; dimmed outside value area)
+    max_tot = max(vp["tot"]) or 1.0
+    pw = prof_r - prof_l
+    for i in range(vp["bins"]):
+        y_top = py(vp["lo"] + (i + 1) * vp["step"])
+        y_bot = py(vp["lo"] + i * vp["step"])
+        y1, y2 = y_top + 0.5, y_bot - 0.5
+        if y2 - y1 < 1:
+            y2 = y1 + 1
+        wb = vp["buy"][i] / max_tot * pw
+        ws = vp["sell"][i] / max_tot * pw
+        in_va = vp["va_lo"] <= i <= vp["va_hi"]
+        cb = _UP if in_va else tuple(int(x * 0.45) for x in _UP)
+        cs = _DOWN if in_va else tuple(int(x * 0.45) for x in _DOWN)
+        if wb >= 0.5:
+            d.rectangle([prof_l, y1, prof_l + wb, y2], fill=cb)
+        if ws >= 0.5:
+            d.rectangle([prof_l + wb, y1, prof_l + wb + ws, y2], fill=cs)
+        if i == vp["poc"]:
+            d.rectangle([prof_l, y1, prof_l + wb + ws, y2], outline=_GOLD, width=2)
+
+    # POC / VAH / VAL lines across candles + profile
+    d.line([(L, py(vp["poc_price"])), (prof_r, py(vp["poc_price"]))], fill=_GOLD, width=2)
+    _dashed(d, L, prof_r, py(vp["vah"]), _BLUE)
+    _dashed(d, L, prof_r, py(vp["val"]), _BLUE)
+
+    # price tags on the right
+    for p, label, col in tags:
+        y = py(p)
+        s = f"{label} {_fmt_price(p)}"
+        d.rectangle([prof_r + 4, y - 11, prof_r + 4 + text_w(s, f_sm) + 12, y + 11], fill=col)
+        d.text((prof_r + 10, y - 8), s, fill=(0, 0, 0), font=f_sm)
+
+    # x labels (candle area) + panel label
+    fmt = "%d %b" if timeframe in ("1d", "1M") else "%d %b %H:%M"
+    step = max(1, n // 6)
+    for i in range(0, n, step):
+        x = L + (i + 0.5) * cw
+        lbl = datetime.fromtimestamp(rows[i][0] / 1000, tz=timezone.utc).strftime(fmt)
+        d.text((max(4, x - text_w(lbl, f_sm) / 2), BOT + 10), lbl, fill=_TXT, font=f_sm)
+    d.text((prof_l, BOT + 10), "Volume Profile", fill=_TXT, font=f_sm)
+
+    # title + legend
+    d.text((L, 20), f"{ticker}/USDT  ·  Volume Profile  ·  {timeframe}", fill=(255, 255, 255), font=f_title)
+    d.text((L, 58), f"{n} candles  ·  Value Area {int(_VP_VALUE_AREA * 100)}%", fill=_TXT, font=f_sm)
+    lx = prof_l
+    d.rectangle([lx, 66, lx + 12, 78], fill=_UP)
+    d.text((lx + 18, 63), "Buy", fill=_TXT, font=f_sm)
+    d.rectangle([lx + 70, 66, lx + 82, 78], fill=_DOWN)
+    d.text((lx + 88, 63), "Sell", fill=_TXT, font=f_sm)
+
+    d.text((L, H - 34), "powered by - BELUGA.PY", fill=(150, 150, 150), font=f_sm)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _build_vp_sync(ticker: str, timeframe: str):
+    rows, source = _fetch_ohlcv_sync(ticker, timeframe, _VP_LOOKBACK)
+    if not rows or len(rows) < 20:
+        return None
+    vp = _compute_vp(rows)
+    png = _render_vp_sync(rows, vp, ticker, timeframe)
+    return {
+        "png": png, "ts": time.time(), "source": source,
+        "ticker": ticker, "tf": timeframe, "n": len(rows),
+        "poc": vp["poc_price"], "vah": vp["vah"], "val": vp["val"],
+    }
+
+
+def _vp_evict():
+    if len(_vp_cache) <= _VP_MAX_CACHE:
+        return
+    victims = sorted((k for k in _vp_cache if k not in _WARM_KEYS), key=lambda k: _vp_cache[k]["ts"])
+    for k in victims:
+        if len(_vp_cache) <= _VP_MAX_CACHE:
+            break
+        _vp_cache.pop(k, None)
+
+
+def _vp_fresh(key) -> bool:
+    e = _vp_cache.get(key)
+    return bool(e) and (time.time() - e["ts"]) < _VP_TTL
+
+
+async def _get_vp(ticker: str, timeframe: str, force: bool = False):
+    """Returns the cached profile if fresh, else builds it. May return a stale entry if the rebuild fails."""
+    key = (ticker, timeframe)
+    if not force and _vp_fresh(key):
+        return _vp_cache[key]
+    lock = _vp_locks.setdefault(key, asyncio.Lock())
+    async with lock:
+        if not force and _vp_fresh(key):
+            return _vp_cache[key]
+        loop = asyncio.get_running_loop()
+        new = await loop.run_in_executor(None, lambda: _build_vp_sync(ticker, timeframe))
+        if new:
+            _vp_cache[key] = new
+            _vp_evict()
+            return new
+        return _vp_cache.get(key)
+
+
+async def vp_warmup_loop():
+    """Keeps BTC/ETH/SOL/XAU volume profiles pre-built so /vp replies instantly."""
+    await asyncio.sleep(20)  # let the bot finish starting
+    while True:
+        for coin in _VP_COINS:
+            for tf in _VP_TFS:
+                try:
+                    await _get_vp(coin, tf, force=True)
+                except Exception as e:
+                    logger.warning(f"[vp_warmup] {coin} {tf}: {str(e)[:80]}")
+                await asyncio.sleep(1.5)
+        logger.info(f"[vp_warmup] cycle done ({len(_vp_cache)} cached)")
+        await asyncio.sleep(_VP_REFRESH)
+
+
+def start_vp_warmup():
+    """Call once from inside the running event loop (e.g. right after `await init_exchange_async()`)."""
+    global _warm_task
+    if _warm_task is None or _warm_task.done():
+        _warm_task = asyncio.create_task(vp_warmup_loop())
+        logger.info("[vp_warmup] background task started")
+
+
+def _vp_caption(e) -> str:
+    upd = datetime.fromtimestamp(e["ts"], tz=timezone.utc).strftime("%H:%M")
+    return (f"📊 *Volume Profile* · `{e['ticker']}/USDT` · `{e['tf']}`\n"
+            f"🟡 POC: `{_fmt_price(e['poc'])}`\n"
+            f"🔵 VAH: `{_fmt_price(e['vah'])}`  |  VAL: `{_fmt_price(e['val'])}`\n"
+            f"🕒 {e['n']} candles · {e['source']} · {upd} UTC\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{BRAND}")
+
+
+async def crypto_vp_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """/vp <coin> <tf>  e.g. /vp btc 1h, /vp eth 4h"""
+    if not u.message:
+        return
+    sm = None
+    try:
+        parts = (u.message.text or "").split()
+        ticker, timeframe = _parse_ticker_tf(parts[1:], "1h")
+        await safe_react(c.bot, u.effective_chat.id, u.message.message_id, "⚡")
+
+        if not _vp_fresh((ticker, timeframe)):
+            sm = await u.message.reply_text(
+                f"⏳ Building volume profile for *{ticker}/USDT* (`{timeframe}`)...", parse_mode=ParseMode.MARKDOWN
+            )
+
+        entry = await asyncio.wait_for(_get_vp(ticker, timeframe), timeout=60)
+        if not entry:
+            raise ValueError(f"No Binance data for {ticker}/USDT")
+
+        await u.message.reply_photo(photo=_png_file(entry["png"], f"VP_{ticker}_{timeframe}.png"),
+                                    caption=_vp_caption(entry), parse_mode=ParseMode.MARKDOWN)
+        if sm:
+            try:
+                await sm.delete()
+            except Exception:
+                pass
+    except BaseException as e:
+        _log_exc("[crypto_vp]", e)
+        bot_status["error_count"] += 1
+        if sm:
+            try:
+                await sm.edit_text(f"❌ Volume profile error: {type(e).__name__}: {str(e)[:150]}")
+            except Exception:
+                pass
+        if isinstance(e, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+            raise
+
+
+# =====================================================================
+# Callbacks. New charts only have the Refresh button; ob_/fp_/ind_ branches
+# stay so buttons on OLD chart messages don't break.
+# =====================================================================
 def _fetch_orderbook_sync(ticker: str):
     for host in _BINANCE_HOSTS:
         try:
@@ -508,7 +891,7 @@ async def fetch_orderbook_data(ticker: str):
         for price, amt in bids[:5]:
             text += f"`{_fmt_price(price)}  |  {amt:,.4f}`\n"
 
-        text += f"\n━━━━━━━━━━━━━━━━━━━━\n🐾 _{source} Orderbook Feed_"
+        text += f"\n━━━━━━━━━━━━━━━━━━━━\n{BRAND}"
         return text
     except Exception as e:
         return f"❌ Could not fetch orderbook for {ticker}: {str(e)[:150]}"
@@ -546,14 +929,13 @@ async def fetch_footprint_summary(ticker: str):
                 f"🔴 *Aggressive Sell Vol*: `{sell_vol:,.2f}`\n"
                 f"⚖️ *Delta*: `{delta_sign}{delta:,.2f}`\n"
                 f"📊 *Total Traded*: `{total_vol:,.2f} {ticker}`\n\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n🐾 _Derived from Binance AggTrades_")
+                f"━━━━━━━━━━━━━━━━━━━━\n{BRAND}")
         return text
     except Exception as e:
         return f"❌ Error computing footprint: {str(e)[:150]}"
 
 
 async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles clicks on Inline Keyboard buttons for Orderbook, Footprint, Indicators, and Chart Refresh."""
     query = update.callback_query
     if not query or not query.message:
         return
@@ -561,7 +943,27 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
     data = query.data or ""
 
     try:
-        if data.startswith("ob_"):
+        if data.startswith("chart_"):
+            # Refresh: edit the same photo in place; fall back to a new photo if Telegram refuses
+            _, ticker, tf = data.split("_", 2)
+            ticker = _clean_ticker(ticker)
+            tf = tf if tf in _TF_MAPPING.values() else "1h"
+            png, source = await _make_chart(ticker, tf)
+            caption = _chart_caption(ticker, tf, source)
+            try:
+                await query.message.edit_media(
+                    media=InputMediaPhoto(media=_png_file(png, f"{ticker}_{tf}.png"),
+                                          caption=caption, parse_mode=ParseMode.MARKDOWN),
+                    reply_markup=_chart_keyboard(ticker, tf),
+                )
+            except Exception as e:
+                if "not modified" in str(e).lower():
+                    return
+                await query.message.reply_photo(photo=_png_file(png, f"{ticker}_{tf}.png"),
+                                                caption=caption, parse_mode=ParseMode.MARKDOWN,
+                                                reply_markup=_chart_keyboard(ticker, tf))
+
+        elif data.startswith("ob_"):
             ticker = _clean_ticker(data.split("_", 1)[1])
             await query.message.reply_text(await fetch_orderbook_data(ticker), parse_mode=ParseMode.MARKDOWN)
 
@@ -576,9 +978,7 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
                 f"• Moving Averages (EMA/SMA)\n• Bollinger Bands\n\n"
                 f"*(Custom indicator toggles enabled via Beluga Engine)*",
                 parse_mode=ParseMode.MARKDOWN)
-
-        elif data.startswith("chart_"):
-            _, ticker, tf = data.split("_", 2)
-            await _send_chart(query.message, _clean_ticker(ticker), tf if tf in _TF_MAPPING.values() else "1h")
-    except Exception as e:
-        logger.error(f"[button_callback] {e}")
+    except BaseException as e:
+        _log_exc("[button_callback]", e)
+        if isinstance(e, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+            raise
