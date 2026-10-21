@@ -64,8 +64,10 @@ from handlers.crypto import (
     button_callback_handler,
     crypto_chart_handler,
     crypto_chart_text_handler,
+    crypto_lh_handler,
     crypto_movers_handler,
     crypto_price_handler,
+    crypto_vf_handler,
     crypto_vp_handler,
     init_exchange_async,
     start_vp_warmup,
@@ -176,6 +178,8 @@ async def main():
     app.add_handler(CommandHandler(["topgainers", "toplosers"], crypto_movers_handler))
     app.add_handler(CommandHandler(["chart", "chart5m", "chart15m", "chart1h", "chart4h", "chart1d"], crypto_chart_handler))
     app.add_handler(CommandHandler("vp", crypto_vp_handler))
+    app.add_handler(CommandHandler("vf", crypto_vf_handler))
+    app.add_handler(CommandHandler("lh", crypto_lh_handler))
     # Plain-text "chart btc 1h" (no slash). Own group (-3) so media_reply_question_handler in
     # group 0 can't shadow it; the handler raises ApplicationHandlerStop so the AI chat
     # handlers don't also answer the same message.
@@ -285,7 +289,7 @@ async def main():
     cleanup_task = asyncio.create_task(cleanup_expired_games())
     sync_task = asyncio.create_task(periodic_sync())
     exchange_task = asyncio.create_task(init_exchange_async())
-    vp_task = start_vp_warmup()  # background volume-profile cache (BTC/ETH/SOL/XAU)
+    vp_task = start_vp_warmup()  # background volume-profile cache (BTC/ETH/SOL/XAU) + /lh collector
     revival_task = asyncio.create_task(revival_loop(app))
     cleanup_mongo_task = asyncio.create_task(mongo_cleanup_loop())
 
