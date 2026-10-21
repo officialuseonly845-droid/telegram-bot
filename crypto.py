@@ -9,25 +9,14 @@ import ccxt
 import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.constants import ParseMode
-from telegram.ext import ContextTypes
+from telegram.ext import ApplicationHandlerStop, ContextTypes
 
 import texts as T
 from config import logger
 from state import bot_status, cache_movers
 from utils import safe_react
 
-# =====================================================================
-# REGISTRATION (bot.py) — add these:
-#
-#   from telegram.ext import CommandHandler, MessageHandler, CallbackQueryHandler, filters
-#   app.add_handler(CommandHandler("chart", crypto_chart_handler))
-#   app.add_handler(CommandHandler("vp", crypto_vp_handler))
-#   app.add_handler(MessageHandler(filters.Regex(CHART_TEXT_REGEX) & ~filters.COMMAND, crypto_chart_text_handler))
-#   (button_callback_handler stays registered as before)
-#
-#   # right after `await init_exchange_async()`:
-#   start_vp_warmup()
-# =====================================================================
+# Wired in bot.py: /chart*, /vp, text trigger (CHART_TEXT_REGEX), button_callback_handler, start_vp_warmup()
 
 BRAND = "powered by - BELUGA.PY 🍂"
 
@@ -541,7 +530,9 @@ async def crypto_chart_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return
     try:
         parts = (u.message.text or "").split()
-        ticker, timeframe = _parse_ticker_tf(parts[1:], "1h")
+        cmd = parts[0].lstrip("/").split("@")[0].lower() if parts else "chart"
+        default_tf = _tf_of(cmd[5:]) if len(cmd) > 5 else None   # /chart5m, /chart1h, /chart4h ...
+        ticker, timeframe = _parse_ticker_tf(parts[1:], default_tf or "1h")
         await safe_react(c.bot, u.effective_chat.id, u.message.message_id, "⚡")
         await _send_chart(u.message, ticker, timeframe)
     except Exception as e:
@@ -558,6 +549,7 @@ async def crypto_chart_text_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await _send_chart(u.message, ticker, timeframe, quiet=True)
     except Exception as e:
         logger.error(f"[crypto_chart_text] {e}")
+    raise ApplicationHandlerStop  # message handled -> don't let chat/AI handlers answer it too
 
 
 # =====================================================================
@@ -804,6 +796,7 @@ def start_vp_warmup():
     if _warm_task is None or _warm_task.done():
         _warm_task = asyncio.create_task(vp_warmup_loop())
         logger.info("[vp_warmup] background task started")
+    return _warm_task
 
 
 def _vp_caption(e) -> str:
