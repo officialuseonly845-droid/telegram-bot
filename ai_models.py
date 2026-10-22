@@ -1,5 +1,6 @@
-"""AI providers (Groq, OpenRouter, NVIDIA, Cloudflare), rate-limit/fallback logic, and the ai() entry point."""
+"""AI providers (Cohere, Cloudflare, Groq, OpenRouter, NVIDIA), rate-limit/fallback logic, and the ai() entry point."""
 import asyncio
+import os
 import re
 import time
 import aiohttp
@@ -22,18 +23,46 @@ OR_MODEL = "google/gemma-4-26b-a4b-it:free"
 OR_BASE = "https://openrouter.ai/api/v1"
 NVIDIA_MODEL = "meta/muse-glimmer-30b"
 NVIDIA_BASE = "https://integrate.api.nvidia.com/v1"
-CF_MODEL = "@cf/meta-llama/llama-2-7b-chat-hf-lora"
 
 
-# Default mode is "auto" (was locked to "nvi"): muse-glimmer fails
-# intermittently (see _call_nvidia notes below), and "nvi" locked mode only
-# retries NVIDIA itself, so a bad stretch reached the user as the fallback
-# "Meow!" reply. "auto" tries Groq → OpenRouter → NVIDIA → Cloudflare, so one
-# provider having a rough moment no longer means a failed reply. Switch to
-# any single provider anytime with /model (owner-only).
+def _env(*names: str) -> str:
+    """First non-empty environment variable among `names` (whitespace / stray quotes stripped)."""
+    for n in names:
+        v = os.environ.get(n, "").strip().strip("\"'").strip()
+        if v:
+            return v
+    return ""
+
+
+# ── Cloudflare Workers AI ────────────────────────────────────────────────────
+# Needs an Account ID + an API token. Any of these env names work:
+#   token:      CLOUDFLARE_API_TOKEN | CLOUDFLARE_AUTH_TOKEN | CLOUDFLARE_API_KEY | CF_API_TOKEN
+#   account id: CLOUDFLARE_ACCOUNT_ID | CF_ACCOUNT_ID | CLOUDFLARE_ACCOUNT
+_CF_TOKEN = CLOUDFLARE_API_TOKEN or _env("CLOUDFLARE_AUTH_TOKEN", "CLOUDFLARE_API_KEY", "CF_API_TOKEN")
+_CF_ACCOUNT = CLOUDFLARE_ACCOUNT_ID or _env("CF_ACCOUNT_ID", "CLOUDFLARE_ACCOUNT")
+CF_MODEL = _env("CLOUDFLARE_MODEL") or "@cf/meta/llama-3.2-3b-instruct"
+
+# ── Cohere ───────────────────────────────────────────────────────────────────
+# Env: COHERE_API_KEY (or CO_API_KEY). Model can be changed with COHERE_MODEL.
+COHERE_KEY = _env("COHERE_API_KEY", "CO_API_KEY", "COHERE_KEY")
+COHERE_MODEL = _env("COHERE_MODEL") or "command-a-plus-05-2026"
+COHERE_URL = "https://api.cohere.com/v2/chat"
+
+# Order "auto" mode tries providers in. Providers whose key isn't set are skipped
+# automatically, so you can just set the keys you have. Reorder freely:
+#   "co" = Cohere, "cf" = Cloudflare, "groq", "or" = OpenRouter, "nvi" = NVIDIA
+AUTO_ORDER = ["co", "cf", "groq", "or", "nvi"]
+# The tiny emoji-reaction pick runs on almost every message, so it prefers the fast/cheap providers.
+EMOJI_ORDER = ["groq", "cf", "co"]
+
+
+# Default mode is "auto": tries Cohere -> Cloudflare -> Groq -> OpenRouter -> NVIDIA (see AUTO_ORDER),
+# skipping any provider whose API key isn't set, and does a second full pass before giving up, so one
+# provider having a rough moment doesn't reach the user as the fallback "Meow!" reply.
+# Switch to a single provider anytime with /model (owner-only).
 ai_model_state = {
     "mode": "auto",
-    "groq_rl_until": 0.0, "or_rl_until": 0.0, "nvi_rl_until": 0.0, "cf_rl_until": 0.0,
+    "groq_rl_until": 0.0, "or_rl_until": 0.0, "nvi_rl_until": 0.0, "cf_rl_until": 0.0, "co_rl_until": 0.0,
 }
 
 
@@ -51,6 +80,10 @@ def _nvi_rate_limited() -> bool:
 
 def _cf_rate_limited() -> bool:
     return time.time() < ai_model_state["cf_rl_until"]
+
+
+def _co_rate_limited() -> bool:
+    return time.time() < ai_model_state["co_rl_until"]
 
 
 def _set_groq_rl():
@@ -71,6 +104,11 @@ def _set_nvi_rl():
 def _set_cf_rl():
     ai_model_state["cf_rl_until"] = time.time() + 20
     logger.warning("[AI] Cloudflare rate-limited — backing off 20s")
+
+
+def _set_co_rl():
+    ai_model_state["co_rl_until"] = time.time() + 20
+    logger.warning("[AI] Cohere rate-limited — backing off 20s")
 
 
 async def _call_groq(system: str, user: str, max_tok: int) -> Optional[str]:
@@ -257,16 +295,29 @@ async def _call_nvidia(system: str, user: str, max_tok: int) -> Optional[str]:
     return None
 
 
+def _cf_extract(data: dict) -> str:
+    """Pulls the reply text out of a Workers AI response. Classic models answer with
+    result.response; newer OpenAI-style models answer with result.choices[0].message.content."""
+    res = data.get("result") or {}
+    txt = res.get("response")
+    if isinstance(txt, str) and txt.strip():
+        return txt.strip()
+    choices = res.get("choices") or []
+    if choices:
+        content = (choices[0].get("message") or {}).get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+    return ""
+
+
 async def _call_cloudflare(system: str, user: str, max_tok: int) -> Optional[str]:
     """
-    Calls Cloudflare Workers AI (api.cloudflare.com) with the
-    @cf/meta-llama/llama-2-7b-chat-hf-lora model. Same aiohttp-POST pattern
-    as the other providers, needs two env vars instead of one:
-    CLOUDFLARE_API_TOKEN (Bearer auth) and CLOUDFLARE_ACCOUNT_ID (the
-    account the model run is scoped under, part of the URL path).
+    Calls Cloudflare Workers AI: POST /accounts/{account_id}/ai/run/{model} with a Bearer token.
+    Env: account id (CLOUDFLARE_ACCOUNT_ID) + API token (CLOUDFLARE_API_TOKEN), see the aliases at the top.
+    Model: CF_MODEL (default @cf/meta/llama-3.2-3b-instruct, override with CLOUDFLARE_MODEL).
     """
-    if not CLOUDFLARE_API_TOKEN or not CLOUDFLARE_ACCOUNT_ID:
-        logger.warning("[AI] CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID not set")
+    if not _CF_TOKEN or not _CF_ACCOUNT:
+        logger.warning("[AI] Cloudflare token / account id not set (CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID)")
         return None
     bot_status["api_calls"] += 1
     try:
@@ -279,8 +330,8 @@ async def _call_cloudflare(system: str, user: str, max_tok: int) -> Optional[str
                 "max_tokens": max(max_tok, 60),
             }
             async with session.post(
-                f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/{CF_MODEL}",
-                headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}", "Content-Type": "application/json"},
+                f"https://api.cloudflare.com/client/v4/accounts/{_CF_ACCOUNT}/ai/run/{CF_MODEL}",
+                headers={"Authorization": f"Bearer {_CF_TOKEN}", "Content-Type": "application/json"},
                 json=payload,
                 timeout=aiohttp.ClientTimeout(total=16)
             ) as r:
@@ -290,7 +341,9 @@ async def _call_cloudflare(system: str, user: str, max_tok: int) -> Optional[str
                         logger.error(f"[AI] Cloudflare error payload: {str(data.get('errors'))[:200]}")
                         bot_status["failed_apis"] += 1
                         return None
-                    content = ((data.get("result") or {}).get("response") or "").strip()
+                    content = _cf_extract(data)
+                    if not content:
+                        logger.warning(f"[AI] Cloudflare: empty reply, raw={str(data)[:200]}")
                     return content or None
                 elif r.status == 429:
                     _set_cf_rl()
@@ -298,16 +351,17 @@ async def _call_cloudflare(system: str, user: str, max_tok: int) -> Optional[str
                 elif r.status == 401:
                     logger.error(
                         "[AI] Cloudflare 401 Authentication error — this is Cloudflare rejecting "
-                        "CLOUDFLARE_API_TOKEN/CLOUDFLARE_ACCOUNT_ID, not a bot bug. Check: (1) it's a "
-                        "scoped API Token (My Profile > API Tokens), not the legacy Global API Key; "
-                        "(2) the token has Account > Workers AI > Edit permission; (3) CLOUDFLARE_ACCOUNT_ID "
-                        "matches the account the token was created under."
+                        "the API token / account id, not a bot bug. Check: (1) it's a scoped API Token "
+                        "(My Profile > API Tokens), not the legacy Global API Key; (2) the token has "
+                        "Account > Workers AI > Read/Edit permission; (3) the account id matches the "
+                        "account the token was created under."
                     )
                     bot_status["failed_apis"] += 1
                     return None
                 else:
                     body = await r.text()
-                    logger.error(f"[AI] Cloudflare error {r.status}: {body[:300]}")
+                    hint = " (model name not found — check CLOUDFLARE_MODEL)" if ("5007" in body or "No such model" in body) else ""
+                    logger.error(f"[AI] Cloudflare error {r.status}{hint}: {body[:300]}")
                     bot_status["failed_apis"] += 1
     except Exception as e:
         logger.error(f"[AI] Cloudflare exception: {e}")
@@ -315,49 +369,140 @@ async def _call_cloudflare(system: str, user: str, max_tok: int) -> Optional[str
     return None
 
 
+def _cohere_extract(data: dict) -> str:
+    """Cohere v2 returns message.content as a list of blocks; keep only the visible text
+    blocks (reasoning models may also return 'thinking' blocks, which must not be shown)."""
+    content = (data.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return content.strip()
+    parts = []
+    for blk in content or []:
+        if isinstance(blk, dict) and blk.get("type", "text") == "text" and isinstance(blk.get("text"), str):
+            parts.append(blk["text"])
+    return "\n".join(parts).strip()
+
+
+async def _call_cohere(system: str, user: str, max_tok: int) -> Optional[str]:
+    """
+    Calls Cohere's v2 chat API (https://api.cohere.com/v2/chat) with COHERE_MODEL
+    (default command-a-plus-05-2026). Env: COHERE_API_KEY.
+    """
+    if not COHERE_KEY:
+        logger.warning("[AI] COHERE_API_KEY not set")
+        return None
+    bot_status["api_calls"] += 1
+    # Floor of 256: if the model spends part of its budget on internal reasoning before the visible
+    # answer, a tiny max_tokens could otherwise leave the reply empty. Replies stay short because
+    # the prompts ask for short replies; the floor only prevents truncation.
+    payload = {
+        "model": COHERE_MODEL,
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        "max_tokens": max(max_tok, 256),
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                COHERE_URL,
+                headers={"Authorization": f"Bearer {COHERE_KEY}", "Content-Type": "application/json",
+                         "Accept": "application/json", "X-Client-Name": "beluga-bot"},
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=20)
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    content = _cohere_extract(data)
+                    if not content and data.get("finish_reason") == "MAX_TOKENS":
+                        logger.warning("[AI] Cohere: response truncated by max_tokens")
+                    elif not content:
+                        logger.warning(f"[AI] Cohere: empty reply, raw={str(data)[:200]}")
+                    return content or None
+                elif r.status == 429:
+                    _set_co_rl()
+                    return None
+                elif r.status in (401, 403):
+                    logger.error("[AI] Cohere auth error — check COHERE_API_KEY (use a Trial/Production key from dashboard.cohere.com).")
+                    bot_status["failed_apis"] += 1
+                    return None
+                else:
+                    body = await r.text()
+                    hint = f" (model '{COHERE_MODEL}' rejected — check COHERE_MODEL)" if r.status in (400, 404) else ""
+                    logger.error(f"[AI] Cohere error {r.status}{hint}: {body[:300]}")
+                    bot_status["failed_apis"] += 1
+    except Exception as e:
+        logger.error(f"[AI] Cohere exception: {e}")
+        bot_status["failed_apis"] += 1
+    return None
+
+
+def _ready(provider: str) -> bool:
+    """True if the provider has the credentials it needs."""
+    return {
+        "co": bool(COHERE_KEY),
+        "cf": bool(_CF_TOKEN and _CF_ACCOUNT),
+        "groq": bool(GROQ_KEY),
+        "or": bool(OPENROUTER_KEY),
+        "nvi": bool(NVIDIA_KEY),
+    }.get(provider, False)
+
+
+_PROVIDER_NAMES = {"co": "Cohere", "cf": "Cloudflare", "groq": "Groq", "or": "OpenRouter", "nvi": "NVIDIA"}
+logger.info("[AI] Providers in auto order: " + (" → ".join(_PROVIDER_NAMES[p] for p in AUTO_ORDER if _ready(p))
+                                                  or "NONE configured (set COHERE_API_KEY and/or Cloudflare keys)"))
+
+# /model (owner.py) mode name -> provider. "co" is Cohere.
+_LOCKED_MODES = {"gro": "groq", "rou": "or", "nvi": "nvi", "cf": "cf", "co": "co"}
+
+
+async def _dispatch(provider: str, system: str, user: str, max_tok: int) -> Optional[str]:
+    """One attempt on one provider, honouring its rate-limit back-off and timeout."""
+    if provider == "groq":
+        if _groq_rate_limited():
+            return None
+        return await asyncio.wait_for(_call_groq(system, user, max_tok), timeout=14)
+    if provider == "nvi":
+        if _nvi_rate_limited():
+            return None
+        # 34s, not 18s: _call_nvidia does its own inner retry (up to
+        # 2 attempts x 16s + a short backoff) to absorb the free
+        # endpoint's occasional blips before giving up. Cutting the
+        # outer timeout short would kill that retry mid-flight.
+        return await asyncio.wait_for(_call_nvidia(system, user, max_tok), timeout=34)
+    if provider == "cf":
+        if _cf_rate_limited():
+            return None
+        return await asyncio.wait_for(_call_cloudflare(system, user, max_tok), timeout=16)
+    if provider == "co":
+        if _co_rate_limited():
+            return None
+        return await asyncio.wait_for(_call_cohere(system, user, max_tok), timeout=22)
+    # OpenRouter
+    if _or_rate_limited():
+        return None
+    or_system = CHAT_PROMPT_OR if system.startswith(CHAT_PROMPT) else system
+    return await asyncio.wait_for(_call_openrouter(or_system, user, max_tok), timeout=16)
+
+
 async def ai(system: str, user: str, fallback: str = "Meow! 🐾", max_tok: int = 200) -> str:
     """
     Smart multi-provider AI call.
-    Mode 'gro' → Groq ONLY. Retries Groq itself up to 3x, never switches away.
-    Mode 'rou' → OpenRouter ONLY. Retries OR itself up to 3x, never switches away.
-    Mode 'nvi' → NVIDIA (meta/muse-glimmer-30b) ONLY. Retries NVIDIA itself up to 3x, never switches away.
-    Mode 'auto' → tries Groq, then OpenRouter, then NVIDIA, with a second full retry pass across all three.
-    If OpenRouter is active, uses CHAT_PROMPT_OR (Hinglish+English).
+    Locked modes ('gro', 'rou', 'nvi', 'cf', 'co') → that ONE provider only, retried up to 3x, never switches away.
+    Mode 'auto' → tries the providers in AUTO_ORDER (Cohere, Cloudflare, Groq, OpenRouter, NVIDIA) that have
+                  an API key set, then a second full pass before returning `fallback`.
     """
     mode = ai_model_state["mode"]
 
     async def _try(provider: str) -> Optional[str]:
         try:
-            if provider == "groq":
-                if _groq_rate_limited():
-                    return None
-                return await asyncio.wait_for(_call_groq(system, user, max_tok), timeout=14)
-            elif provider == "nvi":
-                if _nvi_rate_limited():
-                    return None
-                # 34s, not 18s: _call_nvidia does its own inner retry (up to
-                # 2 attempts x 16s + a short backoff) to absorb the free
-                # endpoint's occasional blips before giving up. Cutting the
-                # outer timeout short would kill that retry mid-flight.
-                return await asyncio.wait_for(_call_nvidia(system, user, max_tok), timeout=34)
-            elif provider == "cf":
-                if _cf_rate_limited():
-                    return None
-                return await asyncio.wait_for(_call_cloudflare(system, user, max_tok), timeout=16)
-            else:
-                if _or_rate_limited():
-                    return None
-                or_system = CHAT_PROMPT_OR if system.startswith(CHAT_PROMPT) else system
-                return await asyncio.wait_for(_call_openrouter(or_system, user, max_tok), timeout=16)
+            return await _dispatch(provider, system, user, max_tok)
         except asyncio.TimeoutError:
             logger.warning(f"[AI] {provider} timed out")
         except Exception as e:
             logger.warning(f"[AI] {provider} error: {e}")
         return None
 
-    if mode in ("gro", "rou", "nvi", "cf"):
+    if mode in _LOCKED_MODES:
         # Locked to one provider — retry only that provider, never cross over.
-        provider = {"gro": "groq", "rou": "or", "nvi": "nvi", "cf": "cf"}[mode]
+        provider = _LOCKED_MODES[mode]
         for attempt in range(3):
             res = await _try(provider)
             if res:
@@ -367,8 +512,8 @@ async def ai(system: str, user: str, fallback: str = "Meow! 🐾", max_tok: int 
         logger.error(f"[AI] {provider} failed 3x in locked mode — returning fallback")
         return fallback
 
-    # auto mode: try all providers, then a second full pass across all of them.
-    order = ["groq", "or", "nvi", "cf"]
+    # auto mode: try every configured provider, then a second full pass across all of them.
+    order = [p for p in AUTO_ORDER if _ready(p)] or list(AUTO_ORDER)
     for provider in order:
         res = await _try(provider)
         if res:
@@ -385,18 +530,18 @@ async def ai(system: str, user: str, fallback: str = "Meow! 🐾", max_tok: int 
 
 
 async def ai_emoji(text: str) -> str:
-    """Quick emoji pick — always uses Groq (lightweight, no Hinglish needed)."""
-    try:
-        res = await asyncio.wait_for(
-            _call_groq("Output ONE emoji matching emotion. ONLY the emoji, nothing else.", f"Text: '{text[:60]}'", 10),
-            timeout=6
-        )
+    """Quick emoji pick. Uses the first available provider in EMOJI_ORDER (fast/cheap ones first)."""
+    system = "Output ONE emoji matching emotion. ONLY the emoji, nothing else."
+    user = f"Text: '{text[:60]}'"
+    for provider in [p for p in EMOJI_ORDER if _ready(p)]:
+        try:
+            res = await asyncio.wait_for(_dispatch(provider, system, user, 10), timeout=8)
+        except Exception:
+            res = None
         if res:
             found = re.findall(r"[^\w\s,.:!?'\"\(\)\-]+", res)
             if found:
                 return found[0][0]
-    except Exception:
-        pass
     return "😼"
 
 
