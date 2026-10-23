@@ -3,26 +3,32 @@ import asyncio
 import time
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 import texts as T
 from ai_models import (
     CF_MODEL,
+    COHERE_MODEL,
     GROQ_MODEL,
     NVIDIA_MODEL,
+    OLLAMA_MODEL,
     OR_MODEL,
     _call_cloudflare,
+    _call_cohere,
     _call_groq,
     _call_nvidia,
+    _call_ollama,
     _call_openrouter,
     _cf_rate_limited,
+    _co_rate_limited,
     _groq_rate_limited,
     _nvi_rate_limited,
+    _ol_rate_limited,
     _or_rate_limited,
+    _ready,
     ai_model_state,
 )
 from config import (
-    CLOUDFLARE_ACCOUNT_ID,
-    CLOUDFLARE_API_TOKEN,
     GROQ_KEY,
     NVIDIA_KEY,
     OPENROUTER_KEY,
@@ -123,7 +129,7 @@ async def ping_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
     # --- Cloudflare live test ---
     cf_status = "❌ not reachable"
-    if CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID:
+    if _ready("cf"):
         t0 = time.time()
         try:
             res = await asyncio.wait_for(_call_cloudflare("Reply with only the word: pong", "ping", 20), timeout=14)
@@ -133,6 +139,32 @@ async def ping_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
             cf_status = f"❌ error: {str(e)[:40]}"
     else:
         cf_status = "❌ CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID not set"
+
+    # --- Cohere live test ---
+    co_status = "❌ not reachable"
+    if _ready("co"):
+        t0 = time.time()
+        try:
+            res = await asyncio.wait_for(_call_cohere("Reply with only the word: pong", "ping", 20), timeout=22)
+            co_ms = int((time.time() - t0) * 1000)
+            co_status = f"✅ OK ({co_ms}ms)" if res else "⚠️ no response"
+        except Exception as e:
+            co_status = f"❌ error: {str(e)[:40]}"
+    else:
+        co_status = "❌ COHERE_API_KEY not set"
+
+    # --- Ollama live test ---
+    ol_status = "❌ not reachable"
+    if _ready("ol"):
+        t0 = time.time()
+        try:
+            res = await asyncio.wait_for(_call_ollama("Reply with only the word: pong", "ping", 20), timeout=26)
+            ol_ms = int((time.time() - t0) * 1000)
+            ol_status = f"✅ OK ({ol_ms}ms)" if res else "⚠️ no response"
+        except Exception as e:
+            ol_status = f"❌ error: {str(e)[:40]}"
+    else:
+        ol_status = "❌ OLLAMA_API_KEY not set"
 
     # --- MongoDB live test ---
     mongo_status = "❌ not configured"
@@ -149,10 +181,12 @@ async def ping_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     text = (
         f"🏓 *Live Connection Check*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"☁️ *Cloudflare* (`{CF_MODEL}`)\n{cf_status}\n\n"
+        f"🧠 *Cohere* (`{COHERE_MODEL}`)\n{co_status}\n\n"
+        f"🦙 *Ollama* (`{OLLAMA_MODEL}`)\n{ol_status}\n\n"
+        f"⚡ *NVIDIA* (`{NVIDIA_MODEL}`)\n{nvi_status}\n\n"
         f"🤖 *Groq* (`{GROQ_MODEL}`)\n{groq_status}\n\n"
         f"🌐 *OpenRouter* (`{OR_MODEL}`)\n{or_status}\n\n"
-        f"⚡ *NVIDIA* (`{NVIDIA_MODEL}`)\n{nvi_status}\n\n"
-        f"☁️ *Cloudflare* (`{CF_MODEL}`)\n{cf_status}\n\n"
         f"🗄 *MongoDB*\n{mongo_status}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Active AI mode: `{mode.upper()}`"
@@ -163,41 +197,71 @@ async def ping_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 
+def _badge(provider: str, rate_limited) -> str:
+    """✅ ready, ⛔RL rate-limited right now, ❌key = API key / credentials not set."""
+    if not _ready(provider):
+        return "❌key"
+    return "⛔RL" if rate_limited() else "✅"
+
+
+_MODEL_LABELS = {
+    "cf": "Cloudflare (CF)", "co": "Cohere (CO)", "oll": "Ollama (OLL)", "nvi": "NVIDIA (NVI)",
+    "gro": "Groq (GRO)", "rou": "OpenRouter (ROU)", "auto": "Auto Switch",
+}
+
+
+def _model_menu(note: str = ""):
+    """Builds the /model selector (text + buttons) for the CURRENT mode. Used by both the command and
+    the button callback, so the menu stays on screen and updates in place after every tap."""
+    mode = ai_model_state["mode"]
+    cf_ok = _badge("cf", _cf_rate_limited)
+    co_ok = _badge("co", _co_rate_limited)
+    ol_ok = _badge("ol", _ol_rate_limited)
+    nvi_ok = _badge("nvi", _nvi_rate_limited)
+    groq_ok = _badge("groq", _groq_rate_limited)
+    or_ok = _badge("or", _or_rate_limited)
+
+    def btn(key, label, ok, style="primary"):
+        return InlineKeyboardButton(f"{'▶ ' if mode == key else ''}{label} {ok}".strip(),
+                                    callback_data=f"model:{key}", style=style)
+
+    kb = InlineKeyboardMarkup([
+        [btn("cf", "CF", cf_ok), btn("co", "CO", co_ok), btn("oll", "OLL", ol_ok)],
+        [btn("nvi", "NVI", nvi_ok), btn("gro", "GRO", groq_ok), btn("rou", "ROU", or_ok)],
+        [btn("auto", "AUTO", "", "success")],
+    ])
+
+    text = (
+        (f"{note}\n\n" if note else "")
+        + f"🤖 *AI Model Selector*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Current: `{mode.upper()}`\n\n"
+        f"• *CF* — Cloudflare `{CF_MODEL}` {cf_ok}\n"
+        f"• *CO* — Cohere `{COHERE_MODEL}` {co_ok}\n"
+        f"• *OLL* — Ollama `{OLLAMA_MODEL}` {ol_ok}\n"
+        f"• *NVI* — NVIDIA `{NVIDIA_MODEL}` {nvi_ok}\n"
+        f"• *GRO* — Groq `{GROQ_MODEL}` {groq_ok}\n"
+        f"• *ROU* — OpenRouter `{OR_MODEL}` {or_ok}\n"
+        f"• *AUTO* (default) — Cloudflare → Cohere → Ollama → NVIDIA → Groq → OpenRouter, "
+        f"moves to the next one on rate limit or failure\n\n"
+        f"_❌key = API key not set. Rate limit auto-recovers after 20s "
+        f"(Cloudflare daily limit: 15 min)_"
+    )
+    return text, kb
+
+
 async def model_command_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Owner-only: /model — pick Groq, OpenRouter, NVIDIA, Cloudflare, or Auto via inline keyboard."""
+    """Owner-only: /model — pick Cloudflare, Cohere, Ollama, NVIDIA, Groq, OpenRouter, or Auto via inline keyboard."""
     if not u.message:
         return
     if not is_owner(u.effective_user.id if u.effective_user else 0):
         await u.message.reply_text(T.MODEL_COMMAND_MSG_1)
         return
-
-    mode = ai_model_state["mode"]
-    groq_ok = "✅" if not _groq_rate_limited() else "⛔RL"
-    or_ok = "✅" if not _or_rate_limited() else "⛔RL"
-    nvi_ok = "✅" if not _nvi_rate_limited() else "⛔RL"
-    cf_ok = "✅" if not _cf_rate_limited() else "⛔RL"
-
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton(f"{'▶' if mode=='gro' else ''} GRO {groq_ok}", callback_data="model:gro", style="primary"),
-        InlineKeyboardButton(f"{'▶' if mode=='rou' else ''} ROU {or_ok}", callback_data="model:rou", style="primary"),
-        InlineKeyboardButton(f"{'▶' if mode=='nvi' else ''} NVI {nvi_ok}", callback_data="model:nvi", style="primary"),
-        InlineKeyboardButton(f"{'▶' if mode=='cf' else ''} CF {cf_ok}", callback_data="model:cf", style="primary"),
-    ], [
-        InlineKeyboardButton(f"{'▶' if mode=='auto' else ''} AUTO", callback_data="model:auto", style="success"),
-    ]])
-
-    status = (
-        f"🤖 *AI Model Selector*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Current: `{mode.upper()}`\n\n"
-        f"• *GRO* — Groq `{GROQ_MODEL}` {groq_ok}\n"
-        f"• *ROU* — OpenRouter `{OR_MODEL}` {or_ok}\n"
-        f"• *NVI* — NVIDIA `{NVIDIA_MODEL}` {nvi_ok}\n"
-        f"• *CF* — Cloudflare `{CF_MODEL}` {cf_ok}\n"
-        f"• *AUTO* (default) — Groq → OpenRouter → NVIDIA → Cloudflare, falls back on rate limit or failure\n\n"
-        f"_Rate limit auto-recovers after 20s_"
-    )
-    await u.message.reply_text(status, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+    text, kb = _model_menu()
+    try:
+        await u.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+    except BadRequest:
+        await u.message.reply_text(text.replace("*", "").replace("`", "").replace("_", ""), reply_markup=kb)
 
 
 async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -210,13 +274,20 @@ async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer(T.MODEL_MSG_1, show_alert=True)
             return
         _, mode = q.data.split(":", 1)
+        if mode not in _MODEL_LABELS:
+            return
+        previous = ai_model_state["mode"]
         ai_model_state["mode"] = mode
-        label = {"gro": "Groq (GRO)", "rou": "OpenRouter (ROU)", "nvi": "NVIDIA (NVI)", "cf": "Cloudflare (CF)", "auto": "Auto Switch"}.get(mode, mode)
-        await q.edit_message_text(
-            T.model_msg_2(label, GROQ_MODEL, OR_MODEL, NVIDIA_MODEL, CF_MODEL),
-            parse_mode=ParseMode.MARKDOWN
-        )
-        logger.info(f"[AI] Model mode switched to: {mode}")
+        if mode != previous:
+            logger.info(f"[AI] Model mode switched to: {mode}")
+        text, kb = _model_menu(f"✅ *AI model switched to: {_MODEL_LABELS[mode]}*")
+        try:
+            await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+        except BadRequest as e:
+            if "not modified" in str(e).lower():
+                return
+            # Markdown rejected: resend the same menu as plain text, buttons kept
+            await q.edit_message_text(text.replace("*", "").replace("`", "").replace("_", ""), reply_markup=kb)
     except Exception as e:
         logger.error(f"[model_callback] {e}")
 
