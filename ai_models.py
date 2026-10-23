@@ -1,4 +1,4 @@
-"""AI providers (Cohere, Cloudflare, Groq, OpenRouter, NVIDIA), rate-limit/fallback logic, and the ai() entry point."""
+"""AI providers (Cloudflare, Cohere, Ollama, NVIDIA, Groq, OpenRouter), rate-limit/fallback logic, and the ai() entry point."""
 import asyncio
 import os
 import re
@@ -40,7 +40,14 @@ def _env(*names: str) -> str:
 #   account id: CLOUDFLARE_ACCOUNT_ID | CF_ACCOUNT_ID | CLOUDFLARE_ACCOUNT
 _CF_TOKEN = CLOUDFLARE_API_TOKEN or _env("CLOUDFLARE_AUTH_TOKEN", "CLOUDFLARE_API_KEY", "CF_API_TOKEN")
 _CF_ACCOUNT = CLOUDFLARE_ACCOUNT_ID or _env("CF_ACCOUNT_ID", "CLOUDFLARE_ACCOUNT")
-CF_MODEL = _env("CLOUDFLARE_MODEL") or "@cf/meta/llama-3.2-3b-instruct"
+CF_MODEL = _env("CLOUDFLARE_MODEL") or "@cf/google/gemma-4-26b-a4b-it"
+
+# ── Ollama (Ollama Cloud, https://ollama.com/api/chat) ───────────────────────
+# Env: OLLAMA_API_KEY. Model: OLLAMA_MODEL (default gemma4:31b). Host: OLLAMA_HOST
+# (default https://ollama.com; point it at your own server to use a self-hosted Ollama).
+OLLAMA_KEY = _env("OLLAMA_API_KEY", "OLLAMA_KEY")
+OLLAMA_MODEL = _env("OLLAMA_MODEL") or "gemma4:31b"
+OLLAMA_URL = (_env("OLLAMA_HOST") or "https://ollama.com").rstrip("/") + "/api/chat"
 
 # ── Cohere ───────────────────────────────────────────────────────────────────
 # Env: COHERE_API_KEY (or CO_API_KEY). Model can be changed with COHERE_MODEL.
@@ -48,21 +55,22 @@ COHERE_KEY = _env("COHERE_API_KEY", "CO_API_KEY", "COHERE_KEY")
 COHERE_MODEL = _env("COHERE_MODEL") or "command-a-plus-05-2026"
 COHERE_URL = "https://api.cohere.com/v2/chat"
 
-# Order "auto" mode tries providers in. Providers whose key isn't set are skipped
+# Order "auto" mode (the default) tries providers in: Cloudflare first, and when it is rate-limited or
+# fails -> Cohere -> Ollama -> NVIDIA -> Groq -> OpenRouter. Providers whose key isn't set are skipped
 # automatically, so you can just set the keys you have. Reorder freely:
-#   "co" = Cohere, "cf" = Cloudflare, "groq", "or" = OpenRouter, "nvi" = NVIDIA
-AUTO_ORDER = ["co", "cf", "groq", "or", "nvi"]
+#   "cf" = Cloudflare, "co" = Cohere, "ol" = Ollama, "nvi" = NVIDIA, "groq", "or" = OpenRouter
+AUTO_ORDER = ["cf", "co", "ol", "nvi", "groq", "or"]
 # The tiny emoji-reaction pick runs on almost every message, so it prefers the fast/cheap providers.
-EMOJI_ORDER = ["groq", "cf", "co"]
+EMOJI_ORDER = ["groq", "cf", "co", "ol"]
 
 
-# Default mode is "auto": tries Cohere -> Cloudflare -> Groq -> OpenRouter -> NVIDIA (see AUTO_ORDER),
+# Default mode is "auto": tries Cloudflare -> Cohere -> Ollama -> NVIDIA -> Groq -> OpenRouter (see AUTO_ORDER),
 # skipping any provider whose API key isn't set, and does a second full pass before giving up, so one
 # provider having a rough moment doesn't reach the user as the fallback "Meow!" reply.
 # Switch to a single provider anytime with /model (owner-only).
 ai_model_state = {
     "mode": "auto",
-    "groq_rl_until": 0.0, "or_rl_until": 0.0, "nvi_rl_until": 0.0, "cf_rl_until": 0.0, "co_rl_until": 0.0,
+    "groq_rl_until": 0.0, "or_rl_until": 0.0, "nvi_rl_until": 0.0, "cf_rl_until": 0.0, "co_rl_until": 0.0, "ol_rl_until": 0.0,
 }
 
 
@@ -86,6 +94,10 @@ def _co_rate_limited() -> bool:
     return time.time() < ai_model_state["co_rl_until"]
 
 
+def _ol_rate_limited() -> bool:
+    return time.time() < ai_model_state["ol_rl_until"]
+
+
 def _set_groq_rl():
     ai_model_state["groq_rl_until"] = time.time() + 20
     logger.warning("[AI] Groq rate-limited — backing off 20s")
@@ -101,14 +113,19 @@ def _set_nvi_rl():
     logger.warning("[AI] NVIDIA rate-limited — backing off 20s")
 
 
-def _set_cf_rl():
-    ai_model_state["cf_rl_until"] = time.time() + 20
-    logger.warning("[AI] Cloudflare rate-limited — backing off 20s")
+def _set_cf_rl(secs: float = 20):
+    ai_model_state["cf_rl_until"] = time.time() + secs
+    logger.warning(f"[AI] Cloudflare rate-limited — backing off {int(secs)}s")
 
 
 def _set_co_rl():
     ai_model_state["co_rl_until"] = time.time() + 20
     logger.warning("[AI] Cohere rate-limited — backing off 20s")
+
+
+def _set_ol_rl(secs: float = 20):
+    ai_model_state["ol_rl_until"] = time.time() + secs
+    logger.warning(f"[AI] Ollama rate-limited — backing off {int(secs)}s")
 
 
 async def _call_groq(system: str, user: str, max_tok: int) -> Optional[str]:
@@ -327,7 +344,9 @@ async def _call_cloudflare(system: str, user: str, max_tok: int) -> Optional[str
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
-                "max_tokens": max(max_tok, 60),
+                # floor of 256: newer Workers AI models can spend part of the budget on internal
+                # reasoning before the visible answer; replies stay short because prompts ask for that.
+                "max_tokens": max(max_tok, 256),
             }
             async with session.post(
                 f"https://api.cloudflare.com/client/v4/accounts/{_CF_ACCOUNT}/ai/run/{CF_MODEL}",
@@ -346,7 +365,11 @@ async def _call_cloudflare(system: str, user: str, max_tok: int) -> Optional[str
                         logger.warning(f"[AI] Cloudflare: empty reply, raw={str(data)[:200]}")
                     return content or None
                 elif r.status == 429:
-                    _set_cf_rl()
+                    body = await r.text()
+                    # 4006 = the account's DAILY free allocation is used up: retrying every 20s is pointless,
+                    # so back off for 15 minutes and let Cohere (next in AUTO_ORDER) take over meanwhile.
+                    daily = ("4006" in body) or ("daily" in body.lower())
+                    _set_cf_rl(900 if daily else 20)
                     return None
                 elif r.status == 401:
                     logger.error(
@@ -434,10 +457,68 @@ async def _call_cohere(system: str, user: str, max_tok: int) -> Optional[str]:
     return None
 
 
+def _ollama_extract(data: dict) -> str:
+    """Ollama /api/chat (stream:false) -> message.content. Any 'thinking' text is returned in a
+    separate message.thinking field and is deliberately ignored."""
+    content = (data.get("message") or {}).get("content")
+    return content.strip() if isinstance(content, str) else ""
+
+
+async def _call_ollama(system: str, user: str, max_tok: int) -> Optional[str]:
+    """
+    Calls Ollama's chat API: POST {OLLAMA_HOST}/api/chat with a Bearer key (Ollama Cloud).
+    Env: OLLAMA_API_KEY. Model: OLLAMA_MODEL (default gemma4:31b).
+    """
+    if not OLLAMA_KEY:
+        logger.warning("[AI] OLLAMA_API_KEY not set")
+        return None
+    bot_status["api_calls"] += 1
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        "stream": False,
+        "think": False,  # fast chat replies: skip the hidden reasoning phase on thinking-capable models
+        "options": {"num_predict": max(max_tok, 256)},
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                OLLAMA_URL,
+                headers={"Authorization": f"Bearer {OLLAMA_KEY}", "Content-Type": "application/json"},
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=24)
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    content = _ollama_extract(data)
+                    if not content:
+                        logger.warning(f"[AI] Ollama: empty reply, done_reason={data.get('done_reason')}")
+                    return content or None
+                elif r.status == 429:
+                    body = await r.text()
+                    # weekly/session usage cap on Ollama Cloud: no point retrying every 20s
+                    _set_ol_rl(600 if any(w in body.lower() for w in ("usage", "weekly", "daily")) else 20)
+                    return None
+                elif r.status in (401, 403):
+                    logger.error("[AI] Ollama auth error — check OLLAMA_API_KEY (create one at ollama.com/settings/keys).")
+                    bot_status["failed_apis"] += 1
+                    return None
+                else:
+                    body = await r.text()
+                    hint = f" (model '{OLLAMA_MODEL}' not found — check OLLAMA_MODEL)" if r.status == 404 else ""
+                    logger.error(f"[AI] Ollama error {r.status}{hint}: {body[:300]}")
+                    bot_status["failed_apis"] += 1
+    except Exception as e:
+        logger.error(f"[AI] Ollama exception: {e}")
+        bot_status["failed_apis"] += 1
+    return None
+
+
 def _ready(provider: str) -> bool:
     """True if the provider has the credentials it needs."""
     return {
         "co": bool(COHERE_KEY),
+        "ol": bool(OLLAMA_KEY),
         "cf": bool(_CF_TOKEN and _CF_ACCOUNT),
         "groq": bool(GROQ_KEY),
         "or": bool(OPENROUTER_KEY),
@@ -445,12 +526,12 @@ def _ready(provider: str) -> bool:
     }.get(provider, False)
 
 
-_PROVIDER_NAMES = {"co": "Cohere", "cf": "Cloudflare", "groq": "Groq", "or": "OpenRouter", "nvi": "NVIDIA"}
+_PROVIDER_NAMES = {"cf": "Cloudflare", "co": "Cohere", "ol": "Ollama", "nvi": "NVIDIA", "groq": "Groq", "or": "OpenRouter"}
 logger.info("[AI] Providers in auto order: " + (" → ".join(_PROVIDER_NAMES[p] for p in AUTO_ORDER if _ready(p))
-                                                  or "NONE configured (set COHERE_API_KEY and/or Cloudflare keys)"))
+                                                  or "NONE configured (set Cloudflare, Cohere or Ollama keys)"))
 
-# /model (owner.py) mode name -> provider. "co" is Cohere.
-_LOCKED_MODES = {"gro": "groq", "rou": "or", "nvi": "nvi", "cf": "cf", "co": "co"}
+# /model (owner.py) mode name -> provider. "co" is Cohere, "oll" is Ollama.
+_LOCKED_MODES = {"gro": "groq", "rou": "or", "nvi": "nvi", "cf": "cf", "co": "co", "oll": "ol"}
 
 
 async def _dispatch(provider: str, system: str, user: str, max_tok: int) -> Optional[str]:
@@ -475,6 +556,10 @@ async def _dispatch(provider: str, system: str, user: str, max_tok: int) -> Opti
         if _co_rate_limited():
             return None
         return await asyncio.wait_for(_call_cohere(system, user, max_tok), timeout=22)
+    if provider == "ol":
+        if _ol_rate_limited():
+            return None
+        return await asyncio.wait_for(_call_ollama(system, user, max_tok), timeout=26)
     # OpenRouter
     if _or_rate_limited():
         return None
@@ -485,8 +570,8 @@ async def _dispatch(provider: str, system: str, user: str, max_tok: int) -> Opti
 async def ai(system: str, user: str, fallback: str = "Meow! 🐾", max_tok: int = 200) -> str:
     """
     Smart multi-provider AI call.
-    Locked modes ('gro', 'rou', 'nvi', 'cf', 'co') → that ONE provider only, retried up to 3x, never switches away.
-    Mode 'auto' → tries the providers in AUTO_ORDER (Cohere, Cloudflare, Groq, OpenRouter, NVIDIA) that have
+    Locked modes ('cf', 'co', 'oll', 'nvi', 'gro', 'rou') → that ONE provider only, retried up to 3x, never switches away.
+    Mode 'auto' → tries the providers in AUTO_ORDER (Cloudflare, Cohere, Ollama, NVIDIA, Groq, OpenRouter) that have
                   an API key set, then a second full pass before returning `fallback`.
     """
     mode = ai_model_state["mode"]
