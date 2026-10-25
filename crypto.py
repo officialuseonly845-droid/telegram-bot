@@ -1,14 +1,13 @@
 """
-Crypto commands: /price, /topgainers, /toplosers, /chart, /vp, /vf, /lh
+Crypto commands: /price, /topgainers, /toplosers, /chart (+ text trigger), /vp, /vf, /lh
 
-Wired in bot.py:
-  CommandHandler: chart*, vp, vf, lh, price, topgainers, toplosers
-  text trigger (CHART_TEXT_REGEX) -> crypto_chart_text_handler
-  button_callback_handler (chart Refresh button)
-  start_vp_warmup()  (also starts the /lh order-book collector, call it once inside the running event loop)
+Wired in bot.py: CommandHandler chart*/vp/vf/lh/price/topgainers/toplosers, text trigger CHART_TEXT_REGEX,
+button_callback_handler (chart Refresh), start_vp_warmup() (also starts the /lh order-book collector).
+Fonts: put Poppins-Bold.ttf + Poppins-Medium.ttf next to this file (or in a fonts/ folder).
 """
 import asyncio
 import bisect
+import importlib.util
 import io
 import math
 import os
@@ -165,23 +164,6 @@ def _fmt_price(p: float) -> str:
     return f"{p:.8f}"
 
 
-def _fmt_vol(v: float) -> str:
-    """Compact volume: 1.25M / 12.40K / 345.6 / 0.0123. Handles negatives."""
-    s = "-" if v < 0 else ""
-    a = abs(v)
-    if a >= 1e9:
-        return f"{s}{a / 1e9:,.2f}B"
-    if a >= 1e6:
-        return f"{s}{a / 1e6:,.2f}M"
-    if a >= 1e3:
-        return f"{s}{a / 1e3:,.2f}K"
-    if a >= 100:
-        return f"{s}{a:,.1f}"
-    if a >= 1:
-        return f"{s}{a:,.2f}"
-    return f"{s}{a:.4f}"
-
-
 def _fetch_movers_sync():
     errors = []
     # 1) Binance
@@ -320,8 +302,6 @@ _GRID = (34, 34, 34)
 _TXT = (204, 204, 204)
 _GOLD = (255, 204, 0)
 _BLUE = (100, 170, 255)
-_MUTED = (140, 140, 150)
-_WHITE = (255, 255, 255)
 
 # Text trigger: "chart btc 1h" / "chart eth" (no slash). Register with filters.Regex(CHART_TEXT_REGEX)
 CHART_TEXT_REGEX = r"(?i)^\s*chart(?:@\w+)?\s+[a-z0-9]{2,10}(?:\s+(?:5m|15m|1h|4h|1d|1m))?\s*$"
@@ -412,50 +392,60 @@ def _log_exc(tag: str, e: BaseException):
     logger.error(f"{tag} {type(e).__name__}: {str(e)[:100]} | TB: {tail}")
 
 
-def _font(size, bold=False):
-    """Pillow font. bold=True uses DejaVu Sans Bold (ships with matplotlib) when it can be found."""
-    from PIL import ImageFont
-    if bold:
-        paths = ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-                 "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf"]
-        try:
-            import matplotlib
-            paths.insert(0, os.path.join(matplotlib.get_data_path(), "fonts", "ttf", "DejaVuSans-Bold.ttf"))
-        except Exception:
-            pass
-        for p in paths:
-            try:
-                return ImageFont.truetype(p, size)
-            except Exception:
-                continue
+_FONT_CACHE = {}
+_FONT_FILES = {
+    "bold": ["Poppins-Bold.ttf", "DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf", "Roboto-Bold.ttf"],
+    "reg": ["Poppins-Medium.ttf", "Poppins-Regular.ttf", "DejaVuSans.ttf", "LiberationSans-Regular.ttf", "Roboto-Regular.ttf"],
+}
+
+
+def _font_dirs():
+    here = os.path.dirname(os.path.abspath(__file__))
+    parent = os.path.dirname(here)
+    dirs = [os.environ.get("BELUGA_FONT_DIR", ""), here, os.path.join(here, "fonts"), parent,
+            os.path.join(parent, "fonts"), "/usr/share/fonts/truetype/dejavu",
+            "/usr/share/fonts/truetype/liberation", "/usr/share/fonts/dejavu", "/usr/share/fonts/TTF"]
     try:
-        return ImageFont.load_default(size=size)
-    except TypeError:  # very old Pillow
-        return ImageFont.load_default()
+        spec = importlib.util.find_spec("matplotlib")
+        if spec and spec.submodule_search_locations:
+            dirs.append(os.path.join(list(spec.submodule_search_locations)[0], "mpl-data", "fonts", "ttf"))
+    except Exception:
+        pass
+    return [x for x in dirs if x and os.path.isdir(x)]
+
+
+def _font(size, bold=False):
+    """Poppins (bundled .ttf next to this file) -> DejaVu/Liberation -> Pillow default."""
+    key = (size, bold)
+    f = _FONT_CACHE.get(key)
+    if f:
+        return f
+    from PIL import ImageFont
+    for name in _FONT_FILES["bold" if bold else "reg"]:
+        for folder in _font_dirs():
+            path = os.path.join(folder, name)
+            if os.path.isfile(path):
+                try:
+                    f = ImageFont.truetype(path, size)
+                    break
+                except Exception:
+                    f = None
+        if f:
+            break
+    if f is None:
+        try:
+            f = ImageFont.load_default(size=size)
+        except TypeError:  # very old Pillow
+            f = ImageFont.load_default()
+    _FONT_CACHE[key] = f
+    return f
 
 
 def _text(d, xy, s, font, fill, anchor="la"):
-    """d.text with an anchor (e.g. 'lm' = left/middle, 'ms' = middle/baseline). Falls back to manual
-    placement when the font is a bitmap font that doesn't support anchors."""
     try:
         d.text(xy, s, font=font, fill=fill, anchor=anchor)
-    except (ValueError, TypeError):
-        x, y = xy
-        w = d.textlength(s, font=font)
-        try:
-            _l, t, _r, b = d.textbbox((0, 0), s, font=font)
-            h = b - t
-        except Exception:
-            h = 11
-        if anchor[0] == "m":
-            x -= w / 2
-        elif anchor[0] == "r":
-            x -= w
-        if anchor[1] == "m":
-            y -= h / 2
-        elif anchor[1] in "sdb":
-            y -= h
-        d.text((x, y), s, font=font, fill=fill)
+    except (ValueError, TypeError):  # bitmap fallback font has no anchor support
+        d.text(xy, s, font=font, fill=fill)
 
 
 def _dashed(d, x1, x2, y, color, dash=8, gap=5):
@@ -463,6 +453,21 @@ def _dashed(d, x1, x2, y, color, dash=8, gap=5):
     while x < x2:
         d.line([(x, y), (min(x + dash, x2), y)], fill=color, width=1)
         x += dash + gap
+
+
+def _fmt_vol(x: float) -> str:
+    a = abs(x)
+    if a >= 1e9:
+        return f"{x / 1e9:,.2f}B"
+    if a >= 1e6:
+        return f"{x / 1e6:,.2f}M"
+    if a >= 1e3:
+        return f"{x / 1e3:,.2f}K"
+    return f"{x:,.2f}"
+
+
+def _now_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%H:%M")
 
 
 # =====================================================================
@@ -475,15 +480,17 @@ def _render_chart_sync(rows, ticker: str, timeframe: str) -> bytes:
     rows = sorted((r[:6] for r in rows), key=lambda r: r[0])
     n = len(rows)
 
-    W, H = 1200, 780
-    L, R, TOP = 20, 110, 70
-    price_bottom = 530
-    vol_top, vol_bottom = 550, 690
-    plot_w = W - L - R
+    W, H = 1300, 880
+    L, R = 30, 215
+    TOP, price_bottom = 125, 565
+    vol_top, vol_bottom = 595, 750
+    plot_r = W - R
+    plot_w = plot_r - L
 
     img = Image.new("RGB", (W, H), _BG)
     d = ImageDraw.Draw(img)
-    f_sm, f_title = _font(15), _font(24)
+    f_title, f_big, f_sub = _font(36, True), _font(30, True), _font(24, True)
+    f_lbl, f_tag = _font(17), _font(18, True)
 
     max_h = max(r[2] for r in rows)
     min_l = min(r[3] for r in rows)
@@ -494,18 +501,20 @@ def _render_chart_sync(rows, ticker: str, timeframe: str) -> bytes:
     def py(p):
         return TOP + (hi - p) / (hi - lo) * (price_bottom - TOP)
 
-    def text_w(s, f):
-        return d.textlength(s, font=f)
+    last = rows[-1][4]
+    ly = py(last)
+    lc = _UP if rows[-1][4] >= rows[-1][1] else _DOWN
+    tag = _fmt_price(last)
 
     for i in range(6):
         p = lo + (hi - lo) * i / 5
         y = py(p)
-        d.line([(L, y), (W - R, y)], fill=_GRID, width=1)
-        d.text((W - R + 8, y - 8), _fmt_price(p), fill=_TXT, font=f_sm)
+        d.line([(L, y), (plot_r, y)], fill=_GRID, width=1)
+        if abs(y - ly) > 32:
+            _text(d, (plot_r + 14, y), _fmt_price(p), f_lbl, _TXT, "lm")
 
     cw = plot_w / n
     body_half = max(1.0, cw * 0.35)
-
     for i, (_, o, h, l, c, v) in enumerate(rows):
         x = L + (i + 0.5) * cw
         col = _UP if c >= o else _DOWN
@@ -517,25 +526,26 @@ def _render_chart_sync(rows, ticker: str, timeframe: str) -> bytes:
         vh = v / max_v * (vol_bottom - vol_top)
         d.rectangle([x - body_half, vol_bottom - vh, x + body_half, vol_bottom], fill=col)
 
-    d.line([(L, vol_bottom), (W - R, vol_bottom)], fill=_GRID, width=1)
-    d.text((W - R + 8, vol_top), "Volume", fill=_TXT, font=f_sm)
+    d.line([(L, vol_bottom), (plot_r, vol_bottom)], fill=_GRID, width=1)
+    _text(d, (plot_r + 14, vol_top + 12), "Volume", f_lbl, _TXT, "lm")
 
-    fmt = "%d %b" if timeframe in ("1d", "1M") else "%d %b %H:%M"
-    step = max(1, n // 6)
-    for i in range(0, n, step):
+    fmt = "%d %b" if timeframe in ("1d", "1M") else "%d %b  %H:%M"
+    for k in range(5):
+        i = min(n - 1, int((k + 0.5) / 5 * n))
         x = L + (i + 0.5) * cw
         lbl = datetime.fromtimestamp(rows[i][0] / 1000, tz=timezone.utc).strftime(fmt)
-        d.text((max(4, x - text_w(lbl, f_sm) / 2), vol_bottom + 10), lbl, fill=_TXT, font=f_sm)
+        _text(d, (min(max(x, L + 55), plot_r - 55), vol_bottom + 18), lbl, f_lbl, _TXT, "ma")
 
-    last = rows[-1][4]
-    ly = py(last)
-    lc = _UP if rows[-1][4] >= rows[-1][1] else _DOWN
-    d.line([(L, ly), (W - R, ly)], fill=lc, width=1)
-    tag = _fmt_price(last)
-    d.rectangle([W - R + 2, ly - 11, W - R + 8 + text_w(tag, f_sm) + 6, ly + 11], fill=lc)
-    d.text((W - R + 8, ly - 8), tag, fill=(0, 0, 0), font=f_sm)
-    d.text((L, 20), f"{ticker}/USDT  ·  {timeframe}  ·  {tag}", fill=(255, 255, 255), font=f_title)
-    d.text((L, H - 34), "powered by - BELUGA.PY", fill=(150, 150, 150), font=f_sm)
+    d.line([(L, ly), (plot_r, ly)], fill=lc, width=1)
+    tw = d.textlength(tag, font=f_tag)
+    d.rectangle([plot_r + 4, ly - 16, plot_r + 4 + tw + 24, ly + 16], fill=lc)
+    _text(d, (plot_r + 16, ly), tag, f_tag, (0, 0, 0), "lm")
+
+    title = f"{ticker}/USDT"
+    _text(d, (L, 70), title, f_title, (255, 255, 255), "ls")
+    _text(d, (L + d.textlength(title, font=f_title) + 20, 70), timeframe, f_sub, (150, 150, 165), "ls")
+    _text(d, (plot_r, 70), tag, f_big, lc, "rs")
+    _text(d, (L, H - 52), "powered by - BELUGA.PY", f_lbl, (140, 140, 150), "la")
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -543,23 +553,23 @@ def _render_chart_sync(rows, ticker: str, timeframe: str) -> bytes:
 
 
 async def _make_chart(ticker: str, timeframe: str):
-    """Returns (png_bytes, source). Raises on failure."""
+    """Returns (png_bytes, last_price). Raises on failure."""
     loop = asyncio.get_running_loop()
-    rows, source = await loop.run_in_executor(None, lambda: _fetch_ohlcv_sync(ticker, timeframe, 60))
+    rows, _source = await loop.run_in_executor(None, lambda: _fetch_ohlcv_sync(ticker, timeframe, 60))
     if not rows:
         raise ValueError(f"No candle data for {ticker}/USDT")
     png = await loop.run_in_executor(None, lambda: _render_chart_sync(rows, ticker, timeframe))
-    return png, source
+    return png, rows[-1][4]
 
 
 def _chart_keyboard(ticker: str, timeframe: str):
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh", callback_data=f"chart_{ticker}_{timeframe}")]])
 
 
-def _chart_caption(ticker: str, timeframe: str, source: str) -> str:
-    return (f"⚡ *{ticker}/USDT* · `{timeframe}`\n"
-            f"📡 {source}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
+def _chart_caption(ticker: str, timeframe: str, last: float) -> str:
+    return (f"⚡ *{ticker}/USDT*  ·  `{timeframe}`\n\n"
+            f"💵 *Price* :  `{_fmt_price(last)}`\n\n"
+            f"🕒 *Updated* :  `{_now_utc()} UTC`\n\n"
             f"{BRAND}")
 
 
@@ -571,14 +581,14 @@ async def _send_chart(message, ticker: str, timeframe: str, quiet: bool = False)
             f"⚡ Generating chart for *{ticker}/USDT* (`{timeframe}`)...", parse_mode=ParseMode.MARKDOWN
         )
     try:
-        png, source = await _make_chart(ticker, timeframe)
+        png, last = await _make_chart(ticker, timeframe)
         if sm:
             try:
                 await sm.delete()
             except Exception:
                 pass
         await message.reply_photo(photo=_png_file(png, f"{ticker}_{timeframe}.png"),
-                                  caption=_chart_caption(ticker, timeframe, source),
+                                  caption=_chart_caption(ticker, timeframe, last),
                                   parse_mode=ParseMode.MARKDOWN,
                                   reply_markup=_chart_keyboard(ticker, timeframe))
     except BaseException as e:  # RecursionError included
@@ -691,14 +701,15 @@ def _render_vp_sync(rows, vp, ticker: str, timeframe: str) -> bytes:
     rows = sorted(rows, key=lambda r: r[0])
     n = len(rows)
 
-    W, H = 1300, 800
-    L, cand_r = 20, 800
-    prof_l, prof_r = 815, 1130
-    TOP, BOT = 100, 700
+    W, H = 1420, 880
+    L, cand_r = 30, 840
+    prof_l, prof_r = 860, 1190
+    TOP, BOT = 140, 735
 
     img = Image.new("RGB", (W, H), _BG)
     d = ImageDraw.Draw(img)
-    f_sm, f_title = _font(15), _font(26)
+    f_title, f_sub = _font(36, True), _font(24, True)
+    f_lbl, f_tag = _font(17), _font(18, True)
 
     data_hi = max(r[2] for r in rows)
     data_lo = min(r[3] for r in rows)
@@ -707,9 +718,6 @@ def _render_vp_sync(rows, vp, ticker: str, timeframe: str) -> bytes:
 
     def py(p):
         return TOP + (hi_ax - p) / (hi_ax - lo_ax) * (BOT - TOP)
-
-    def text_w(s, f):
-        return d.textlength(s, font=f)
 
     last = rows[-1][4]
     tags = [
@@ -720,15 +728,13 @@ def _render_vp_sync(rows, vp, ticker: str, timeframe: str) -> bytes:
     ]
     tag_ys = [py(p) for p, _, _ in tags]
 
-    # grid + price labels (skip labels that would collide with a tag)
     for i in range(6):
         p = lo_ax + (hi_ax - lo_ax) * i / 5
         y = py(p)
         d.line([(L, y), (prof_r, y)], fill=_GRID, width=1)
-        if all(abs(y - ty) > 24 for ty in tag_ys):
-            d.text((prof_r + 8, y - 8), _fmt_price(p), fill=_TXT, font=f_sm)
+        if all(abs(y - ty) > 34 for ty in tag_ys):
+            _text(d, (prof_r + 14, y), _fmt_price(p), f_lbl, _TXT, "lm")
 
-    # candles
     cw = (cand_r - L) / n
     body_half = max(0.5, cw * 0.35)
     for i, (_, o, h, l, c, v, *_rest) in enumerate(rows):
@@ -740,7 +746,6 @@ def _render_vp_sync(rows, vp, ticker: str, timeframe: str) -> bytes:
             y2 = y1 + 1
         d.rectangle([x - body_half, y1, x + body_half, y2], fill=col)
 
-    # profile histogram (buy green + sell red; dimmed outside value area)
     max_tot = max(vp["tot"]) or 1.0
     pw = prof_r - prof_l
     for i in range(vp["bins"]):
@@ -761,37 +766,34 @@ def _render_vp_sync(rows, vp, ticker: str, timeframe: str) -> bytes:
         if i == vp["poc"]:
             d.rectangle([prof_l, y1, prof_l + wb + ws, y2], outline=_GOLD, width=2)
 
-    # POC / VAH / VAL lines across candles + profile
     d.line([(L, py(vp["poc_price"])), (prof_r, py(vp["poc_price"]))], fill=_GOLD, width=2)
     _dashed(d, L, prof_r, py(vp["vah"]), _BLUE)
     _dashed(d, L, prof_r, py(vp["val"]), _BLUE)
 
-    # price tags on the right
     for p, label, col in tags:
         y = py(p)
-        s = f"{label} {_fmt_price(p)}"
-        d.rectangle([prof_r + 4, y - 11, prof_r + 4 + text_w(s, f_sm) + 12, y + 11], fill=col)
-        d.text((prof_r + 10, y - 8), s, fill=(0, 0, 0), font=f_sm)
+        s = f"{label}  {_fmt_price(p)}"
+        d.rectangle([prof_r + 6, y - 16, prof_r + 6 + d.textlength(s, font=f_tag) + 24, y + 16], fill=col)
+        _text(d, (prof_r + 18, y), s, f_tag, (0, 0, 0), "lm")
 
-    # x labels (candle area) + panel label
-    fmt = "%d %b" if timeframe in ("1d", "1M") else "%d %b %H:%M"
-    step = max(1, n // 6)
-    for i in range(0, n, step):
+    fmt = "%d %b" if timeframe in ("1d", "1M") else "%d %b  %H:%M"
+    for k in range(5):
+        i = min(n - 1, int((k + 0.5) / 5 * n))
         x = L + (i + 0.5) * cw
         lbl = datetime.fromtimestamp(rows[i][0] / 1000, tz=timezone.utc).strftime(fmt)
-        d.text((max(4, x - text_w(lbl, f_sm) / 2), BOT + 10), lbl, fill=_TXT, font=f_sm)
-    d.text((prof_l, BOT + 10), "Volume Profile", fill=_TXT, font=f_sm)
+        _text(d, (min(max(x, L + 55), cand_r - 55), BOT + 20), lbl, f_lbl, _TXT, "ma")
+    _text(d, (prof_l, BOT + 20), "Volume Profile", f_lbl, _TXT, "la")
 
-    # title + legend
-    d.text((L, 20), f"{ticker}/USDT  ·  Volume Profile  ·  {timeframe}", fill=(255, 255, 255), font=f_title)
-    d.text((L, 58), f"{n} candles  ·  Value Area {int(_VP_VALUE_AREA * 100)}%", fill=_TXT, font=f_sm)
+    title = f"{ticker}/USDT"
+    _text(d, (L, 72), title, f_title, (255, 255, 255), "ls")
+    _text(d, (L + d.textlength(title, font=f_title) + 20, 72), f"Volume Profile  ·  {timeframe}", f_sub, (150, 150, 165), "ls")
     lx = prof_l
-    d.rectangle([lx, 66, lx + 12, 78], fill=_UP)
-    d.text((lx + 18, 63), "Buy", fill=_TXT, font=f_sm)
-    d.rectangle([lx + 70, 66, lx + 82, 78], fill=_DOWN)
-    d.text((lx + 88, 63), "Sell", fill=_TXT, font=f_sm)
+    d.rectangle([lx, 102, lx + 18, 120], fill=_UP)
+    _text(d, (lx + 30, 111), "Buy", f_lbl, _TXT, "lm")
+    d.rectangle([lx + 110, 102, lx + 128, 120], fill=_DOWN)
+    _text(d, (lx + 140, 111), "Sell", f_lbl, _TXT, "lm")
 
-    d.text((L, H - 34), "powered by - BELUGA.PY", fill=(150, 150, 150), font=f_sm)
+    _text(d, (L, H - 52), "powered by - BELUGA.PY", f_lbl, (140, 140, 150), "la")
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -860,8 +862,7 @@ async def vp_warmup_loop():
 
 
 def start_vp_warmup():
-    """Call once from inside the running event loop (e.g. right after `await init_exchange_async()`).
-    Also starts the /lh liquidity-heatmap collector, so bot.py only needs this one call."""
+    """Call once inside the running event loop. Also starts the /lh order-book collector."""
     global _warm_task
     if _warm_task is None or _warm_task.done():
         _warm_task = asyncio.create_task(vp_warmup_loop())
@@ -872,11 +873,12 @@ def start_vp_warmup():
 
 def _vp_caption(e) -> str:
     upd = datetime.fromtimestamp(e["ts"], tz=timezone.utc).strftime("%H:%M")
-    return (f"📊 *Volume Profile* · `{e['ticker']}/USDT` · `{e['tf']}`\n"
-            f"🟡 POC: `{_fmt_price(e['poc'])}`\n"
-            f"🔵 VAH: `{_fmt_price(e['vah'])}`  |  VAL: `{_fmt_price(e['val'])}`\n"
-            f"🕒 {e['n']} candles · {e['source']} · {upd} UTC\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
+    return (f"📊 *Volume Profile*\n"
+            f"`{e['ticker']}/USDT`  ·  `{e['tf']}`\n\n"
+            f"🟡 *POC* :  `{_fmt_price(e['poc'])}`\n\n"
+            f"🔵 *VAH* :  `{_fmt_price(e['vah'])}`\n"
+            f"🔵 *VAL* :  `{_fmt_price(e['val'])}`\n\n"
+            f"🕒 *Updated* :  `{upd} UTC`\n\n"
             f"{BRAND}")
 
 
@@ -1012,8 +1014,8 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             _, ticker, tf = data.split("_", 2)
             ticker = _clean_ticker(ticker)
             tf = tf if tf in _TF_MAPPING.values() else "1h"
-            png, source = await _make_chart(ticker, tf)
-            caption = _chart_caption(ticker, tf, source)
+            png, last = await _make_chart(ticker, tf)
+            caption = _chart_caption(ticker, tf, last)
             try:
                 await query.message.edit_media(
                     media=InputMediaPhoto(media=_png_file(png, f"{ticker}_{tf}.png"),
@@ -1048,6 +1050,14 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             raise
 
 
+# =====================================================================
+# /vf and /lh — shared helpers
+# =====================================================================
+_MUTED = (140, 140, 150)
+_WHITE = (255, 255, 255)
+_SUBTLE = (150, 150, 165)
+
+
 def _fmt_usd(v: float) -> str:
     a = abs(v)
     if a >= 1e9:
@@ -1059,15 +1069,39 @@ def _fmt_usd(v: float) -> str:
     return f"${v:,.0f}"
 
 
+def _fmt_cell(v: float) -> str:
+    """Very compact number for a footprint cell: 1.2K / 345 / 12.5 / 0.45"""
+    if v >= 1000:
+        return f"{v / 1000:.1f}K"
+    if v >= 100:
+        return f"{v:.0f}"
+    if v >= 10:
+        return f"{v:.1f}"
+    if v >= 1:
+        return f"{v:.1f}"
+    return f"{v:.2f}"
+
+
+def _vtext(img, cx, cy, s, font, fill):
+    """Text rotated 90° (reads bottom -> top), centred on (cx, cy)."""
+    from PIL import Image, ImageDraw
+    l, t, r, b = ImageDraw.Draw(img).textbbox((0, 0), s, font=font)
+    layer = Image.new("RGBA", (r + 6, b + 8), (0, 0, 0, 0))
+    ImageDraw.Draw(layer).text((3, 3), s, font=font, fill=tuple(fill) + (255,))
+    rot = layer.rotate(90, expand=True)
+    img.paste(rot, (int(cx - rot.width / 2), int(cy - rot.height / 2)), rot)
+
+
 # =====================================================================
-# /vf — VOLUME FOOTPRINT (last 200 candles)
-# Per-candle buy/sell volume at each price level, built from lower-timeframe
-# candles' taker buy/sell volume (Binance klines), so it is an approximation of
-# tick-level footprint but stays fast and light.
+# /vf — VOLUME FOOTPRINT (last 40 candles by default)
+#   /vf btc 1h   /vf eth 4h   /vf btc 1h 20   (10-60 candles; <=20 also prints numbers inside cells)
+# Each candle = red half (sell volume) | green half (buy volume) per price level,
+# a gold box on the candle's POC, a white box on open-close, and a Buy/Sell/Delta
+# table underneath. Built from 1m/5m/15m candles' taker buy/sell volume (Binance).
 # =====================================================================
-_VF_CANDLES = 200
-_VF_BINS = 100
-_VF_SUB = {"5m": "1m", "15m": "1m", "1h": "5m", "4h": "15m", "1d": "1h"}
+_VF_DEFAULT_N = 40
+_VF_MIN_N, _VF_MAX_N = 10, 60
+_VF_SUB = {"5m": "1m", "15m": "1m", "1h": "1m", "4h": "5m", "1d": "15m"}
 _TF_MS = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000}
 _VF_TTL = 90
 
@@ -1107,11 +1141,11 @@ def _fetch_klines_range(ticker: str, interval: str, start_ms: int, end_ms: int, 
     return rows
 
 
-def _compute_vf(ticker: str, tf: str):
-    parents, _src = _fetch_ohlcv_sync(ticker, tf, _VF_CANDLES)
-    if not parents or len(parents) < 30:
+def _compute_vf(ticker: str, tf: str, n_req: int):
+    parents, _src = _fetch_ohlcv_sync(ticker, tf, n_req)
+    if not parents or len(parents) < 10:
         return None
-    parents = sorted(parents, key=lambda r: r[0])
+    parents = sorted(parents, key=lambda r: r[0])[-n_req:]
     n = len(parents)
     pms = _TF_MS[tf]
     subs = _fetch_klines_range(ticker, _VF_SUB[tf], parents[0][0], parents[-1][0] + pms)
@@ -1122,9 +1156,9 @@ def _compute_vf(ticker: str, tf: str):
     hi = max(p[2] for p in parents)
     if hi <= lo:
         hi = lo * 1.0001 + 1e-12
-    pad = (hi - lo) * 0.02
+    pad = (hi - lo) * 0.03
     lo, hi = lo - pad, hi + pad
-    bins = _VF_BINS
+    bins = 36 if n <= 20 else 56
     step = (hi - lo) / bins
 
     buy = [[0.0] * bins for _ in range(n)]
@@ -1146,27 +1180,10 @@ def _compute_vf(ticker: str, tf: str):
             bb[j] += t / k
             ss[j] += sv / k
 
-    delta = [sum(buy[i]) - sum(sell[i]) for i in range(n)]
-    cvd, run = [], 0.0
-    for dl in delta:
-        run += dl
-        cvd.append(run)
+    cbuy = [sum(r) for r in buy]
+    csell = [sum(r) for r in sell]
     return {"parents": parents, "buy": buy, "sell": sell, "lo": lo, "hi": hi, "step": step, "bins": bins,
-            "delta": delta, "cvd": cvd,
-            "tot_buy": sum(sum(r) for r in buy), "tot_sell": sum(sum(r) for r in sell)}
-
-
-def _cell_color(b: float, s: float, ref: float):
-    t = b + s
-    if t <= 0:
-        return None
-    d = (b - s) / t
-    strength = 0.28 + 0.72 * min(1.0, (t / ref) ** 0.5)
-    base = _UP if d >= 0 else _DOWN
-    k = min(1.0, abs(d) * 1.7)
-    neutral = (120, 120, 130)
-    col = [neutral[i] + (base[i] - neutral[i]) * k for i in range(3)]
-    return tuple(int(_BG[i] + (col[i] - _BG[i]) * strength) for i in range(3))
+            "cbuy": cbuy, "csell": csell, "cdelta": [b - s for b, s in zip(cbuy, csell)]}
 
 
 def _render_vf_sync(vf, ticker: str, tf: str) -> bytes:
@@ -1174,19 +1191,21 @@ def _render_vf_sync(vf, ticker: str, tf: str) -> bytes:
 
     parents, buy, sell = vf["parents"], vf["buy"], vf["sell"]
     n, bins, lo, hi, step = len(parents), vf["bins"], vf["lo"], vf["hi"], vf["step"]
+    numbers = n <= 20
 
-    W, H = 1700, 1060
-    L, R = 30, 215
-    TOP, P_BOT = 140, 650
-    D_TOP, D_BOT = 685, 800
-    C_TOP, C_BOT = 835, 935
+    W, H = 1600, 1010
+    L, R = 90, 170
+    TOP, P_BOT = 140, 640
+    ROW_H = 66
+    T_TOP = P_BOT + 24
     plot_r = W - R
     cw = (plot_r - L) / n
 
     img = Image.new("RGB", (W, H), _BG)
     d = ImageDraw.Draw(img)
     f_title, f_sub = _font(36, True), _font(24, True)
-    f_lbl, f_tag = _font(17), _font(18, True)
+    f_lbl, f_tag, f_row = _font(17), _font(18, True), _font(17, True)
+    f_cell, f_tab, f_tab_s = _font(11), _font(14, True), _font(12, True)
 
     def py(p):
         return TOP + (hi - p) / (hi - lo) * (P_BOT - TOP)
@@ -1202,89 +1221,100 @@ def _render_vf_sync(vf, ticker: str, tf: str) -> bytes:
         if abs(y - ly) > 32:
             _text(d, (plot_r + 14, y), _fmt_price(p), f_lbl, _TXT, "lm")
 
-    totals = sorted(buy[i][j] + sell[i][j] for i in range(n) for j in range(bins) if buy[i][j] + sell[i][j] > 0)
-    ref = totals[int(len(totals) * 0.95)] if totals else 1.0
-    ref = ref or 1.0
+    side_vals = sorted(v for rows in (buy, sell) for r in rows for v in r if v > 0)
+    ref = (side_vals[int(len(side_vals) * 0.95)] if side_vals else 1.0) or 1.0
 
     for i in range(n):
-        x0, x1 = L + i * cw + 1, L + (i + 1) * cw - 1
+        o, c = parents[i][1], parents[i][4]
+        x0, x1 = L + i * cw + 1.5, L + (i + 1) * cw - 1.5
+        xm = (x0 + x1) / 2
         best_j, best_t = -1, 0.0
         for j in range(bins):
             b, s = buy[i][j], sell[i][j]
-            col = _cell_color(b, s, ref)
-            if col is None:
+            if b <= 0 and s <= 0:
                 continue
-            y0, y1 = py(lo + (j + 1) * step), py(lo + j * step)
-            d.rectangle([x0, y0, x1, max(y0 + 1, y1 - 1)], fill=col)
+            y0, y1 = py(lo + (j + 1) * step) + 0.5, py(lo + j * step) - 0.5
+            if y1 - y0 < 1:
+                y1 = y0 + 1
+            for v, xa, xb, base in ((s, x0, xm - 0.5, _DOWN), (b, xm + 0.5, x1, _UP)):
+                if v <= 0:
+                    continue
+                a = 0.18 + 0.82 * min(1.0, (v / ref) ** 0.6)
+                col = tuple(int(_BG[k] + (base[k] - _BG[k]) * a) for k in range(3))
+                d.rectangle([xa, y0, xb, y1], fill=col)
+                if numbers and y1 - y0 >= 11:
+                    _text(d, ((xa + xb) / 2, (y0 + y1) / 2), _fmt_cell(v), f_cell,
+                          (0, 0, 0) if a > 0.72 else (235, 235, 235), "mm")
             if b + s > best_t:
                 best_t, best_j = b + s, j
         if best_j >= 0:
             y0, y1 = py(lo + (best_j + 1) * step), py(lo + best_j * step)
             d.rectangle([x0, y0, x1, max(y0 + 1, y1 - 1)], outline=_GOLD, width=1)
+        by0, by1 = py(max(o, c)), py(min(o, c))
+        d.rectangle([x0 - 1, by0, x1 + 1, max(by0 + 1, by1)], outline=(225, 225, 230), width=1)
 
-    # delta bars
-    dmax = max(abs(x) for x in vf["delta"]) or 1.0
-    zero = (D_TOP + D_BOT) / 2
-    d.line([(L, zero), (plot_r, zero)], fill=_GRID, width=1)
-    for i, dl in enumerate(vf["delta"]):
-        h = abs(dl) / dmax * (D_BOT - D_TOP) / 2
-        x0, x1 = L + i * cw + 1, L + (i + 1) * cw - 1
-        if dl >= 0:
-            d.rectangle([x0, zero - h, x1, zero], fill=_UP)
-        else:
-            d.rectangle([x0, zero, x1, zero + h], fill=_DOWN)
-    _text(d, (L + 6, D_TOP + 6), "Delta", f_lbl, _TXT, "la")
+    # Buy / Sell / Delta table (one rotated number per candle)
+    table = (("Buy", vf["cbuy"], _UP), ("Sell", vf["csell"], _DOWN), ("Delta", vf["cdelta"], _WHITE))
+    for r, (label, arr, lcol) in enumerate(table):
+        ytop = T_TOP + r * ROW_H
+        yc = ytop + ROW_H / 2
+        d.line([(L, ytop), (plot_r, ytop)], fill=_GRID, width=1)
+        _text(d, (L - 14, yc), label, f_row, lcol, "rm")
+        for i, v in enumerate(arr):
+            if label == "Delta":
+                s, col = ("+" if v >= 0 else "") + _fmt_vol(v), (_UP if v >= 0 else _DOWN)
+            else:
+                s, col = _fmt_vol(v), lcol
+            f = f_tab if d.textlength(s, font=f_tab) <= ROW_H - 12 else f_tab_s
+            _vtext(img, L + (i + 0.5) * cw, yc, s, f, col)
+    d.line([(L, T_TOP + 3 * ROW_H), (plot_r, T_TOP + 3 * ROW_H)], fill=_GRID, width=1)
 
-    # cumulative delta line
-    cmin, cmax = min(vf["cvd"]), max(vf["cvd"])
-    cspan = (cmax - cmin) or 1.0
-    pts = [(L + (i + 0.5) * cw, C_BOT - (v - cmin) / cspan * (C_BOT - C_TOP)) for i, v in enumerate(vf["cvd"])]
-    d.line([(L, C_BOT), (plot_r, C_BOT)], fill=_GRID, width=1)
-    d.line(pts, fill=_BLUE, width=3)
-    _text(d, (L + 6, C_TOP + 6), "Cumulative Delta", f_lbl, _TXT, "la")
-    cv = vf["cvd"][-1]
-    _text(d, (plot_r + 14, pts[-1][1]), _fmt_vol(cv), f_tag, _UP if cv >= 0 else _DOWN, "lm")
-
-    # time labels
-    fmt = "%d %b" if tf == "1d" else "%d %b  %H:%M"
-    stp = max(1, n // 7)
-    for i in range(0, n, stp):
+    # time labels: HH:MM, date underneath when the day changes
+    y_lbl = T_TOP + 3 * ROW_H + 24
+    every = max(1, math.ceil(52 / cw))
+    prev_day = None
+    for i in sorted(range(n - 1, -1, -every)):
+        dt = datetime.fromtimestamp(parents[i][0] / 1000, tz=timezone.utc)
         x = L + (i + 0.5) * cw
-        lbl = datetime.fromtimestamp(parents[i][0] / 1000, tz=timezone.utc).strftime(fmt)
-        _text(d, (min(max(x, L + 55), plot_r - 55), C_BOT + 22), lbl, f_lbl, _TXT, "ma")
+        if tf == "1d":
+            _text(d, (x, y_lbl), dt.strftime("%d %b"), f_lbl, _TXT, "ma")
+            continue
+        _text(d, (x, y_lbl), dt.strftime("%H:%M"), f_lbl, _TXT, "ma")
+        if dt.day != prev_day:
+            _text(d, (x, y_lbl + 26), dt.strftime("%d %b"), f_lbl, _GOLD, "ma")
+            prev_day = dt.day
 
-    # last price
     d.line([(L, ly), (plot_r, ly)], fill=lc, width=1)
     tag = _fmt_price(last)
     d.rectangle([plot_r + 4, ly - 16, plot_r + 4 + d.textlength(tag, font=f_tag) + 24, ly + 16], fill=lc)
     _text(d, (plot_r + 16, ly), tag, f_tag, (0, 0, 0), "lm")
 
-    # header + legend
     title = f"{ticker}/USDT"
-    _text(d, (L, 72), title, f_title, _WHITE, "ls")
-    _text(d, (L + d.textlength(title, font=f_title) + 20, 72), f"Volume Footprint  ·  {tf}", f_sub, (150, 150, 165), "ls")
-    lx = L
-    for col, label in ((_UP, "Buy dominant"), (_DOWN, "Sell dominant"), (_GOLD, "POC of candle")):
+    _text(d, (L - 60, 72), title, f_title, _WHITE, "ls")
+    _text(d, (L - 60 + d.textlength(title, font=f_title) + 20, 72), f"Volume Footprint  ·  {tf}", f_sub, _SUBTLE, "ls")
+    lx = L - 60
+    for col, label in ((_DOWN, "Sell volume"), (_UP, "Buy volume"), (_GOLD, "POC of candle")):
         d.rectangle([lx, 104, lx + 18, 122], fill=col)
         _text(d, (lx + 30, 113), label, f_lbl, _TXT, "lm")
         lx += 30 + d.textlength(label, font=f_lbl) + 46
-    _text(d, (L, H - 52), "powered by - BELUGA.PY", f_lbl, _MUTED, "la")
+    _text(d, (L - 60, H - 52), "powered by - BELUGA.PY", f_lbl, _MUTED, "la")
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
 
 
-def _build_vf_sync(ticker: str, tf: str):
-    vf = _compute_vf(ticker, tf)
+def _build_vf_sync(ticker: str, tf: str, n: int):
+    vf = _compute_vf(ticker, tf, n)
     if not vf:
         return None
     return {"png": _render_vf_sync(vf, ticker, tf), "ts": time.time(), "ticker": ticker, "tf": tf,
-            "buy": vf["tot_buy"], "sell": vf["tot_sell"]}
+            "buy": sum(vf["cbuy"]), "sell": sum(vf["csell"]),
+            "lbuy": vf["cbuy"][-1], "lsell": vf["csell"][-1]}
 
 
-async def _get_vf(ticker: str, tf: str):
-    key = (ticker, tf)
+async def _get_vf(ticker: str, tf: str, n: int):
+    key = (ticker, tf, n)
     e = _vf_cache.get(key)
     if e and time.time() - e["ts"] < _VF_TTL:
         return e
@@ -1293,7 +1323,7 @@ async def _get_vf(ticker: str, tf: str):
         if e and time.time() - e["ts"] < _VF_TTL:
             return e
         loop = asyncio.get_running_loop()
-        new = await loop.run_in_executor(None, lambda: _build_vf_sync(ticker, tf))
+        new = await loop.run_in_executor(None, lambda: _build_vf_sync(ticker, tf, n))
         if new:
             _vf_cache[key] = new
             if len(_vf_cache) > 30:
@@ -1303,41 +1333,57 @@ async def _get_vf(ticker: str, tf: str):
         return e
 
 
+def _signed(v: float) -> str:
+    return ("+" if v >= 0 else "-") + _fmt_vol(abs(v))
+
+
 def _vf_caption(e) -> str:
-    delta = e["buy"] - e["sell"]
     upd = datetime.fromtimestamp(e["ts"], tz=timezone.utc).strftime("%H:%M")
     return (f"🗺 *Volume Footprint*\n"
             f"`{e['ticker']}/USDT`  ·  `{e['tf']}`\n\n"
-            f"🟢 *Buy Volume* :  `{_fmt_vol(e['buy'])}`\n\n"
-            f"🔴 *Sell Volume* :  `{_fmt_vol(e['sell'])}`\n\n"
-            f"⚖️ *Delta* :  `{'+' if delta >= 0 else '-'}{_fmt_vol(abs(delta))}`\n\n"
+            f"🕯 *Current Candle*\n"
+            f"🟢 Buy :  `{_fmt_vol(e['lbuy'])}`\n"
+            f"🔴 Sell :  `{_fmt_vol(e['lsell'])}`\n"
+            f"⚖️ Delta :  `{_signed(e['lbuy'] - e['lsell'])}`\n\n"
+            f"📊 *Total*\n"
+            f"🟢 Buy :  `{_fmt_vol(e['buy'])}`\n"
+            f"🔴 Sell :  `{_fmt_vol(e['sell'])}`\n"
+            f"⚖️ Delta :  `{_signed(e['buy'] - e['sell'])}`\n\n"
             f"🕒 *Updated* :  `{upd} UTC`\n\n"
             f"{BRAND}")
 
 
+def _parse_vf(tokens):
+    ticker, tf, n = "BTC", "1h", _VF_DEFAULT_N
+    rest = list(tokens)
+    if rest and not rest[0].isdigit() and not _tf_of(rest[0]):
+        ticker = _clean_ticker(rest.pop(0))
+    for tok in rest:
+        if _tf_of(tok):
+            tf = _tf_of(tok)
+        elif tok.isdigit():
+            n = max(_VF_MIN_N, min(_VF_MAX_N, int(tok)))
+    return ticker, tf, n
+
+
 async def crypto_vf_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """/vf <coin> <tf>  e.g. /vf btc 1h   (tf: 5m, 15m, 1h, 4h, 1d)"""
+    """/vf <coin> <tf> [candles]   e.g. /vf btc 1h, /vf btc 4h, /vf eth 1h 20"""
     if not u.message:
         return
     sm = None
     try:
-        tokens = (u.message.text or "").split()[1:]
-        if len(tokens) == 1 and _tf_of(tokens[0]):
-            ticker, tf = "BTC", _tf_of(tokens[0])
-        else:
-            ticker = _clean_ticker(tokens[0]) if tokens else "BTC"
-            tf = next((_tf_of(t) for t in tokens[1:] if _tf_of(t)), "1h")
+        ticker, tf, n = _parse_vf((u.message.text or "").split()[1:])
         if tf not in _VF_SUB:
             await u.message.reply_text("⚠️ Footprint timeframes:\n\n`5m`  `15m`  `1h`  `4h`  `1d`",
                                        parse_mode=ParseMode.MARKDOWN)
             return
         await safe_react(c.bot, u.effective_chat.id, u.message.message_id, "⚡")
 
-        e = _vf_cache.get((ticker, tf))
+        e = _vf_cache.get((ticker, tf, n))
         if not (e and time.time() - e["ts"] < _VF_TTL):
             sm = await u.message.reply_text(
                 f"⏳ Building footprint for *{ticker}/USDT* (`{tf}`)...", parse_mode=ParseMode.MARKDOWN)
-        e = await asyncio.wait_for(_get_vf(ticker, tf), timeout=90)
+        e = await asyncio.wait_for(_get_vf(ticker, tf, n), timeout=90)
         if not e:
             raise ValueError(f"No data for {ticker}/USDT")
         await u.message.reply_photo(photo=_png_file(e["png"], f"VF_{ticker}_{tf}.png"),
@@ -1360,17 +1406,19 @@ async def crypto_vf_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 
 # =====================================================================
-# /lh — LIQUIDITY HEATMAP (order-book depth collected over time)
-# A background task snapshots the Binance order book every ~30s and keeps 12h.
-# The heatmap = those snapshots stacked in time, with candles drawn on top.
+# /lh — LIQUIDITY HEATMAP (order-book depth collected over time), default 1D
+# A background task snapshots the Binance order book every ~30s and keeps 26h.
+# The heatmap = those snapshots stacked in time, with thin candles on top.
+# Only clearly large resting orders are coloured; small noise stays dark (clean look).
 # History lives in memory, so after a restart it fills up again from zero.
 # =====================================================================
 _LH_CORE = ["BTC", "ETH", "SOL", "XAU"]
 _LH_INTERVAL = 30
-_LH_KEEP_SEC = 12 * 3600
+_LH_KEEP_SEC = 26 * 3600
 _LH_EXTRA_MAX = 4
 _LH_EXTRA_IDLE = 6 * 3600
-_LH_WINDOWS = {"1h": 1, "2h": 2, "4h": 4, "6h": 6, "12h": 12}
+_LH_WINDOWS = {"1h": 1, "2h": 2, "4h": 4, "6h": 6, "12h": 12, "1d": 24, "24h": 24}
+_LH_DEFAULT_H = 24
 _LH_TTL = 45
 
 _lh_widths = {}      # ticker -> price bucket width
@@ -1379,8 +1427,8 @@ _lh_extra = {}       # ticker -> last requested ts (non-core coins being tracked
 _lh_cache = {}
 _lh_task = None
 
-_CMAP = [(0.0, (10, 8, 32)), (0.18, (45, 20, 115)), (0.40, (25, 95, 170)),
-         (0.62, (20, 185, 170)), (0.82, (150, 225, 70)), (1.0, (255, 235, 60))]
+_CMAP = [(0.0, (16, 18, 36)), (0.25, (28, 52, 110)), (0.55, (32, 140, 170)),
+         (0.80, (120, 210, 150)), (1.0, (250, 225, 90))]
 
 
 def _cmap(x: float):
@@ -1393,6 +1441,10 @@ def _cmap(x: float):
 
 
 _LUT = [_cmap(i / 255) for i in range(256)]
+
+
+def _win_label(h: int) -> str:
+    return "1D" if h == 24 else f"{h}h"
 
 
 def _nice_width(price: float) -> float:
@@ -1466,8 +1518,7 @@ async def lh_collector_loop():
 
 
 def start_lh_collector():
-    """Call once inside the running event loop. Returns the task (cancel it on shutdown).
-    (start_vp_warmup() already calls this, so bot.py doesn't need to.)"""
+    """Starts the order-book collector once (start_vp_warmup() already calls this)."""
     global _lh_task
     if _lh_task is None or _lh_task.done():
         _lh_task = asyncio.create_task(lh_collector_loop())
@@ -1504,15 +1555,22 @@ def _walls(snap, w: float):
 
 
 def _pick_interval(span_sec: float):
-    want = span_sec / 60 / 90
+    want = span_sec / 60 / 100
     for mins, name in ((1, "1m"), (3, "3m"), (5, "5m"), (15, "15m"), (30, "30m"), (60, "1h")):
         if mins >= want:
             return mins * 60, name
     return 3600, "1h"
 
 
+def _dashed_line(d, x1, x2, y, color=(255, 255, 255), dash=10, gap=6):
+    x = x1
+    while x < x2:
+        d.line([(x, y), (min(x + dash, x2), y)], fill=color, width=1)
+        x += dash + gap
+
+
 def _render_lh_sync(ticker: str, window_h: int, snaps, candles, interval_sec: int, w: float) -> bytes:
-    from PIL import Image, ImageDraw
+    from PIL import Image, ImageDraw, ImageFilter
 
     t1 = snaps[-1][0]
     t0 = max(snaps[0][0], t1 - window_h * 3600)
@@ -1525,7 +1583,7 @@ def _render_lh_sync(ticker: str, window_h: int, snaps, candles, interval_sec: in
     cand = [c for c in candles if t0 - interval_sec <= c[0] / 1000 <= t1 + interval_sec]
     ylo = min([c[3] for c in cand] + [mid_last])
     yhi = max([c[2] for c in cand] + [mid_last])
-    pad = (yhi - ylo) * 0.15 + mid_last * 0.001
+    pad = (yhi - ylo) * 0.12 + mid_last * 0.001
     ylo, yhi = ylo - pad, yhi + pad
 
     idx_lo, idx_hi = int(ylo // w), int(yhi // w)
@@ -1559,18 +1617,23 @@ def _render_lh_sync(ticker: str, window_h: int, snaps, candles, interval_sec: in
         else:
             last = cols[c]
 
+    # clean look: small orders stay dark, only clearly large resting orders glow
     vals.sort()
-    ref = vals[int(len(vals) * 0.97)] if vals else 1.0
-    ref = ref or 1.0
-    k_log = math.log1p(25.0)
-
+    floor = vals[int(len(vals) * 0.55)] if vals else 0.0
+    top = vals[int(len(vals) * 0.985)] if vals else 1.0
+    if top <= floor:
+        top = floor * 1.5 + 1.0
     bg = _LUT[0]
     pix = []
     for r in range(nrows - 1, -1, -1):
         for c in range(ncols):
             col = cols[c]
             v = col.get(r, 0.0) if col else 0.0
-            pix.append(bg if v <= 0 else _LUT[min(255, int(math.log1p(v / ref * 25.0) / k_log * 255))])
+            if v <= floor:
+                pix.append(bg)
+            else:
+                x = min(1.0, (v - floor) / (top - floor)) ** 1.5
+                pix.append(_LUT[int(x * 255)])
 
     W, H = 1500, 900
     L, plot_r = 30, 1150
@@ -1584,7 +1647,8 @@ def _render_lh_sync(ticker: str, window_h: int, snaps, candles, interval_sec: in
 
     hm = Image.new("RGB", (ncols, nrows))
     hm.putdata(pix)
-    img.paste(hm.resize((plot_w, plot_h), Image.Resampling.BILINEAR), (L, TOP))
+    hm = hm.resize((plot_w, plot_h), Image.Resampling.BILINEAR).filter(ImageFilter.GaussianBlur(1.1))
+    img.paste(hm, (L, TOP))
 
     def py(p):
         return TOP + (hi_ax - p) / (hi_ax - lo_ax) * plot_h
@@ -1592,20 +1656,20 @@ def _render_lh_sync(ticker: str, window_h: int, snaps, candles, interval_sec: in
     def px(ts_sec):
         return L + (ts_sec - t0) / span * plot_w
 
-    # candles on top of the heatmap
-    cwpx = max(2.0, interval_sec / span * plot_w * 0.62)
+    # thin candles (white = up, dark with white outline = down)
+    cwpx = min(7.0, max(2.0, interval_sec / span * plot_w * 0.55))
     for ts, o, h, l, c, _v, *_r in cand:
         x = px(ts / 1000 + interval_sec / 2)
         if x < L - cwpx or x > plot_r + cwpx:
             continue
-        col = (0, 235, 150) if c >= o else (255, 70, 110)
-        d.line([(x, py(h)), (x, py(l))], fill=(235, 235, 235), width=1)
+        d.line([(x, py(h)), (x, py(l))], fill=(225, 225, 232), width=1)
         y1, y2 = py(max(o, c)), py(min(o, c))
         if y2 - y1 < 1:
             y2 = y1 + 1
-        d.rectangle([x - cwpx / 2, y1, x + cwpx / 2, y2], fill=col, outline=(0, 0, 0))
+        up = c >= o
+        d.rectangle([x - cwpx / 2, y1, x + cwpx / 2, y2],
+                    fill=(240, 240, 245) if up else (12, 12, 18), outline=(240, 240, 245))
 
-    # axes: price labels, time labels, last price
     ly = py(mid_last)
     for i in range(7):
         p = lo_ax + (hi_ax - lo_ax) * i / 6
@@ -1613,41 +1677,31 @@ def _render_lh_sync(ticker: str, window_h: int, snaps, candles, interval_sec: in
         d.line([(plot_r, y), (plot_r + 8, y)], fill=_TXT, width=1)
         if abs(y - ly) > 32:
             _text(d, (plot_r + 16, y), _fmt_price(p), f_lbl, _TXT, "lm")
-    tfmt = "%H:%M" if span <= 20 * 3600 else "%d %b %H:%M"
-    for i in range(6):
-        ts = t0 + span * i / 5
-        lbl = datetime.fromtimestamp(ts, tz=timezone.utc).strftime(tfmt)
-        _text(d, (min(max(px(ts), L + 40), plot_r - 40), BOT + 20), lbl, f_lbl, _TXT, "ma")
+    tfmt = "%H:%M" if span <= 20 * 3600 else "%d %b  %H:%M"
+    for k in range(5):
+        ts = t0 + span * (k + 0.5) / 5
+        _text(d, (px(ts), BOT + 22), datetime.fromtimestamp(ts, tz=timezone.utc).strftime(tfmt), f_lbl, _TXT, "ma")
 
     _dashed_line(d, L, plot_r, ly)
     tag = _fmt_price(mid_last)
     d.rectangle([plot_r + 6, ly - 16, plot_r + 6 + d.textlength(tag, font=f_tag) + 24, ly + 16], fill=_WHITE)
     _text(d, (plot_r + 18, ly), tag, f_tag, (0, 0, 0), "lm")
 
-    # colour bar
     bx0, bx1 = 1415, 1440
     for y in range(TOP, BOT):
-        x = 1 - (y - TOP) / plot_h
-        d.line([(bx0, y), (bx1, y)], fill=_LUT[int(x * 255)], width=1)
-    _text(d, ((bx0 + bx1) / 2, TOP - 14), "High", f_lbl, _TXT, "ms")
-    _text(d, ((bx0 + bx1) / 2, BOT + 28), "Low", f_lbl, _TXT, "ms")
+        d.line([(bx0, y), (bx1, y)], fill=_LUT[int((1 - (y - TOP) / plot_h) * 255)], width=1)
+    _text(d, ((bx0 + bx1) / 2, TOP - 16), "High", f_lbl, _TXT, "ms")
+    _text(d, ((bx0 + bx1) / 2, BOT + 32), "Low", f_lbl, _TXT, "ms")
 
     title = f"{ticker}/USDT"
     _text(d, (L, 72), title, f_title, _WHITE, "ls")
-    _text(d, (L + d.textlength(title, font=f_title) + 20, 72), f"Liquidity Heatmap  ·  {window_h}h", f_sub, (150, 150, 165), "ls")
-    _text(d, (L, 112), "Bright = large resting orders", f_lbl, _MUTED, "lm")
+    _text(d, (L + d.textlength(title, font=f_title) + 20, 72), f"Liquidity Heatmap  ·  {_win_label(window_h)}", f_sub, _SUBTLE, "ls")
+    _text(d, (L, 112), "Bright bands = large resting orders", f_lbl, _MUTED, "lm")
     _text(d, (L, H - 52), "powered by - BELUGA.PY", f_lbl, _MUTED, "la")
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
-
-
-def _dashed_line(d, x1, x2, y, color=(255, 255, 255), dash=10, gap=6):
-    x = x1
-    while x < x2:
-        d.line([(x, y), (min(x + dash, x2), y)], fill=color, width=1)
-        x += dash + gap
 
 
 def _build_lh_sync(ticker: str, window_h: int, snaps):
@@ -1669,10 +1723,12 @@ def _build_lh_sync(ticker: str, window_h: int, snaps):
 def _lh_caption(e) -> str:
     upd = datetime.fromtimestamp(e["ts"], tz=timezone.utc).strftime("%H:%M")
     note = ""
-    if e["span"] < 1800:
-        note = "⏳ History abhi build ho rahi hai, heatmap time ke saath aur bharega.\n\n"
+    if e["span"] < e["window"] * 3600 * 0.9:
+        hrs, mins = int(e["span"] // 3600), int(e["span"] % 3600 // 60)
+        have = f"{hrs}h {mins}m" if hrs else f"{mins}m"
+        note = f"⏳ Abhi {have} ka data jama hua hai, {_win_label(e['window'])} poora hone me time lagega.\n\n"
     return (f"🔥 *Liquidity Heatmap*\n"
-            f"`{e['ticker']}/USDT`  ·  `{e['window']}h`\n\n"
+            f"`{e['ticker']}/USDT`  ·  `{_win_label(e['window'])}`\n\n"
             f"🟢 *Biggest Bid Wall* :  `{_fmt_price(e['bid'][0])}`  ·  `{_fmt_usd(e['bid'][1])}`\n\n"
             f"🔴 *Biggest Ask Wall* :  `{_fmt_price(e['ask'][0])}`  ·  `{_fmt_usd(e['ask'][1])}`\n\n"
             f"{note}"
@@ -1682,16 +1738,16 @@ def _lh_caption(e) -> str:
 
 def _parse_lh(tokens):
     if not tokens:
-        return "BTC", 4
+        return "BTC", _LH_DEFAULT_H
     if len(tokens) == 1 and tokens[0].lower() in _LH_WINDOWS:
         return "BTC", _LH_WINDOWS[tokens[0].lower()]
     ticker = _clean_ticker(tokens[0])
-    window = next((_LH_WINDOWS[t.lower()] for t in tokens[1:] if t.lower() in _LH_WINDOWS), 4)
+    window = next((_LH_WINDOWS[t.lower()] for t in tokens[1:] if t.lower() in _LH_WINDOWS), _LH_DEFAULT_H)
     return ticker, window
 
 
 async def crypto_lh_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """/lh <coin> <window>  e.g. /lh btc, /lh eth 12h   (window: 1h 2h 4h 6h 12h, default 4h)"""
+    """/lh <coin> [window]  e.g. /lh btc (default 1D), /lh eth 4h   (window: 1h 2h 4h 6h 12h 1d)"""
     if not u.message:
         return
     try:
@@ -1731,7 +1787,7 @@ async def crypto_lh_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 for k in sorted(_lh_cache, key=lambda k: _lh_cache[k]["ts"])[:10]:
                     _lh_cache.pop(k, None)
 
-        await u.message.reply_photo(photo=_png_file(e["png"], f"LH_{ticker}_{window}h.png"),
+        await u.message.reply_photo(photo=_png_file(e["png"], f"LH_{ticker}_{_win_label(window)}.png"),
                                     caption=_lh_caption(e), parse_mode=ParseMode.MARKDOWN)
     except BaseException as e:
         _log_exc("[crypto_lh]", e)
