@@ -67,12 +67,13 @@ from handlers.crypto import (
     crypto_lh_handler,
     crypto_movers_handler,
     crypto_price_handler,
-    crypto_vf_handler,
     crypto_vp_handler,
+    crypto_vf_handler,
     init_exchange_async,
     start_vp_warmup,
 )
 from handlers.events import my_chat_member_handler, revival_loop, welcome_handler
+from handlers.trades import analytics_handler, backtest_handler, paper_handler, start_trades_engine
 from handlers.fun import fun_dispatcher, pump_dump_handler
 from handlers.games import (
     cleanup_expired_games,
@@ -180,6 +181,9 @@ async def main():
     app.add_handler(CommandHandler("vp", crypto_vp_handler))
     app.add_handler(CommandHandler("vf", crypto_vf_handler))
     app.add_handler(CommandHandler("lh", crypto_lh_handler))
+    app.add_handler(CommandHandler("analytics", analytics_handler))   # owner only
+    app.add_handler(CommandHandler("backtest", backtest_handler))     # owner only
+    app.add_handler(CommandHandler("paper", paper_handler))           # owner only
     # Plain-text "chart btc 1h" (no slash). Own group (-3) so media_reply_question_handler in
     # group 0 can't shadow it; the handler raises ApplicationHandlerStop so the AI chat
     # handlers don't also answer the same message.
@@ -289,7 +293,8 @@ async def main():
     cleanup_task = asyncio.create_task(cleanup_expired_games())
     sync_task = asyncio.create_task(periodic_sync())
     exchange_task = asyncio.create_task(init_exchange_async())
-    vp_task = start_vp_warmup()  # background volume-profile cache (BTC/ETH/SOL/XAU) + /lh collector
+    vp_task = start_vp_warmup()  # background volume-profile cache (BTC/ETH/SOL/XAU)
+    trades_task = start_trades_engine(app.bot)  # BTC/Gold signal scanner + paper trading (DMs the owner only)
     revival_task = asyncio.create_task(revival_loop(app))
     cleanup_mongo_task = asyncio.create_task(mongo_cleanup_loop())
 
@@ -300,6 +305,7 @@ async def main():
     sync_task.cancel()
     if vp_task:
         vp_task.cancel()
+    trades_task.cancel()
     bot_status["running"] = False
     for fn in [app.updater.stop, app.stop, app.shutdown, http_runner.cleanup]:
         try:
