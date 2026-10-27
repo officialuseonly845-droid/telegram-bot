@@ -3,7 +3,8 @@ trades.py — BTC / Gold futures scalping signal engine (Binance free public dat
 
 What it does
   1. Pulls 5m candles from Binance public REST (no API key).
-  2. Two rule-based strategy families (momentum breakout, trend pullback) -> LONG / SHORT signals
+  2. Strategy families: C = FVG / Order-Block retest scalp (default, many trades), A = momentum breakout,
+     B = trend pullback (slower, $400-target) -> LONG / SHORT signals
      with entry, stop-loss, take-profit and a plain-language explanation.
   3. Backtester (fees + slippage, SL-first on ambiguous candles, next-candle-open entries, no look-ahead)
      + walk-forward optimizer: picks parameters on the first 60% of history and checks them on the unseen 40%.
@@ -49,6 +50,7 @@ SYMBOLS = {
 ALIASES = {"BTC": "BTC", "BITCOIN": "BTC", "XAU": "XAU", "GOLD": "XAU", "XAUUSD": "XAU", "PAXG": "XAU"}
 
 FEE = 0.0004             # taker fee per side (futures)
+FEE_MAKER = 0.0002       # limit-order fee (take-profit orders)
 SLIP = 0.0001            # slippage per side
 RISK = 0.01              # risk per trade, fraction of equity
 LEV_CAP = 10.0           # max leverage used when sizing
@@ -61,13 +63,18 @@ MIN_TRAIN_TRADES = 12
 VALID_MIN_TEST_TRADES = 8
 VALID_MIN_PF = 1.15
 VALID_MIN_EXP = 0.05     # expectancy in R on unseen data
-SEND_UNVALIDATED = False  # True = also DM signals from configs that failed validation (not recommended)
+SEND_UNVALIDATED = False  # True = DM unvalidated signals as normal signals (not recommended)
+PRACTICE_MODE = True     # unvalidated strategy still trades on PAPER and DMs signals tagged PRACTICE
+MAX_DAILY_SIGNALS = 15   # per market per UTC day
+ACTIVE_FAMILIES = ("C",)  # "C" = FVG/OB scalp (many trades). Add "A", "B" for the slower $400-target strategies
+SCALP_MIN_TP = {"BTC": 120.0, "XAU": 8.0}   # minimum take-profit for scalps in USD (gold: 80 pips @ $0.10)
 SCAN_EVERY = 30          # seconds between scanner loops
 OPTIMIZE_EVERY = 6 * 3600
 PAPER_START = 1000.0
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trades_state.json")
 
-DEFAULT_CFG = {"family": "A", "n": 48, "vol": 1.2, "k_sl": 1.8, "k_tp": 4.0, "min_atr_f": 0.0}
+DEFAULT_CFG = {"family": "C", "zone": "BOTH", "rr": 1.5, "trend": "fast", "disp": 1.0, "gap": 0.15,
+               "fresh": True, "look": 24, "cool": 2, "hold": 36}
 
 _state = {"cfg": {}, "paper": None, "hist": {}}
 _engine_task = None
@@ -243,13 +250,125 @@ def _sig_pullback(ind, i, p, min_tp):
     return None
 
 
+def _money(x):
+    return f"${x:,.2f}" if x < 50 else f"${x:,.0f}"
+
+
+def _smc_zone(ind, i, p, a, bull, need_retest=True):
+    """Most recent fresh FVG / Order Block in the trade direction.
+    need_retest=True : only a zone that bar i is retesting right now (with a rejection close) -> entry signal.
+    need_retest=False: nearest fresh zone waiting on the right side of price (used by /analytics 'watching').
+    Returns (lo, hi, kind, age_in_candles) or None. Uses candles <= i only."""
+    h, l, o, c = ind.h, ind.l, ind.o, ind.c
+    fresh = p.get("fresh", True)
+    disp = p["disp"] * a
+    gap_min = p.get("gap", 0.15) * a
+    use_fvg = p["zone"] in ("FVG", "BOTH")
+    use_ob = p["zone"] in ("OB", "BOTH")
+    end = i if need_retest else i + 1                 # candles that must not have used the zone already
+    for j in range(i - 2, max(i - p.get("look", 24), 6) - 1, -1):    # j = impulse candle (middle of the FVG)
+        body = (c[j] - o[j]) if bull else (o[j] - c[j])
+        if body < disp:
+            continue
+        zones = []
+        if use_fvg:
+            lo_g, hi_g = (h[j - 1], l[j + 1]) if bull else (h[j + 1], l[j - 1])
+            if hi_g - lo_g >= gap_min:
+                zones.append((lo_g, hi_g, "FVG", j + 2))
+        if use_ob:
+            if bull and c[j] > max(h[j - 5:j]):                         # impulse also breaks the recent high
+                m = next((k for k in range(j - 1, j - 5, -1) if c[k] < o[k]), None)   # last bearish candle
+                if m is not None:
+                    zones.append((l[m], o[m], "OB", j + 1))
+            if (not bull) and c[j] < min(l[j - 5:j]):
+                m = next((k for k in range(j - 1, j - 5, -1) if c[k] > o[k]), None)   # last bullish candle
+                if m is not None:
+                    zones.append((o[m], h[m], "OB", j + 1))
+        for lo_z, hi_z, kind, start in zones:
+            if hi_z <= lo_z:
+                continue
+            ok = True
+            for k in range(start, end):
+                if bull and (c[k] < lo_z or (fresh and l[k] <= hi_z)):
+                    ok = False
+                    break
+                if (not bull) and (c[k] > hi_z or (fresh and h[k] >= lo_z)):
+                    ok = False
+                    break
+            if not ok:
+                continue
+            if not need_retest:
+                if (bull and hi_z < c[i]) or ((not bull) and lo_z > c[i]):
+                    return lo_z, hi_z, kind, i - j
+                continue
+            if bull and l[i] <= hi_z and l[i] >= lo_z - 0.3 * a and c[i] > (lo_z + hi_z) / 2:
+                return lo_z, hi_z, kind, i - j
+            if (not bull) and h[i] >= lo_z and h[i] <= hi_z + 0.3 * a and c[i] < (lo_z + hi_z) / 2:
+                return lo_z, hi_z, kind, i - j
+    return None
+
+
+def _sig_smc(ind, i, p, min_tp):
+    """Family C — easy scalp: trade WITH the trend when price comes back into a fresh FVG / Order Block
+    and a rejection candle closes away from it. Many setups per day."""
+    a, e21, e50, e200 = ind.atr[i], ind.ema21[i], ind.ema50[i], ind.ema200[i]
+    if None in (a, e21, e50, e200) or a <= 0:
+        return None
+    o, h, l, c = ind.o[i], ind.h[i], ind.l[i], ind.c[i]
+    rng = h - l
+    if rng <= 0:
+        return None
+    if p["trend"] == "fast":
+        up, dn = e21 > e50 and c > e50, e21 < e50 and c < e50
+        trend_up, trend_dn = "EMA21 above EMA50", "EMA21 below EMA50"
+    else:
+        up, dn = e50 > e200 and c > e50, e50 < e200 and c < e50
+        trend_up, trend_dn = "EMA50 above EMA200", "EMA50 below EMA200"
+    rsi = ind.rsi[i] or 0.0
+    if up and c > o and (c - l) / rng >= 0.55:
+        z = _smc_zone(ind, i, p, a, True)
+        if z:
+            lo_z, hi_z, kind, age = z
+            sl_d = min(max(c - (min(lo_z, l) - 0.2 * a), 0.8 * a), 2.5 * a)
+            tp_d = max(min_tp, p["rr"] * sl_d)
+            what = "Bullish FVG (imbalance gap)" if kind == "FVG" else "Bullish Order Block (last red candle before the rally)"
+            return {"side": "LONG", "sl_d": sl_d, "tp_d": tp_d, "atr": a, "rsi": rsi, "reasons": [
+                f"Trend UP: {trend_up}",
+                f"{what} formed {age} candles ago: zone {_fmt_price(lo_z)} - {_fmt_price(hi_z)}",
+                "Price came back into the zone and a bullish candle closed back above it (rejection)",
+                f"Stop under the zone (risk {_money(sl_d)}), target {p['rr']}R or the minimum scalp move"]}
+    if dn and c < o and (h - c) / rng >= 0.55:
+        z = _smc_zone(ind, i, p, a, False)
+        if z:
+            lo_z, hi_z, kind, age = z
+            sl_d = min(max((max(hi_z, h) + 0.2 * a) - c, 0.8 * a), 2.5 * a)
+            tp_d = max(min_tp, p["rr"] * sl_d)
+            what = "Bearish FVG (imbalance gap)" if kind == "FVG" else "Bearish Order Block (last green candle before the drop)"
+            return {"side": "SHORT", "sl_d": sl_d, "tp_d": tp_d, "atr": a, "rsi": rsi, "reasons": [
+                f"Trend DOWN: {trend_dn}",
+                f"{what} formed {age} candles ago: zone {_fmt_price(lo_z)} - {_fmt_price(hi_z)}",
+                "Price came back into the zone and a bearish candle closed back below it (rejection)",
+                f"Stop above the zone (risk {_money(sl_d)}), target {p['rr']}R or the minimum scalp move"]}
+    return None
+
+
 def signal_at(ind, i, cfg, min_tp):
     if i < WARMUP:
         return None
-    return _sig_breakout(ind, i, cfg, min_tp) if cfg["family"] == "A" else _sig_pullback(ind, i, cfg, min_tp)
+    fam = cfg["family"]
+    if fam == "C":
+        return _sig_smc(ind, i, cfg, min_tp)
+    return _sig_breakout(ind, i, cfg, min_tp) if fam == "A" else _sig_pullback(ind, i, cfg, min_tp)
+
+
+def _min_tp(sym, cfg):
+    return SCALP_MIN_TP[sym] if cfg["family"] == "C" else SYMBOLS[sym]["min_tp"]
 
 
 def cfg_name(cfg):
+    if cfg["family"] == "C":
+        return (f"SMC Scalp ({cfg['zone']} retest, RR {cfg['rr']}, {cfg['trend']} trend, "
+                f"impulse {cfg['disp']}xATR)")
     if cfg["family"] == "A":
         s = f"Momentum Breakout ({cfg['n']}-bar high, vol>={cfg['vol']}x, SL {cfg['k_sl']}xATR, TP {cfg['k_tp']}xATR"
     else:
@@ -271,7 +390,13 @@ def _grid():
                 for vol in (0.0, 0.9):
                     for f in (0.0, 0.25):
                         out.append({"family": "B", "rr": rr, "touch": touch, "rsi_lo": rsi_lo, "vol": vol, "min_atr_f": f})
-    return out
+    for zone in ("FVG", "OB", "BOTH"):
+        for rr in (1.0, 1.5, 2.0):
+            for trend in ("fast", "slow"):
+                for disp in (0.8, 1.2):
+                    out.append({"family": "C", "zone": zone, "rr": rr, "trend": trend, "disp": disp, "gap": 0.15,
+                                "fresh": True, "look": 24, "cool": 2, "hold": 36})
+    return [g for g in out if g["family"] in ACTIVE_FAMILIES]
 
 
 # ----------------------------------------------------------------------------- backtester
@@ -290,7 +415,7 @@ def run_backtest(ind, cfg, min_tp, lo_i, hi_i):
         entry = ind.o[ei] * (1 + SLIP if long else 1 - SLIP)
         sl = entry - sig["sl_d"] if long else entry + sig["sl_d"]
         tp = entry + sig["tp_d"] if long else entry - sig["tp_d"]
-        last = min(hi_i - 1, ei + MAX_HOLD_BARS)
+        last = min(hi_i - 1, ei + cfg.get("hold", MAX_HOLD_BARS))
         j, exit_px, why = ei, None, "TIME"
         while j <= last:
             hit_sl = ind.l[j] <= sl if long else ind.h[j] >= sl
@@ -306,10 +431,10 @@ def run_backtest(ind, cfg, min_tp, lo_i, hi_i):
             j = last
             exit_px = ind.c[j]
         gross = (exit_px - entry) if long else (entry - exit_px)
-        net = gross - entry * (2 * FEE + SLIP)
+        net = gross - (entry * FEE + exit_px * (FEE_MAKER if why == "TP" else FEE + SLIP))
         trades.append({"i": ei, "j": j, "side": sig["side"], "entry": entry, "exit": exit_px, "why": why,
                        "R": net / sig["sl_d"], "usd": net, "sl_pct": sig["sl_d"] / entry, "bars": j - ei + 1})
-        i = j + COOLDOWN_BARS
+        i = j + cfg.get("cool", COOLDOWN_BARS)
     return trades
 
 
@@ -333,14 +458,13 @@ def metrics(trades, n_bars):
 
 def optimize(rows, sym):
     """Walk-forward: choose the best config on the first 60% of the data, then judge it on the unseen 40%."""
-    min_tp = SYMBOLS[sym]["min_tp"]
     ind = Ind(rows)
     n = len(rows)
     split = int(n * TRAIN_FRAC)
     best = None
     tested = 0
     for cfg in _grid():
-        tr = run_backtest(ind, cfg, min_tp, WARMUP, split)
+        tr = run_backtest(ind, cfg, _min_tp(sym, cfg), WARMUP, split)
         m = metrics(tr, split - WARMUP)
         tested += 1
         if m["n"] < MIN_TRAIN_TRADES or m["exp"] <= 0:
@@ -352,7 +476,7 @@ def optimize(rows, sym):
         return {"cfg": None, "validated": False, "tested": tested, "n_bars": n,
                 "reason": "No configuration was profitable on the training period with enough trades."}
     _, cfg, train_m = best
-    test_m = metrics(run_backtest(ind, cfg, min_tp, split, n), n - split)
+    test_m = metrics(run_backtest(ind, cfg, _min_tp(sym, cfg), split, n), n - split)
     validated = (test_m["n"] >= VALID_MIN_TEST_TRADES and test_m["pf"] >= VALID_MIN_PF and test_m["exp"] >= VALID_MIN_EXP)
     reason = "OK" if validated else (
         f"Failed on unseen data (trades {test_m['n']}, PF {test_m['pf']:.2f}, expectancy {test_m['exp']:+.2f}R).")
@@ -375,9 +499,19 @@ def _paper():
 
 def _active_cfg(sym):
     st = _state["cfg"].get(sym)
-    if st and st.get("cfg"):
+    if st and st.get("cfg") and st["cfg"].get("family") in ACTIVE_FAMILIES:
         return st["cfg"], bool(st.get("validated")), st
-    return DEFAULT_CFG, False, st
+    return DEFAULT_CFG, False, None
+
+
+def _current_res(sym):
+    """Stored backtest result, only if it belongs to a currently active strategy family."""
+    st = _state["cfg"].get(sym)
+    return st if st and (st.get("cfg") is None or st["cfg"].get("family") in ACTIVE_FAMILIES) else None
+
+
+def _current_hist(sym):
+    return [h for h in _state["hist"].get(sym, []) if (h.get("cfg") or {}).get("family") in ACTIVE_FAMILIES]
 
 
 def _file_save():
@@ -514,7 +648,7 @@ def _levels(sym, sig, entry):
 
 def _stats_line(st):
     if not st or not st.get("test"):
-        return "Backtest : not run yet (use /backtest)"
+        return "Backtest : running in the background, result appears here in a few minutes"
     t = st["test"]
     tag = "validated" if st.get("validated") else "NOT validated"
     return (f"Backtest on unseen {int((1 - TRAIN_FRAC) * 100)}% of data ({tag}) : "
@@ -529,8 +663,13 @@ def _signal_text(sym, sig, entry, st, validated, opened_paper):
     pip = SYMBOLS[sym]["pip"]
     tp_extra = f"  ({tp_d / pip:,.0f} pips)" if pip else ""
     why = "\n".join(f"• {r}" for r in sig["reasons"])
-    head = "🟢 *LONG SIGNAL*" if long else "🔴 *SHORT SIGNAL*"
-    warn = "" if validated else "\n⚠️ *Strategy not validated yet* — treat as analysis only.\n"
+    head = ("🟢 *LONG SIGNAL*" if long else "🔴 *SHORT SIGNAL*") + ("" if validated else "  🧪 PRACTICE")
+    if validated:
+        warn = ""
+    elif opened_paper:
+        warn = "\n🧪 *PRACTICE signal*: strategy abhi validated nahi hai. Sirf paper trade, real paisa mat lagao.\n"
+    else:
+        warn = "\n⚠️ *Strategy not validated yet* — treat as analysis only.\n"
     paper = "📝 Paper trade opened (virtual, 1% risk).\n\n" if opened_paper else ""
     return (f"{head}\n`{SYMBOLS[sym]['name']}`  ·  `{TF}`  ·  `{_now_utc()} UTC`\n\n"
             f"📍 *Entry* :  `{_px(sym, entry)}`\n\n"
@@ -587,7 +726,7 @@ def _analyze_sync(sym):
     ind = Ind(closed)
     i = len(closed) - 1
     cfg, validated, st = _active_cfg(sym)
-    sig = signal_at(ind, i, cfg, SYMBOLS[sym]["min_tp"])
+    sig = signal_at(ind, i, cfg, _min_tp(sym, cfg))
     return {"ind": ind, "i": i, "price": price, "cfg": cfg, "validated": validated, "st": st, "sig": sig,
             "bar_ts": closed[-1][0]}
 
@@ -606,7 +745,14 @@ def _analysis_text(sym, a):
         return (f"🔎 *Analytics*  ·  `{name}`\n\n"
                 f"💵 *Price* :  `{_px(sym, price)}`\n\n{busy}{body}")
     cfg = a["cfg"]
-    if cfg["family"] == "A":
+    if cfg["family"] == "C":
+        zb = _smc_zone(ind, i, cfg, atr, True, need_retest=False)
+        zs = _smc_zone(ind, i, cfg, atr, False, need_retest=False)
+        buy_z = f"`{_px(sym, zb[0])}` - `{_px(sym, zb[1])}` ({zb[2]})" if zb else "no fresh zone below price"
+        sell_z = f"`{_px(sym, zs[0])}` - `{_px(sym, zs[1])}` ({zs[2]})" if zs else "no fresh zone above price"
+        trig = (f"🟢 Buy zone :  {buy_z}\n   → long when price dips into it and a bullish candle closes back above (needs trend UP)\n"
+                f"🔴 Sell zone :  {sell_z}\n   → short when price rallies into it and a bearish candle closes back below (needs trend DOWN)")
+    elif cfg["family"] == "A":
         hh, ll = ind.don(cfg["n"])[0][i], ind.don(cfg["n"])[1][i]
         trig = (f"🟢 Long above :  `{_px(sym, hh)}`  (5m close, needs trend UP)\n"
                 f"🔴 Short below :  `{_px(sym, ll)}`  (5m close, needs trend DOWN)")
@@ -614,8 +760,8 @@ def _analysis_text(sym, a):
         trig = (f"🟢 Long : pullback to EMA21 `{_px(sym, e21)}`, then a bullish close above the previous high "
                 f"`{_px(sym, ind.h[i - 1])}`\n"
                 f"🔴 Short : rally to EMA21, then a bearish close below the previous low `{_px(sym, ind.l[i - 1])}`")
-    quiet = "\n⚠️ Market quiet: ATR is small for a full-size target." if atr * 3 < SYMBOLS[sym]["min_tp"] else ""
-    warn = "" if a["validated"] else "\n⚠️ Strategy abhi validated nahi hai, auto-DM band hai.\n"
+    quiet = "\n⚠️ Market quiet: ATR is small for a full-size target." if atr * 3 < _min_tp(sym, cfg) else ""
+    warn = "" if a["validated"] else ("\n🧪 Strategy abhi validated nahi hai: signals PRACTICE (paper) mode me aate hain.\n" if PRACTICE_MODE else "\n⚠️ Strategy abhi validated nahi hai, auto-DM band hai.\n")
     return (f"🔎 *Analytics*  ·  `{name}`\n\n"
             f"⚪ *NO TRADE right now*\n\n"
             f"💵 *Price* :  `{_px(sym, price)}`\n\n"
@@ -641,7 +787,8 @@ def _rec_stats(tr):
             "tm": sum(1 for t in tr if t["why"] == "TIME"), "wr": sum(1 for t in tr if t["R"] > 0) / n * 100,
             "pf": (gw / gl if gl > 0 else (99.0 if gw > 0 else 0.0)), "avg": sum(t["R"] for t in tr) / n,
             "pnl": sum(t["pnl"] for t in tr), "moves": sum(t["usd_move"] for t in tr),
-            "best": max(t["R"] for t in tr), "worst": min(t["R"] for t in tr)}
+            "best": max(t["R"] for t in tr), "worst": min(t["R"] for t in tr),
+            "prac": sum(1 for t in tr if t.get("practice"))}
 
 
 def _record_text(sym, price):
@@ -653,7 +800,8 @@ def _record_text(sym, price):
         body = (f"Trades :  `{st['n']}`   (🎯 {st['tp']} TP  ·  🛑 {st['sl']} SL  ·  ⏱ {st['tm']} time stop)\n\n"
                 f"Win rate :  `{st['wr']:.0f}%`   ·   PF `{st['pf']:.2f}`   ·   Avg `{st['avg']:+.2f}R`\n\n"
                 f"Net gain :  `{st['pnl']:+,.2f} USDT`   ·   price moves `{_usd(st['moves'])}`\n\n"
-                f"Best `{st['best']:+.2f}R`   ·   Worst `{st['worst']:+.2f}R`")
+                f"Best `{st['best']:+.2f}R`   ·   Worst `{st['worst']:+.2f}R`"
+                + (f"\n\n🧪 {st['prac']} of these were PRACTICE trades (strategy not yet validated)" if st["prac"] else ""))
     else:
         body = "Abhi tak is market ka koi trade close nahi hua."
     all_line = (f"All markets :  {al['n']} trades  ·  win rate {al['wr']:.0f}%  ·  net {al['pnl']:+,.2f} USDT"
@@ -714,14 +862,14 @@ async def analytics_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         a = await asyncio.get_running_loop().run_in_executor(None, lambda: _analyze_sync(sym))
         parts = [_analysis_text(sym, a) if a else "❌ Binance data abhi nahi mila, thodi der baad try karo."]
         parts.append(_record_text(sym, a["price"] if a else None))
-        parts.append(_backtest_text(sym, _state["cfg"].get(sym), _state["hist"].get(sym, []), _storage_line(sym)))
+        parts.append(_backtest_text(sym, _current_res(sym), _current_hist(sym), _storage_line(sym)))
         await _reply_many(u, c, parts)
     except Exception as e:
         _log_exc("[analytics]", e)
 
 
 # ----------------------------------------------------------------------------- paper trading
-def _paper_open(sym, sig, price, bar_ts, cfg):
+def _paper_open(sym, sig, price, bar_ts, cfg, practice=False):
     p = _paper()
     long = sig["side"] == "LONG"
     entry = price * (1 + SLIP if long else 1 - SLIP)
@@ -729,7 +877,9 @@ def _paper_open(sym, sig, price, bar_ts, cfg):
     risk_usd = p["equity"] * min(RISK, LEV_CAP * sig["sl_d"] / entry)
     p["open"][sym] = {"side": sig["side"], "entry": entry, "sl": sl, "tp": tp, "sl_d": sig["sl_d"],
                       "tp_d": sig["tp_d"], "risk_usd": risk_usd, "opened": time.time(), "bar_ts": bar_ts,
-                      "strategy": cfg_name(cfg)}
+                      "strategy": cfg_name(cfg), "practice": practice,
+                      "hold_s": cfg.get("hold", MAX_HOLD_BARS) * TF_MS / 1000,
+                      "cool_s": cfg.get("cool", COOLDOWN_BARS) * TF_MS / 1000}
 
 
 def _paper_close(sym, exit_px, why):
@@ -737,15 +887,16 @@ def _paper_close(sym, exit_px, why):
     pos = p["open"].pop(sym)
     long = pos["side"] == "LONG"
     gross = (exit_px - pos["entry"]) if long else (pos["entry"] - exit_px)
-    net = gross - pos["entry"] * (2 * FEE + SLIP)
+    net = gross - (pos["entry"] * FEE + exit_px * (FEE_MAKER if why == "TP" else FEE + SLIP))
     r = net / pos["sl_d"]
     pnl = pos["risk_usd"] * r
     p["equity"] += pnl
     rec = {"sym": sym, "side": pos["side"], "entry": pos["entry"], "exit": exit_px, "why": why, "R": r,
-           "pnl": pnl, "usd_move": net, "closed": time.time(), "held_min": (time.time() - pos["opened"]) / 60}
+           "pnl": pnl, "usd_move": net, "closed": time.time(), "opened": pos["opened"],
+           "practice": pos.get("practice", False), "held_min": (time.time() - pos["opened"]) / 60}
     p["closed"].append(rec)
-    p["closed"] = p["closed"][-300:]
-    p["cool"][sym] = time.time() + COOLDOWN_BARS * TF_MS / 1000
+    p["closed"] = p["closed"][-2000:]
+    p["cool"][sym] = time.time() + pos.get("cool_s", COOLDOWN_BARS * TF_MS / 1000)
     return rec
 
 
@@ -766,18 +917,19 @@ def _paper_check_sync(sym):
             return pos["sl"], "SL"
         if hit_tp:
             return pos["tp"], "TP"
-    if time.time() - pos["opened"] > MAX_HOLD_BARS * TF_MS / 1000:
+    if time.time() - pos["opened"] > pos.get("hold_s", MAX_HOLD_BARS * TF_MS / 1000):
         return rows[-1][4], "TIME"
     return None
 
 
 def _close_text(rec):
     icon = {"TP": "🎯", "SL": "🛑", "TIME": "⏱"}[rec["why"]]
-    label = {"TP": "TAKE PROFIT HIT ✅", "SL": "STOP LOSS HIT ❌", "TIME": "Time stop (8h), closed at market"}[rec["why"]]
+    label = {"TP": "TAKE PROFIT HIT ✅", "SL": "STOP LOSS HIT ❌", "TIME": "Time stop, closed at market"}[rec["why"]]
     p = _paper()
     mine = [t for t in p["closed"] if t["sym"] == rec["sym"]]
     wins = sum(1 for t in mine if t["R"] > 0)
-    return (f"{icon} *{label}*\n`{SYMBOLS[rec['sym']]['name']}`  ·  {'🟢 LONG' if rec['side'] == 'LONG' else '🔴 SHORT'}\n\n"
+    prac = "🧪 PRACTICE trade (strategy not yet validated)\n" if rec.get("practice") else ""
+    return (f"{icon} *{label}*\n{prac}`{SYMBOLS[rec['sym']]['name']}`  ·  {'🟢 LONG' if rec['side'] == 'LONG' else '🔴 SHORT'}\n\n"
             f"📍 *Entry* :  `{_px(rec['sym'], rec['entry'])}`\n"
             f"🏁 *Exit* :  `{_px(rec['sym'], rec['exit'])}`\n\n"
             f"📈 *Result* :  `{rec['R']:+.2f}R`  ·  `{rec['pnl']:+,.2f} USDT`\n\n"
@@ -847,7 +999,7 @@ def _backtest_text(sym, res, hist=None, extra=""):
 # ----------------------------------------------------------------------------- background engine
 async def _scan_symbol(bot, sym):
     cfg, validated, st = _active_cfg(sym)
-    if not validated and not SEND_UNVALIDATED:
+    if not validated and not (SEND_UNVALIDATED or PRACTICE_MODE):
         return
     p = _paper()
     expected = (int(time.time() * 1000) // TF_MS) * TF_MS - TF_MS      # open time of the latest closed 5m candle
@@ -860,11 +1012,14 @@ async def _scan_symbol(bot, sym):
     p["last_bar"][sym] = closed[-1][0]
     if sym in p["open"] or time.time() < p["cool"].get(sym, 0) or len(closed) < WARMUP + 5:
         return
+    day0 = time.time() // 86400 * 86400
+    if sum(1 for t in p["closed"] if t["sym"] == sym and t.get("opened", t["closed"]) >= day0) >= MAX_DAILY_SIGNALS:
+        return
     ind = Ind(closed)
-    sig = signal_at(ind, len(closed) - 1, cfg, SYMBOLS[sym]["min_tp"])
+    sig = signal_at(ind, len(closed) - 1, cfg, _min_tp(sym, cfg))
     if not sig:
         return
-    _paper_open(sym, sig, price, closed[-1][0], cfg)
+    _paper_open(sym, sig, price, closed[-1][0], cfg, practice=not validated)
     _save_state()
     await _to_owner(bot, _signal_text(sym, sig, price, st, validated, opened_paper=True))
     logger.info(f"[trades] signal {sym} {sig['side']} @ {price}")
@@ -900,7 +1055,7 @@ async def _optimizer_loop(bot):
     await asyncio.sleep(60)
     while True:
         for sym in SYMBOLS:
-            prev = _state["cfg"].get(sym)
+            prev = _current_res(sym)
             if prev and prev.get("ts") and time.time() - prev["ts"] < OPTIMIZE_EVERY * 0.95:
                 continue
             was_valid = prev.get("validated") if prev else None
@@ -912,7 +1067,7 @@ async def _optimizer_loop(bot):
                     logger.info(f"[trades] optimizer {sym}: validated={res.get('validated')} tested={res.get('tested')}")
                     if was_valid is None or bool(was_valid) != bool(res.get("validated")):
                         await _to_owner(bot, "🔄 *Auto backtest update*\n\n" +
-                                        _backtest_text(sym, res, _state["hist"].get(sym, [])))
+                                        _backtest_text(sym, res, _current_hist(sym)))
             except asyncio.CancelledError:
                 raise
             except BaseException as e:
